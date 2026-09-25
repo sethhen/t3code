@@ -81,9 +81,15 @@ export function useExtensionClient<Methods extends ExtensionMethods>(
         if (environmentId === null) return { ok: false, message: "No environment connected." };
         const codec = codecFor(spec, method);
         if (!codec) return { ok: false, message: `Unknown method ${spec.id}.${method}` };
+        let payload: unknown;
+        try {
+          payload = codec.encodeInput(input);
+        } catch (error) {
+          return { ok: false, message: `Invalid input: ${String(error)}` };
+        }
         const result = await run({
           environmentId,
-          input: { extension: spec.id, method, input: codec.encodeInput(input) },
+          input: { extension: spec.id, method, input: payload },
         });
         if (!AsyncResult.isSuccess(result)) {
           return { ok: false, message: failureMessage(result.cause) };
