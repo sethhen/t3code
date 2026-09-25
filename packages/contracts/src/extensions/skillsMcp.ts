@@ -208,6 +208,11 @@ export const McpMutation = Schema.Union([
     app: AgentApp,
     cwd: Schema.optional(Schema.String),
   }),
+  /**
+   * OAuth sign-in through the app's own CLI (`claude|codex mcp login`). It opens
+   * the browser on the machine running the T3 server and waits for the callback.
+   */
+  Schema.Struct({ action: Schema.Literal("login"), name: Schema.String, app: AgentApp }),
 ]);
 export type McpMutation = typeof McpMutation.Type;
 

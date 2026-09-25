@@ -20,12 +20,13 @@ import type {
   MutationResult,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import * as Semaphore from "effect/Semaphore";
 
 import type { SkillsMcpServices } from "../index.ts";
-import { type AgentCli, agentAppInfo, resolveAgentClis } from "../shared/agents.ts";
+import { type AgentCli, agentAppInfo, resolveAgentClis, runAgentCliOk } from "../shared/agents.ts";
 import { ExtensionFailure, ServerSettingsService } from "../shared/t3.ts";
 import { BUILTIN_SERVER_NAME, type BuiltinAccess, builtinRow } from "./builtin.ts";
 import {
@@ -598,6 +599,22 @@ const reconnect = Effect.fn("skillsMcp.mcp.reconnect")(function* (
     : ({ failures: [], message: `Reconnected ${input.name}` } satisfies MutationResult);
 });
 
+/** Browser sign-in can take a while; the CLI exits once the OAuth callback lands. */
+const LOGIN_TIMEOUT = Duration.minutes(5);
+
+const login = Effect.fn("skillsMcp.mcp.login")(function* (
+  clis: Clis,
+  input: Extract<McpMutation, { readonly action: "login" }>,
+) {
+  const failures = yield* forApp(clis, input.app, true, (cli) =>
+    runAgentCliOk(cli, ["mcp", "login", input.name], { timeout: LOGIN_TIMEOUT }),
+  );
+  yield* input.app === "claude" ? invalidateClaudeProbes : invalidateCodexProbes;
+  return failures.length > 0
+    ? ({ failures } satisfies MutationResult)
+    : ({ failures, message: `Signed in to ${input.name}` } satisfies MutationResult);
+});
+
 /** Writes run one at a time and drop the cached probes, so the next list sees them. */
 const exclusiveWrite = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   mutationLock
@@ -628,6 +645,8 @@ const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpM
       );
     case "reconnect":
       return yield* reconnect(clis, input);
+    case "login":
+      return yield* login(clis, input);
   }
 });
 

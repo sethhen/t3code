@@ -109,6 +109,7 @@ type McpRowAction =
   | { readonly type: "edit"; readonly row: McpServerRow }
   | { readonly type: "delete"; readonly row: McpServerRow }
   | { readonly type: "reconnect"; readonly row: McpServerRow; readonly apps: readonly AgentApp[] }
+  | { readonly type: "login"; readonly row: McpServerRow; readonly apps: readonly AgentApp[] }
   | { readonly type: "project"; readonly row: McpServerRow; readonly enabled: boolean };
 
 interface MutationStep {
@@ -245,6 +246,19 @@ export function McpTab(props: ListTabProps) {
           action.apps.map((app) => ({
             input: { action: "reconnect", name: row.name, app, ...(cwd ? { cwd } : {}) },
             labels: { failure: `Could not reconnect ${row.name} in ${APP_LABEL[app]}` },
+          })),
+          { refresh: true },
+        );
+        return;
+      case "login":
+        mutate(
+          row.key,
+          action.apps.map((app) => ({
+            input: { action: "login", name: row.name, app },
+            labels: {
+              failure: `Could not sign in to ${row.name} for ${APP_LABEL[app]}`,
+              success: `Signed in to ${row.name}`,
+            },
           })),
           { refresh: true },
         );
@@ -573,7 +587,7 @@ const McpRow = memo(function McpRow(props: McpRowProps) {
             size="micro"
             variant="warning-outline"
             disabled={props.busyRow}
-            onClick={() => onAction({ type: "reconnect", row, apps: primary.apps })}
+            onClick={() => onAction({ type: primary.kind, row, apps: primary.apps })}
           >
             {primary.label}
           </Button>

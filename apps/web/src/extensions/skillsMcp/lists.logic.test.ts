@@ -450,13 +450,13 @@ describe("attention", () => {
     assert.equal(countAttention([failed, auth, missing, sseOff, server("ok")]), 3);
   });
 
-  it("offers reconnect for present failures and auth, not for config errors or builtins", () => {
+  it("offers login for auth, reconnect for failures, nothing for config errors or builtins", () => {
     assert.deepEqual(mcpPrimaryAction(failed), {
       kind: "reconnect",
       label: "Reconnect",
       apps: ["claude"],
     });
-    assert.deepEqual(mcpPrimaryAction(auth)?.apps, ["claude"]);
+    assert.deepEqual(mcpPrimaryAction(auth), { kind: "login", label: "Log in", apps: ["claude"] });
     assert.equal(mcpPrimaryAction(missing), null);
     assert.equal(mcpPrimaryAction(server("ok")), null);
     assert.equal(

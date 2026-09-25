@@ -251,16 +251,22 @@ export function mcpToolCount(row: McpServerRow): number {
  * needs-auth case once the contract has one.
  */
 export interface McpPrimaryAction {
-  readonly kind: "reconnect";
+  readonly kind: "login" | "reconnect";
   readonly label: string;
   readonly apps: readonly AgentApp[];
 }
 
+/** Sign-in beats reconnect: a server waiting on OAuth will not connect until the user logs in. */
 export function mcpPrimaryAction(row: McpServerRow): McpPrimaryAction | null {
   if (row.builtin) return null;
-  const apps = mcpIssues(row)
-    .filter((issue) => issue.label !== "Error" && row.apps[issue.app]?.present)
+  const issues = mcpIssues(row).filter(
+    (issue) => issue.label !== "Error" && row.apps[issue.app]?.present,
+  );
+  const needsAuth = issues
+    .filter((issue) => row.apps[issue.app]?.status === "needs-auth")
     .map((issue) => issue.app);
+  if (needsAuth.length > 0) return { kind: "login", label: "Log in", apps: needsAuth };
+  const apps = issues.map((issue) => issue.app);
   return apps.length > 0 ? { kind: "reconnect", label: "Reconnect", apps } : null;
 }
 
