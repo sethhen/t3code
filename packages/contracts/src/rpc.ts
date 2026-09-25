@@ -13,6 +13,7 @@ import {
 } from "./providerSetup.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
+import { ExtensionCallError, ExtensionCallInput } from "./extensions/host.ts"; // t3-ext
 import {
   AuthAccessStreamError,
   AuthAccessStreamEvent,
@@ -433,6 +434,8 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeBackgroundPolicy: "subscribeBackgroundPolicy",
+  // t3-ext: every fork extension method rides this one RPC (see extensions/host.ts).
+  extensionCall: "extension.call",
   subscribeResourceTelemetry: "subscribeResourceTelemetry",
 } as const;
 
@@ -1343,6 +1346,13 @@ const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   stream: true,
 });
 
+// t3-ext
+const WsExtensionCallRpc = Rpc.make(WS_METHODS.extensionCall, {
+  payload: ExtensionCallInput,
+  success: Schema.Unknown,
+  error: Schema.Union([ExtensionCallError, EnvironmentAuthorizationError]),
+});
+
 const WsSubscribeBackgroundPolicyRpc = Rpc.make(WS_METHODS.subscribeBackgroundPolicy, {
   payload: Schema.Struct({}),
   success: BackgroundPolicySnapshot,
@@ -1498,4 +1508,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationGetArchivedShellSnapshotRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
+  WsExtensionCallRpc, // t3-ext
 );

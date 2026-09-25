@@ -122,6 +122,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
+import { makeExtensionRegistry } from "./extensions/registry.ts"; // t3-ext
 import { remoteSshDeviceHosts } from "./device/localSshDeviceHost.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
@@ -573,6 +574,7 @@ const makeWsRpcLayer = (
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+      const extensionRegistry = yield* makeExtensionRegistry; // t3-ext
       const canReplayPersistedRange = Effect.fnUntraced(function* (
         afterSequence: number,
         headSequence: number,
@@ -3634,6 +3636,11 @@ const makeWsRpcLayer = (
             }),
             { "rpc.aggregate": "auth" },
           ),
+        // t3-ext
+        [WS_METHODS.extensionCall]: (input) =>
+          observeRpcEffect(WS_METHODS.extensionCall, extensionRegistry.dispatch(input), {
+            "rpc.aggregate": "extension",
+          }),
         [WS_METHODS.subscribeBackgroundPolicy]: (_input) =>
           observeRpcStream(
             WS_METHODS.subscribeBackgroundPolicy,

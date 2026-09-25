@@ -41,6 +41,11 @@ import {
 } from "react";
 
 import { isElectron } from "~/env";
+import {
+  RIGHT_PANEL_EXTENSIONS,
+  findRightPanelExtension,
+  rightPanelExtensionIcon,
+} from "~/extensions/registry"; // t3-ext
 import type { DesktopPreviewOverlay } from "~/previewStateStore";
 import type { RightPanelSurface } from "~/rightPanelStore";
 import { cn } from "~/lib/utils";
@@ -118,6 +123,8 @@ interface RightPanelTabsProps {
   onAddPullRequests: () => void;
   onAddAgents: () => void;
   onAddDevice: () => void;
+  /** t3-ext: opens a fork extension surface; omitted where no thread is active. */
+  onAddExtension?: ((extensionId: string) => void) | undefined;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -321,6 +328,7 @@ function RightPanelEmptyState(props: {
   onAddPullRequests: () => void;
   onAddAgents: () => void;
   onAddDevice: () => void;
+  onAddExtension?: ((extensionId: string) => void) | undefined; // t3-ext
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -408,6 +416,16 @@ function RightPanelEmptyState(props: {
       onClick: props.onAddDevice,
       badgeCount: 0,
     },
+    // t3-ext
+    ...RIGHT_PANEL_EXTENSIONS.map((extension) => ({
+      label: extension.label,
+      icon: extension.icon,
+      shortcut: extension.shortcut,
+      available: props.onAddExtension !== undefined,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.agents,
+      onClick: () => props.onAddExtension?.(extension.id),
+      badgeCount: 0,
+    })),
   ] as const;
 
   type SurfaceAction = (typeof actions)[number];
@@ -630,6 +648,8 @@ function surfaceTitle(
       return "Pull requests";
     case "agents":
       return "Agents";
+    case "extension": // t3-ext
+      return findRightPanelExtension(surface.extensionId)?.label ?? "Extension";
     case "device":
       return surface.title ?? surface.target?.name ?? "Device";
     case "preview": {
@@ -715,6 +735,11 @@ function SurfaceIcon({
       return <GitPullRequestArrow className="size-3 shrink-0" />;
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "extension": {
+      // t3-ext
+      const ExtensionIcon = rightPanelExtensionIcon(surface.extensionId);
+      return <ExtensionIcon className="size-3 shrink-0" />;
+    }
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -925,6 +950,15 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.device,
       onClick: props.onAddDevice,
     },
+    // t3-ext
+    ...RIGHT_PANEL_EXTENSIONS.map((extension) => ({
+      label: extension.label,
+      icon: extension.icon,
+      shortcut: extension.shortcut,
+      available: props.onAddExtension !== undefined,
+      disabledReason: SURFACE_DISABLED_REASONS.agents,
+      onClick: () => props.onAddExtension?.(extension.id),
+    })),
   ] as const;
 
   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -1397,6 +1431,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddPullRequests={props.onAddPullRequests}
             onAddAgents={props.onAddAgents}
             onAddDevice={props.onAddDevice}
+            onAddExtension={props.onAddExtension} // t3-ext
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}
