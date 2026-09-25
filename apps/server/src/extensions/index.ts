@@ -4,8 +4,6 @@
  */
 import * as Effect from "effect/Effect";
 
-import type { ServerExtension } from "./registry.ts";
+import { makeSkillsMcpServerExtension } from "./skillsMcp/index.ts";
 
-export const makeServerExtensions: Effect.Effect<ReadonlyArray<ServerExtension>> = Effect.succeed(
-  [],
-);
+export const makeServerExtensions = Effect.all([makeSkillsMcpServerExtension]);

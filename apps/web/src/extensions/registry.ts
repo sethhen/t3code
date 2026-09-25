@@ -8,6 +8,8 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { Puzzle, type LucideIcon } from "lucide-react";
 import type { ComponentType } from "react";
 
+import { skillsMcpExtension } from "./skillsMcp";
+
 export interface RightPanelExtensionProps {
   readonly environmentId: EnvironmentId | null;
   readonly threadId: ThreadId | null;
@@ -27,7 +29,7 @@ export interface RightPanelExtension {
   readonly Panel: ComponentType<RightPanelExtensionProps>;
 }
 
-export const RIGHT_PANEL_EXTENSIONS: readonly RightPanelExtension[] = [];
+export const RIGHT_PANEL_EXTENSIONS: readonly RightPanelExtension[] = [skillsMcpExtension];
 
 export const findRightPanelExtension = (id: string): RightPanelExtension | undefined =>
   RIGHT_PANEL_EXTENSIONS.find((extension) => extension.id === id);
