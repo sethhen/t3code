@@ -52,9 +52,15 @@ const toolName = (qualified: string, serverName: string) => {
   return split === -1 ? qualified : qualified.slice(split + 2);
 };
 
+/**
+ * `deferring`: whether `/context` reports any out-of-window tool schemas. When
+ * tool search is off, every MCP tool is in the window whatever `isLoaded`
+ * says (Claude reports `isLoaded: false` for tools it never had to search for).
+ */
 const mcpServersOf = (
   tools: ClaudeContextUsage["mcpTools"],
   statuses: ClaudeProbe["statuses"],
+  deferring: boolean,
 ): McpContextCost[] => {
   // `/context` may report the normalized name; the panel knows servers by config name.
   const configNames = new Map<string, string>();
@@ -72,7 +78,7 @@ const mcpServersOf = (
       name: toolName(tool.name, tool.serverName),
       tokens: tool.tokens,
       // Absent on CLIs that load every tool up front.
-      loaded: tool.isLoaded !== false,
+      loaded: !deferring || tool.isLoaded !== false,
     });
     servers.set(server, list);
   }
@@ -137,7 +143,11 @@ export const claudeAppContext = (probe: ClaudeProbe): AppContext => {
     ...(windowTokens > 0 ? { windowTokens } : {}),
     baselineTokens,
     categories,
-    mcpServers: mcpServersOf(usage.mcpTools, probe.statuses),
+    mcpServers: mcpServersOf(
+      usage.mcpTools,
+      probe.statuses,
+      categories.some((category) => category.kind === "deferred" && category.tokens > 0),
+    ),
     skills: (usage.skills?.skillFrontmatter ?? [])
       .map((skill) => ({
         name: skill.name,

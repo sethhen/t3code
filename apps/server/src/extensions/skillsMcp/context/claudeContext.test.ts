@@ -140,6 +140,19 @@ describe("claudeAppContext", () => {
     ]);
   });
 
+  it("counts every tool as loaded when Claude defers nothing", () => {
+    const context = claudeAppContext(
+      probe({
+        contextUsage: usage({
+          categories: usage().categories.filter((category) => !category.isDeferred),
+        }),
+      }),
+    );
+    const docs = context.mcpServers.find((server) => server.name === "docs");
+    assert.strictEqual(docs?.loadedTokens, 2_400);
+    assert.strictEqual(docs?.deferredTokens, 0);
+  });
+
   it("treats tools without isLoaded as loaded", () => {
     const context = claudeAppContext(
       probe({
