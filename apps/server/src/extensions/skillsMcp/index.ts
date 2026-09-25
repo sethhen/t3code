@@ -9,6 +9,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { serverExtension } from "../registry.ts";
+import { getContext, getUsage } from "./context/index.ts";
 import { listMcp, mcpPresets, mutateMcp } from "./mcp/index.ts";
 import { listPlugins, mutatePlugins } from "./plugins/index.ts";
 import { ChildProcessSpawner, ServerConfig, ServerSettingsService } from "./shared/t3.ts";
@@ -37,5 +38,7 @@ export const makeSkillsMcpServerExtension = Effect.gen(function* () {
     "skills.mutate": (input) => run(mutateSkills(input)),
     "plugins.list": (input) => run(listPlugins(input)),
     "plugins.mutate": (input) => run(mutatePlugins(input)),
+    "context.get": (input) => run(getContext(input)),
+    "usage.get": (input) => run(getUsage(input)),
   });
 });

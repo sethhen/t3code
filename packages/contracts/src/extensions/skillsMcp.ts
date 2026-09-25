@@ -413,6 +413,89 @@ export const PluginsMutation = Schema.Struct({
 export type PluginsMutation = typeof PluginsMutation.Type;
 
 // ---------------------------------------------------------------------------
+// Context and usage - what each app pays per new thread, and what it actually uses
+
+export const ContextCategory = Schema.Struct({
+  name: Schema.String,
+  tokens: Schema.Number,
+  /** used: in the window; free: remaining; buffer: compaction reserve; deferred: loaded on demand. */
+  kind: Schema.Literals(["used", "free", "buffer", "deferred"]),
+});
+export type ContextCategory = typeof ContextCategory.Type;
+
+export const McpContextCost = Schema.Struct({
+  name: Schema.String,
+  toolCount: Schema.Number,
+  /** Tokens of tool definitions sent with every request. */
+  loadedTokens: Schema.Number,
+  /** Tokens of tool definitions kept out of the window until the agent searches for them. */
+  deferredTokens: Schema.Number,
+  tools: Schema.Array(
+    Schema.Struct({ name: Schema.String, tokens: Schema.Number, loaded: Schema.Boolean }),
+  ),
+});
+export type McpContextCost = typeof McpContextCost.Type;
+
+export const AppContext = Schema.Struct({
+  /** True when the agent measured it (Claude `/context`); false for a local estimate (Codex). */
+  exact: Schema.Boolean,
+  model: Schema.optional(Schema.String),
+  windowTokens: Schema.optional(Schema.Number),
+  /** Tokens a new thread in this cwd starts with before the first message. */
+  baselineTokens: Schema.Number,
+  categories: Schema.Array(ContextCategory),
+  mcpServers: Schema.Array(McpContextCost),
+  skills: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      source: Schema.optional(Schema.String),
+      tokens: Schema.Number,
+    }),
+  ),
+  memoryFiles: Schema.Array(Schema.Struct({ path: Schema.String, tokens: Schema.Number })),
+  error: Schema.optional(Schema.String),
+});
+export type AppContext = typeof AppContext.Type;
+
+export const ContextOverview = Schema.Struct({
+  apps: Schema.Struct({ claude: Schema.optional(AppContext), codex: Schema.optional(AppContext) }),
+  checkedAt: Schema.String,
+});
+export type ContextOverview = typeof ContextOverview.Type;
+
+export const UsageStat = Schema.Struct({
+  name: Schema.String,
+  calls: Schema.Number,
+  lastUsedAt: Schema.optional(Schema.String),
+});
+export type UsageStat = typeof UsageStat.Type;
+
+export const AppUsage = Schema.Struct({
+  mcpServers: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      calls: Schema.Number,
+      lastUsedAt: Schema.optional(Schema.String),
+      tools: Schema.Array(UsageStat),
+    }),
+  ),
+  skills: Schema.Array(UsageStat),
+  sessions: Schema.Number,
+  scannedFiles: Schema.Number,
+  scannedBytes: Schema.Number,
+  error: Schema.optional(Schema.String),
+});
+export type AppUsage = typeof AppUsage.Type;
+
+/** Calls counted from the apps' own local transcripts (T3 threads and CLI sessions alike). */
+export const UsageReport = Schema.Struct({
+  days: Schema.Number,
+  apps: Schema.Struct({ claude: AppUsage, codex: AppUsage }),
+  scannedAt: Schema.String,
+});
+export type UsageReport = typeof UsageReport.Type;
+
+// ---------------------------------------------------------------------------
 // Methods
 
 const CwdInput = Schema.Struct({ cwd: Schema.optional(Schema.String) });
@@ -439,5 +522,20 @@ export const SkillsMcpExtension = defineExtension(SKILLS_MCP_EXTENSION_ID, {
     output: PluginsOverview,
   },
   "plugins.mutate": { input: PluginsMutation, output: MutationResult },
+  "context.get": {
+    input: Schema.Struct({
+      cwd: Schema.optional(Schema.String),
+      refresh: Schema.optional(Schema.Boolean),
+    }),
+    output: ContextOverview,
+  },
+  "usage.get": {
+    input: Schema.Struct({
+      /** Look-back window, 1-90 days. */
+      days: Schema.Number,
+      refresh: Schema.optional(Schema.Boolean),
+    }),
+    output: UsageReport,
+  },
 });
 export type SkillsMcpMethods = typeof SkillsMcpExtension.methods;
