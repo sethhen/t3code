@@ -16,3 +16,7 @@ export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 FORK_HOOK_XDG="${TMPDIR:-/tmp}/t3code-fork-xdg"
 mkdir -p "$FORK_HOOK_XDG"
 fork_git() { XDG_CONFIG_HOME="$FORK_HOOK_XDG" git "$@"; }
+
+# The desktop build compiles native/resource-monitor with Cargo (rustup, installed
+# with --no-modify-path so shell profiles stay untouched).
+if [ -d "$HOME/.cargo/bin" ]; then export PATH="$HOME/.cargo/bin:$PATH"; fi
