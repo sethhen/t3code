@@ -119,12 +119,18 @@ instances (`overlay.ts`), never written to the user's Claude or Codex config.
 
 Why each routing setting exists (measured 2026-09-26 against direct Claude Code): behind any
 custom `ANTHROPIC_BASE_URL` Claude Code drops tool search (every MCP schema in every thread),
-fine-grained tool streaming, the global system-prompt cache, the 1h cache and the advisor.
-`_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` + `ENABLE_TOOL_SEARCH` + `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`
+fine-grained tool streaming, the global system-prompt cache, the 1h cache and the advisor. The
+pool restores them with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, `ENABLE_TOOL_SEARCH`,
+`CLAUDE_CODE_PROMPT_CACHE_TTL=1h` and `advisorModel`. They go in flag `--settings` too, because a
+`settings.json` `env` block outranks the process environment. The proxy pins each session to one
+account (prompt cache) and gives each subagent its own. Codex gets OpenAI's live model catalog
+through a pool account.
 
-- `advisorModel` restore them. They go in flag `--settings` too, because a `settings.json` `env`
-  block outranks the process environment. The proxy pins each session to one account (prompt cache)
-  and gives each subagent its own. Codex gets OpenAI's live model catalog through a pool account.
+The pool key never goes on a command line (argv shows up in `ps`, traces and resource telemetry):
+flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyHelper` prints
+`<stateDir>/pool/client-key` (0600) with `cat` (`type` on Windows). Codex reads the key from an
+env var. Models stay in their own harness: Claude models only through Claude Code, OpenAI models
+only through Codex (pooled instances drop cross-family custom models and gateway model discovery).
 
 **After an upstream merge, a Claude Code update or a CLIProxyAPI bump:**
 
@@ -136,7 +142,9 @@ fine-grained tool streaming, the global system-prompt cache, the 1h cache and th
    `is not a first-party Anthropic host` to find the new switch.
 4. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
 
-Known limits: on Windows a hard-killed server leaves the proxy running until T3 starts again;
+Known limits: during sign-in the proxy's OAuth callback listeners (54545 Claude, 1455 Codex) bind
+all interfaces (CLIProxyAPI has no option to restrict them); on Windows a hard-killed server leaves
+the proxy running until T3 starts again;
 signing in on a remote environment needs a browser on that machine (the OAuth callback is its
 localhost); an External pool shows no accounts or quotas and Codex keeps its built-in catalog.
 
