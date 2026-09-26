@@ -132,8 +132,8 @@ Issuer ID. You can drag files into the terminal. It validates everything, includ
 The script stores them in the GitHub Actions **environment `release`**, which it creates and
 restricts to the `main` branch. Only the fork-release jobs that sign declare that environment, so
 upstream workflows that arrive with a merge can't read the secrets. To add them by hand instead:
-GitHub → `sethhen/t3code` → Settings → Environments → _New environment_ `release` → Deployment
-branches: _Selected branches_ → `main` → then _Add environment secret_ for each of:
+GitHub → `sethhen/t3code` → Settings → Environments → `release` (already restricted to `main`)
+→ _Add environment secret_ for each of:
 
 | Secret             | Value                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
