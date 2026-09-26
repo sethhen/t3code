@@ -1,0 +1,161 @@
+/**
+ * Pure helpers for the Pool section: header status, labels, account and route
+ * presentation, parity checks, the external URL draft and failure triage.
+ */
+import {
+  type ExecutionEnvironmentPlatformOs,
+  type PoolAccount,
+  type PoolCheck,
+  type PoolProvider,
+  type PoolRoute,
+  type PoolStatus,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
+
+/** Dot tones, keyed like the provider cards' `PROVIDER_STATUS_STYLES`. */
+export type PoolTone = "ready" | "warning" | "error" | "disabled";
+
+export const POOL_PROVIDERS: readonly PoolProvider[] = ["claude", "codex"];
+
+export const POOL_PROVIDER_LABEL: Readonly<Record<PoolProvider, string>> = {
+  claude: "Claude",
+  codex: "Codex",
+};
+
+/** What the user signs in with, per provider (Codex runs on a ChatGPT account). */
+export const POOL_ACCOUNT_KIND: Readonly<Record<PoolProvider, string>> = {
+  claude: "Claude account",
+  codex: "ChatGPT account",
+};
+
+const DRIVER: Readonly<Record<PoolProvider, ProviderDriverKind>> = {
+  claude: ProviderDriverKind.make("claudeAgent"),
+  codex: ProviderDriverKind.make("codex"),
+};
+
+/** The T3 driver a pool provider maps to, for its icon and quota bar colour. */
+export function poolProviderDriver(provider: PoolProvider): ProviderDriverKind {
+  return DRIVER[provider];
+}
+
+export function accountCountLabel(count: number): string {
+  return `${count} ${count === 1 ? "account" : "accounts"}`;
+}
+
+/** The "this server" source option, named for the machine the environment runs on. */
+export function localSourceLabel(os: ExecutionEnvironmentPlatformOs | undefined): string {
+  if (os === "darwin") return "This Mac";
+  if (os === "windows") return "This PC";
+  return "This machine";
+}
+
+export interface HeaderStatus {
+  readonly label: string;
+  readonly tone: PoolTone;
+}
+
+/** The section header's one-line state: the local runtime, or the external server's reachability. */
+export function poolHeaderStatus(status: PoolStatus): HeaderStatus {
+  if (status.source === "external") {
+    const { external } = status;
+    if (external.url.trim() === "") return { label: "Not connected", tone: "disabled" };
+    if (external.reachable === undefined) return { label: "Connecting…", tone: "disabled" };
+    return external.reachable
+      ? { label: "Connected", tone: "ready" }
+      : { label: "Unreachable", tone: "error" };
+  }
+  const { runtime } = status;
+  switch (runtime.state) {
+    case "idle":
+      return { label: "Not started", tone: "disabled" };
+    case "downloading":
+      return { label: "Downloading…", tone: "disabled" };
+    case "starting":
+      return { label: "Starting…", tone: "disabled" };
+    case "running":
+      return { label: `Running · ${accountCountLabel(status.accounts.length)}`, tone: "ready" };
+    case "error":
+      return { label: runtime.message?.trim() || "Pool stopped", tone: "error" };
+  }
+}
+
+/** The label a row, menu or dialog uses for an account: its email, else its kind. */
+export function accountLabel(account: PoolAccount): string {
+  return account.email?.trim() || POOL_ACCOUNT_KIND[account.provider];
+}
+
+export type AccountNotice =
+  | { readonly kind: "paused" }
+  | { readonly kind: "cooling"; readonly text: string }
+  | { readonly kind: "error"; readonly text: string };
+
+/** The badge or warning an account row carries; null when it is simply ready. */
+export function accountNotice(account: PoolAccount): AccountNotice | null {
+  const message = account.message?.trim();
+  switch (account.status) {
+    case "ready":
+      return null;
+    case "disabled":
+      return { kind: "paused" };
+    case "cooling":
+      return { kind: "cooling", text: message || "Cooling down" };
+    case "error":
+      return { kind: "error", text: message || "Needs attention" };
+  }
+}
+
+/** Claude first, then Codex; server order within a provider, so rows never jump between polls. */
+export function orderAccounts(accounts: readonly PoolAccount[]): PoolAccount[] {
+  return POOL_PROVIDERS.flatMap((provider) =>
+    accounts.filter((account) => account.provider === provider),
+  );
+}
+
+/** Why a route set to Pool is not serving yet; null when it is active or set to Direct. */
+export function routeWaitingReason(route: PoolRoute): string | null {
+  if (route.mode !== "pool" || route.active) return null;
+  return route.reason?.trim() || `Waiting for a ${POOL_ACCOUNT_KIND[route.provider]}`;
+}
+
+/** Failing parity checks, one line each, for the callout under the section. */
+export function parityFailures(checks: readonly PoolCheck[]): string[] {
+  return checks
+    .filter((check) => check.state === "fail")
+    .map((check) => {
+      const detail = check.detail?.trim();
+      return detail ? `${check.label}: ${detail}` : `${check.label} is off in pooled sessions.`;
+    });
+}
+
+/**
+ * The external server URL as typed, made absolute. A bare host gets `http://`
+ * (pool servers usually sit on a LAN or tailnet); anything but http(s) is refused.
+ */
+export function normalizeExternalUrl(input: string): string | null {
+  const trimmed = input.trim();
+  if (trimmed === "") return null;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  let url: URL;
+  try {
+    url = new URL(withScheme);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.hostname === "") return null;
+  return withScheme.replace(/\/+$/, "");
+}
+
+/**
+ * True when the environment cannot serve the pool at all: a fork build without
+ * it ("Unknown extension method") or an official T3 server with no extension
+ * RPC ("Unknown request tag"). The section hides instead of showing an error.
+ */
+export function isPoolUnsupported(message: string): boolean {
+  return /Unknown extension method pool\.|Unknown request tag/i.test(message);
+}
+
+/** Status poll cadence: quicker while a sign-in is waiting on the browser. */
+export function statusPollDelay(loginPending: boolean): number {
+  return loginPending ? 1_500 : 5_000;
+}
