@@ -93,8 +93,15 @@ PREVIOUS_MOVED=""
 INCOMPLETE=""
 cleanup() {
   local status=$?
-  if [ -n "$PREVIOUS_MOVED" ] && [ ! -e "$APP" ] && [ -d "$STAGE_DIR/previous/$APP_NAME.app" ]; then
-    mv "$STAGE_DIR/previous/$APP_NAME.app" "$APP" && warn "install failed; restored the previous $APP"
+  local previous="$STAGE_DIR/previous/$APP_NAME.app"
+  if [ -n "$PREVIOUS_MOVED" ] && [ -d "$previous" ]; then
+    if [ ! -e "$APP" ] && mv "$previous" "$APP"; then
+      warn "install failed; restored the previous $APP"
+    else
+      # Keep the staging folder: it holds the only unzipped copy of the previous app.
+      warn "install failed and the previous app could not be restored; it is kept at: $previous"
+      STAGE_DIR=""
+    fi
   fi
   if [ -n "$STAGE_DIR" ] && [ -d "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi
   if [ -n "$INCOMPLETE" ] && [ -e "$INCOMPLETE" ]; then rm -rf "$INCOMPLETE"; fi
@@ -220,11 +227,24 @@ if [ -d "$USERDATA" ]; then
   for db in "$USERDATA"/*.sqlite; do
     [ -f "$db" ] || continue
     out="$INCOMPLETE/userdata/$(basename "$db")"
-    # VACUUM INTO writes a consistent, WAL-free copy without writing to the live database.
+    # VACUUM INTO writes a consistent, WAL-free copy. The live database is never opened read-write.
     if ! run sqlite3 -readonly "$db" "VACUUM INTO '${out//$Q/$Q$Q}'"; then
-      warn "read-only open failed (unclean shutdown?); retrying with a normal open"
       rm -f "$out"
-      run sqlite3 "$db" "VACUUM INTO '${out//$Q/$Q$Q}'"
+      UNSETTLED="could not back up $(basename "$db") read-only; nothing was installed and $APP is untouched. Open $APP_NAME, quit it (Cmd+Q) so it settles the database, then re-run"
+      # An immutable open takes no locks and ignores the -wal/-journal files, so it is a faithful
+      # snapshot only when nothing holds the database and it has no pending log.
+      if [ -s "$db-wal" ] || [ -s "$db-journal" ] || [ -n "$(lsof -t -- "$db" 2>/dev/null || true)" ]; then
+        die "$UNSETTLED (it has a pending log or is open by another process)"
+      fi
+      # Normal after a clean quit: the -wal file is gone and a read-only connection cannot create it.
+      info "read-only open failed; nothing holds $(basename "$db") and it has no pending log, retrying as an immutable file"
+      uri="${db//"%"/%25}"
+      uri="${uri//"?"/%3f}"
+      uri="file:${uri//"#"/%23}?mode=ro&immutable=1"
+      if ! run sqlite3 -readonly "$uri" "VACUUM INTO '${out//$Q/$Q$Q}'"; then
+        rm -f "$out"
+        die "$UNSETTLED"
+      fi
     fi
     CHECK="$(sqlite3 -readonly "$out" 'PRAGMA quick_check' 2>&1 || true)"
     [ "$CHECK" = ok ] || die "backup of $(basename "$db") failed quick_check: $CHECK"

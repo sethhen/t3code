@@ -120,10 +120,12 @@ while IFS= read -r line; do
     if git cat-file -e "$OLD_BASE:$file" 2>/dev/null; then printf '%s\n' "$file"; fi
   done)"
   [ -n "$touched" ] || continue
-  case "$subject" in
-    "$HOST_COMMIT_SUBJECT"*) HOST_SEEN=1 ;;
-    *) warn "'$subject' edits upstream files; only the '$HOST_COMMIT_SUBJECT' commit should (FORK.md)" ;;
-  esac
+  # FORK.md's one rule: a single host commit edits upstream files, so rebases conflict in one place.
+  if [ "$HOST_SEEN" = 0 ] && [[ "$subject" == "$HOST_COMMIT_SUBJECT"* ]]; then
+    HOST_SEEN=1
+  else
+    block "${sha:0:9} '$subject' edits upstream files; only the one '$HOST_COMMIT_SUBJECT' commit may (FORK.md). Move these edits into it: ${touched//$'\n'/ }"
+  fi
   info "${sha:0:9} $subject"
   while IFS= read -r file; do
     if git grep -q -e t3-ext "$BRANCH" -- "$file"; then
@@ -135,6 +137,7 @@ while IFS= read -r line; do
 done < <(git log --reverse --format='%H %s' "$OLD_BASE..$BRANCH")
 [ "$HOST_SEEN" = 1 ] || warn "no '$HOST_COMMIT_SUBJECT' commit edits upstream files"
 
+# The push leases against this reviewed value (not whatever a background fetch later records).
 ORIGIN_SHA="$(git rev-parse --verify --quiet "refs/remotes/$ORIGIN_REMOTE/$BRANCH" || true)"
 if [ -z "$ORIGIN_SHA" ]; then
   info "$ORIGIN_REMOTE/$BRANCH: not known locally (first push)"
@@ -306,7 +309,8 @@ info "artifact: $DMG"
 
 if [ "$PUSH" = 1 ]; then
   step "Pushing $BRANCH to $ORIGIN_REMOTE"
-  run fork_git push --force-with-lease "$ORIGIN_REMOTE" "$BRANCH"
+  # An empty ORIGIN_SHA (first push) leases on the remote branch not existing yet.
+  run fork_git push "--force-with-lease=$BRANCH:$ORIGIN_SHA" "$ORIGIN_REMOTE" "$BRANCH"
 else
   step "Skipping push (--no-push)"
 fi

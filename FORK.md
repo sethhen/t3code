@@ -7,8 +7,9 @@ and is installed over the official desktop app as an unsigned, non-updating buil
 
 ## The one rule: upstream files are touched by one commit only
 
-Only the `feat(fork): extension host ...` commit edits upstream files. Every edit in it is
-marked with a `t3-ext` comment so a rebase conflict is easy to recognise. Touch points:
+Only the `feat(fork): extension host ...` commit edits upstream files (`update.sh` refuses to
+run while another commit does). Every edit in it is marked with a `t3-ext` comment so a rebase
+conflict is easy to recognise. Touch points:
 
 | File                                         | What the fork adds                                                   |
 | -------------------------------------------- | -------------------------------------------------------------------- |
@@ -48,9 +49,10 @@ scripts/fork/update.sh                  # latest stable release, or: update.sh v
 It fetches upstream tags, rebases `wingman` with `git rebase --onto <new> <old> wingman`,
 runs `pnpm install`, typechecks contracts/server/web, runs the extension tests, builds an
 unsigned arm64 DMG without an update feed (`release/T3-Code-<version>-arm64.dmg`) and pushes
-`wingman` with `--force-with-lease` (`--no-push` to skip). On a conflict it stops and lists the
-files: fix them, `git add`, `fork_git rebase --continue`, then re-run `update.sh <tag>` (the base
-is then already the new tag, so it continues with install/build). Undo a finished rebase with the
+`wingman` with `--force-with-lease` on the `origin/wingman` commit it checked before the rebase
+(`--no-push` to skip). On a conflict it stops and lists the files: fix them, `git add`,
+`fork_git rebase --continue`, then re-run `update.sh <tag>` (the base is then already the new
+tag, so it continues with install/build). Undo a finished rebase with the
 `git reset --hard <old tip>` it prints.
 
 ## Install and roll back
@@ -65,16 +67,19 @@ the installed version. Backups go to `~/Applications/T3 Code backups/`:
   Bundles are zipped (`ditto -c -k`) on purpose: an unzipped copy is a second
   `com.t3tools.t3code` that LaunchServices could open for `t3code://` links.
 - `userdata-<ts>-<official|fork>-<ver>/` - `~/.t3/userdata` (every top-level `*.sqlite` via
-  `sqlite3 -readonly ... "VACUUM INTO ..."` + `quick_check`; the rest copied without
-  `-wal`/`-shm` and without `logs/`) and the Chromium profile
+  `sqlite3 -readonly ... "VACUUM INTO ..."`, or an `immutable=1` open when the database has no
+  pending log, + `quick_check`; the rest copied without `-wal`/`-shm` and without `logs/`) and
+  the Chromium profile
   (`~/Library/Application Support/t3code`, caches excluded). Backups taken over an official
   app are kept forever, otherwise the newest 3.
 
 It then stages the new bundle in `/Applications`, clears quarantine, ad-hoc signs it if the
 unsigned build's signature does not verify, swaps it in as `/Applications/T3 Code (Alpha).app`
-(restoring the old bundle if the swap fails), opens it and prints the rollback commands.
+(restoring the old bundle if the swap fails, or printing where it is kept), opens it and prints
+the rollback commands.
 
-Rollback (quit T3 Code first):
+Rollback: close any Skills & MCP tab first (the official app shows it as a blank tab, which you
+can close), quit T3 Code, then:
 
 ```bash
 rm -rf "/Applications/T3 Code (Alpha).app"   # ditto merges into an existing bundle: remove first
