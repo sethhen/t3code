@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Store the fork's desktop code-signing credentials as GitHub Actions secrets.
+# Store the fork's desktop code-signing credentials as secrets of the GitHub Actions environment
+# "release", which only runs on `main`, so other workflows (e.g. upstream ones) never see them.
 # Run it yourself in a terminal. Values come from local files or hidden prompts and are piped
 # straight into `gh secret set`, so they never pass through chat, argv or shell history.
 #
@@ -14,6 +15,7 @@
 set -euo pipefail
 
 REPO="sethhen/t3code"
+ENVIRONMENT=release
 MODE=mac
 DRY_RUN=0
 ONLINE_CHECKS=1
@@ -133,14 +135,29 @@ preflight_gh() {
   [[ "$admin" == "true" ]] || die "your gh account needs admin access to $REPO to set Actions secrets"
 }
 
+# The environment exists, restricted to the main branch (idempotent). The fork-release jobs that
+# sign declare `environment: release`.
+ensure_environment() {
+  [[ "$DRY_RUN" == 1 ]] && return 0
+  gh api --silent -X PUT "repos/$REPO/environments/$ENVIRONMENT" \
+    -F 'deployment_branch_policy[protected_branches]=false' \
+    -F 'deployment_branch_policy[custom_branch_policies]=true' ||
+    die "could not create the '$ENVIRONMENT' environment on $REPO"
+  if ! gh api "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
+    --jq '.branch_policies[].name' 2>/dev/null | grep -qx main; then
+    gh api --silent -X POST "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
+      -f name=main -f type=branch || die "could not restrict '$ENVIRONMENT' to the main branch"
+  fi
+}
+
 # confirm NAME...: show which secrets will be set (and which already exist), then ask.
 confirm() {
   local existing name overwrite=""
-  existing="$(gh secret list --repo "$REPO" --json name --jq '.[].name' 2>/dev/null || true)"
+  existing="$(gh secret list --repo "$REPO" --env "$ENVIRONMENT" --json name --jq '.[].name' 2>/dev/null || true)"
   for name in "$@"; do
     if printf '%s\n' "$existing" | grep -qx "$name"; then overwrite="$overwrite $name"; fi
   done
-  step "Ready to set $# Actions secrets on $REPO"
+  step "Ready to set $# secrets in the '$ENVIRONMENT' environment of $REPO"
   info "$*"
   if [[ -n "$overwrite" ]]; then info "already set, will be overwritten:$overwrite"; fi
   local reply=""
@@ -153,7 +170,7 @@ confirm() {
 
 # set_secret NAME < value   (gh reads the value from stdin; it never appears in argv)
 set_secret() {
-  gh secret set "$1" --repo "$REPO" >/dev/null || die "gh secret set $1 failed (secrets set so far:${SET_LIST:- none})"
+  gh secret set "$1" --repo "$REPO" --env "$ENVIRONMENT" >/dev/null || die "gh secret set $1 failed (secrets set so far:${SET_LIST:- none})"
   SET_LIST="$SET_LIST $1"
   info "set $1"
 }
@@ -397,7 +414,8 @@ fi
 
 # shellcheck disable=SC2086 # NAMES is a space-separated list of fixed secret names
 confirm $NAMES
-step "Setting secrets on $REPO"
+ensure_environment
+step "Setting secrets in the '$ENVIRONMENT' environment of $REPO"
 if [[ "$MODE" == mac ]]; then set_mac_secrets; else set_windows_secrets; fi
 P12_PASS=""
 AZ_SECRET=""

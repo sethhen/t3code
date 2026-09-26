@@ -129,8 +129,11 @@ Issuer ID. You can drag files into the terminal. It validates everything, includ
 `notarytool history` call with the key when Xcode is installed. It then pipes each value into
 `gh secret set` and prints only the secret names.
 
-To add the secrets by hand instead, go to GitHub → `sethhen/t3code` → Settings → Secrets and
-variables → Actions → _New repository secret_:
+The script stores them in the GitHub Actions **environment `release`**, which it creates and
+restricts to the `main` branch. Only the fork-release jobs that sign declare that environment, so
+upstream workflows that arrive with a merge can't read the secrets. To add them by hand instead:
+GitHub → `sethhen/t3code` → Settings → Environments → _New environment_ `release` → Deployment
+branches: _Selected branches_ → `main` → then _Add environment secret_ for each of:
 
 | Secret             | Value                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |

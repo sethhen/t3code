@@ -10,9 +10,14 @@ name: Fork release
 #   bundle   JS bundle (server + web client + Electron main), built once on Linux
 #   mac      macOS arm64 dmg + zip, Developer ID signed + notarized when the
 #            Apple secrets exist
+#   linux_cli  Linux x64 CLI archive, embedded in the Windows app as the WSL
+#            runtime (the WSL backend runs it inside the distro)
 #   windows  Windows x64 NSIS installer, Azure Trusted Signing when those
 #            secrets exist
 #   publish  draft release with every asset, then flipped to Latest
+#
+# Signing secrets live in the "release" environment (main only), which only
+# plan, mac and windows declare, so upstream workflows never see them.
 #
 # Without the Apple secrets a run is a dry run: unsigned builds, uploaded as
 # workflow artifacts only, never published (an unsigned macOS app cannot
@@ -57,6 +62,7 @@ jobs:
   plan:
     name: Plan version and signing
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -145,6 +151,7 @@ jobs:
           AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
           EVENT_NAME: ${{ github.event_name }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           missing() {
@@ -168,6 +175,16 @@ jobs:
           publish=false
           if [[ "$mac_signed" == true && "$requested" == true ]]; then
             publish=true
+          fi
+
+          # Once a signed Windows build is installed, the updater refuses any
+          # installer that isn't signed by the same publisher.
+          if [[ "$publish" == true && "$win_signed" != true ]]; then
+            latest_body="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || true)"
+            if grep -q 'windows-signed: true' <<<"$latest_body"; then
+              echo "::error title=Windows signing lapsed::The latest release has a signed Windows build, so installed Windows copies would refuse an unsigned update. Restore the Azure secrets (${win_missing% }) and re-run."
+              exit 1
+            fi
           fi
 
           if [[ "$mac_signed" != true ]]; then
@@ -249,10 +266,100 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # The Windows app embeds this archive as its WSL runtime (upstream builds it
+  # in its Linux desktop job). Same steps as upstream's release-desktop.yml
+  # CLI archive path, minus signing, which Linux doesn't need.
+  linux_cli:
+    name: WSL runtime (Linux x64 CLI)
+    needs: [plan, bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Checkout
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --quiet --detach FETCH_HEAD
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor
+          key: resource-monitor-x86_64-unknown-linux-gnu-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-js-bundle
+          path: apps
+
+      # The single-executable needs a Node with --build-sea; upstream pins the
+      # exact version in apps/server/vite.config.ts (SEA_NODE_VERSION).
+      - name: Build CLI single-executable
+        run: |
+          set -euo pipefail
+          VP_NODE_VERSION="$(sed -n 's/^const SEA_NODE_VERSION = "\(.*\)";$/\1/p' apps/server/vite.config.ts)"
+          [[ -n "$VP_NODE_VERSION" ]] || { echo "::error::SEA_NODE_VERSION not found in apps/server/vite.config.ts"; exit 1; }
+          export VP_NODE_VERSION
+          node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build CLI archive
+        run: |
+          set -euo pipefail
+          monitor_dir="$RUNNER_TEMP/cli-resource-monitor"
+          mkdir -p "$monitor_dir/linux-x64"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$monitor_dir/linux-x64/"
+          node scripts/build-cli-archive.ts --platform linux --arch x64 --version "$VERSION" \
+            --resource-monitor-dir "$monitor_dir" --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "$VERSION"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-cli-linux-x64
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 3
+
   mac:
     name: Desktop macOS arm64
     needs: [plan, bundle]
     runs-on: macos-15
+    environment: release
     timeout-minutes: 75
     env:
       VERSION: ${{ needs.plan.outputs.version }}
@@ -431,8 +538,9 @@ jobs:
 
   windows:
     name: Desktop Windows x64
-    needs: [plan, bundle]
+    needs: [plan, bundle, linux_cli]
     runs-on: windows-latest
+    environment: release
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.plan.outputs.version }}
@@ -498,6 +606,12 @@ jobs:
           name: fork-js-bundle
           path: apps
 
+      - name: Download WSL runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-cli-linux-x64
+          path: wsl-runtime
+
       # The build script's Windows preflight requires the Spectre-mitigated
       # MSVC libraries (same step as upstream's release-desktop.yml).
       - name: Install Spectre-mitigated MSVC libs
@@ -541,9 +655,6 @@ jobs:
             Select-Object -Unique
           "PSModulePath=$($modulePathEntries -join ';')" >> $env:GITHUB_ENV
 
-      # No --wsl-runtime: embedding the Linux CLI archive would need upstream's
-      # Linux CLI build too. The native Windows backend works without it; the
-      # WSL backend does not.
       - name: Build desktop artifact
         env:
           T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
@@ -557,7 +668,8 @@ jobs:
           AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
         run: |
           set -euo pipefail
-          args=(--platform win --target nsis --arch x64 --build-version "$VERSION" --skip-build --verbose)
+          args=(--platform win --target nsis --arch x64 --build-version "$VERSION" --skip-build --verbose
+            --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz)
           if [[ "$SIGNED" == true ]]; then
             echo "Windows signing enabled (Azure Trusted Signing)."
             args+=(--signed)
@@ -599,6 +711,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.plan.outputs.version }}
+      WIN_SIGNED: ${{ needs.plan.outputs.win_signed }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -654,7 +767,12 @@ jobs:
             release-assets/latest-mac.yml release-assets/latest.yml)
           gh release create "$tag" --draft --target "$GITHUB_SHA" \
             --title "T3 Code $VERSION" --generate-notes "${files[@]}"
-          gh release edit "$tag" --draft=false --prerelease=false --latest
+          # The plan job reads this marker to stop an unsigned Windows build
+          # from following a signed one.
+          notes="$RUNNER_TEMP/notes.md"
+          gh release view "$tag" --json body --jq .body > "$notes"
+          printf '\n<!-- windows-signed: %s -->\n' "$WIN_SIGNED" >> "$notes"
+          gh release edit "$tag" --notes-file "$notes" --draft=false --prerelease=false --latest
 
           url="$(gh release view "$tag" --json url --jq .url)"
           echo "Published $url"
