@@ -132,7 +132,15 @@ export const scanClaude = Effect.fn("skillsMcp.skills.scanClaude")(function* (
       inAppDir: scope === "user" && appDirs.has(path.dirname(dir)) && !(yield* isSymlink(dir)),
     });
   }
-  return [...skills, ...(yield* scanSynced("claude", paths.appDirs.claude))];
+  // T3's discovery rejects frontmatter Claude Code itself accepts (e.g. an
+  // unquoted ": " inside `description`; Claude 2.1.282 still loads and counts
+  // those skills in /context), so every folder with a SKILL.md is listed.
+  const loaded = new Set(skills.map((skill) => skill.dir));
+  const lenient = [
+    ...(yield* scanFolder("claude", paths.appDirs.claude, "user", true, new Set(["synced"]))),
+    ...(yield* scanFolder("claude", path.join(cwd, ".claude", "skills"), "project", false)),
+  ].filter((skill) => !loaded.has(skill.dir));
+  return [...skills, ...lenient, ...(yield* scanSynced("claude", paths.appDirs.claude))];
 });
 
 const PLUGIN_SKILL =
