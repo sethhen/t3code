@@ -20,3 +20,7 @@ fork_git() { XDG_CONFIG_HOME="$FORK_HOOK_XDG" git "$@"; }
 # The desktop build compiles native/resource-monitor with Cargo (rustup, installed
 # with --no-modify-path so shell profiles stay untouched).
 if [ -d "$HOME/.cargo/bin" ]; then export PATH="$HOME/.cargo/bin:$PATH"; fi
+
+# Upstream build scripts spawn repo tools (e.g. `vp`) by name, as pnpm scripts would.
+FORK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
+export PATH="$FORK_ROOT/node_modules/.bin:$PATH"
