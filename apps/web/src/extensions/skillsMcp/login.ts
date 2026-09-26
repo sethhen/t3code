@@ -91,7 +91,9 @@ export function useMcpLogin(input: {
         name,
         platform,
       );
-      const terminalId = `mcp-login-${randomUUID().slice(0, 8)}`;
+      // The tab shows the terminal id while idle, so name it after the server.
+      const slug = name.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 40);
+      const terminalId = `login-${slug}-${randomUUID().slice(0, 4)}`;
       const opened = await openTerminal({
         environmentId,
         input: { threadId, terminalId, cwd, providerInstanceId: provider.instanceId },
