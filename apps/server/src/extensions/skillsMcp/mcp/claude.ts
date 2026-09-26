@@ -4,6 +4,8 @@
  * from a thread-less Agent SDK query (see `probes.ts`); user-scope writes go through
  * `claude mcp add-json/remove -s user` so Claude owns its own file format.
  */
+// @effect-diagnostics-next-line nodeBuiltinImport:off - the Agent SDK spawns through a Node ChildProcess.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
 
 import {
@@ -218,9 +220,51 @@ export const claudeCall = <A>(label: string, run: () => Promise<A>) =>
       new ExtensionFailure({ message: `Claude ${label}: ${describeCause(cause)}`, cause }),
   });
 
+/** Resolves true once `child` has exited, or false after `timeout`. */
+const awaitExit = (child: NodeChildProcess.ChildProcess, timeout: Duration.Input) =>
+  Effect.callback<boolean>((resume) => {
+    // No pid: the spawn itself failed, so there is nothing to wait for.
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+      return resume(Effect.succeed(true));
+    }
+    const exited = () => resume(Effect.succeed(true));
+    child.once("exit", exited);
+    child.once("error", exited);
+    return Effect.sync(() => {
+      child.off("exit", exited);
+      child.off("error", exited);
+    });
+  }).pipe(Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.succeed(false) }));
+
+/**
+ * Waits for the Claude process to really exit. `query.close()` only starts a
+ * shutdown (stdin EOF, SIGTERM seconds later) and returns at once, but Claude
+ * rewrites `.claude.json` at startup and exit, so a caller that goes on to
+ * write that file (see `withAgentWrite` in `probes.ts`) must not overlap it.
+ */
+const reapClaude = (child: NodeChildProcess.ChildProcess | undefined) =>
+  Effect.gen(function* () {
+    if (!child) return;
+    if (yield* awaitExit(child, Duration.seconds(3))) return;
+    child.kill("SIGTERM");
+    if (yield* awaitExit(child, Duration.seconds(5))) return;
+    child.kill("SIGKILL");
+    if (yield* awaitExit(child, Duration.seconds(2))) return;
+    yield* Effect.logWarning(`Claude probe process ${child.pid} did not exit after SIGKILL`);
+  });
+
+/** `failure` plus the last line Claude printed to stderr, if any. */
+const withStderr = (failure: ExtensionFailure, stderr: string) => {
+  const last = stderr.trim().split("\n").at(-1)?.trim().slice(0, 300);
+  return last && !failure.message.includes(last)
+    ? new ExtensionFailure({ message: `${failure.message} (${last})`, cause: failure })
+    : failure;
+};
+
 /**
  * Runs `use` against a Claude Agent SDK session at `cwd` that never sends a
- * prompt (so nothing reaches the API), then aborts it.
+ * prompt (so nothing reaches the API), then closes it and waits for the
+ * process to exit, also when interrupted.
  */
 export const withClaudeQuery = <A, R = never>(
   cli: AgentCli,
@@ -233,14 +277,35 @@ export const withClaudeQuery = <A, R = never>(
       Effect.try({
         try: () => {
           const abort = new AbortController();
+          const spawned: { child?: NodeChildProcess.ChildProcess; stderr: string } = {
+            stderr: "",
+          };
           const query = claudeQuery({
             // oxlint-disable-next-line require-yield
             prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
               await waitForAbort(abort.signal);
             })(),
-            options: probeOptions(cli, executablePath, abort, cwd),
+            options: {
+              ...probeOptions(cli, executablePath, abort, cwd),
+              // The SDK's own spawn, keeping the child so the release can wait for it.
+              spawnClaudeCodeProcess: ({ command, args, cwd, env, signal }) => {
+                const child = NodeChildProcess.spawn(command, args, {
+                  cwd,
+                  env,
+                  signal,
+                  stdio: ["pipe", "pipe", "pipe"],
+                  windowsHide: true,
+                });
+                // A custom spawn loses the SDK's stderr tail in its errors; keep our own.
+                child.stderr?.on("data", (chunk) => {
+                  spawned.stderr = (spawned.stderr + String(chunk)).slice(-2000);
+                });
+                spawned.child = child;
+                return child;
+              },
+            },
           });
-          return { abort, query };
+          return { abort, query, spawned };
         },
         catch: (cause) =>
           new ExtensionFailure({
@@ -248,8 +313,9 @@ export const withClaudeQuery = <A, R = never>(
             cause,
           }),
       }),
-      ({ query }) =>
+      ({ query, spawned }) =>
         claudeCall("session", () => query.initializationResult()).pipe(
+          Effect.mapError((failure) => withStderr(failure, spawned.stderr)),
           Effect.timeoutOrElse({
             duration: INIT_TIMEOUT,
             orElse: () =>
@@ -257,11 +323,11 @@ export const withClaudeQuery = <A, R = never>(
           }),
           Effect.andThen(use(query)),
         ),
-      ({ abort, query }) =>
+      ({ abort, query, spawned }) =>
         Effect.sync(() => {
           abort.abort();
           query.close();
-        }),
+        }).pipe(Effect.andThen(Effect.suspend(() => reapClaude(spawned.child)))),
     );
   });
 

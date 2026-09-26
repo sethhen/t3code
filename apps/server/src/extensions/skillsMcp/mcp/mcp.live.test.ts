@@ -7,10 +7,12 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { McpMutation, McpServerRow } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { type AgentCli, resolveAgentClis } from "../shared/agents.ts";
 import { listMcp, mutateMcp } from "./index.ts";
@@ -203,6 +205,90 @@ const storedNamed = (name: string) =>
 
 const codexHas = (toml: string, name: string) =>
   new RegExp(`^\\[mcp_servers\\.${name}[\\].]`, "m").test(toml);
+
+interface AgentProcess {
+  readonly pid: number;
+  readonly command: string;
+}
+
+/**
+ * The `claude` / `codex` processes this test process started (its
+ * descendants) that run at `cwd`, i.e. the probes' sessions.
+ */
+const agentProcessesAt = (cwd: string) =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const table = (yield* spawner.lines(
+      ChildProcess.make("ps", ["-A", "-o", "pid=,ppid=,command="]),
+    )).flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      return match
+        ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" }]
+        : [];
+    });
+    const descendants = new Set([process.pid]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const row of table) {
+        if (!descendants.has(row.pid) && descendants.has(row.ppid)) {
+          descendants.add(row.pid);
+          grew = true;
+        }
+      }
+    }
+    const agents = table.filter(
+      (row) =>
+        row.pid !== process.pid &&
+        descendants.has(row.pid) &&
+        /\b(claude|codex)\b/.test(row.command),
+    );
+    if (agents.length === 0) return [];
+    // `lsof -F n`: a `p<pid>` line, then `f<fd>` and `n<path>` for its cwd.
+    const lines = yield* spawner
+      .lines(
+        ChildProcess.make("lsof", [
+          "-a",
+          "-d",
+          "cwd",
+          "-Fn",
+          "-p",
+          agents.map((row) => row.pid).join(","),
+        ]),
+      )
+      .pipe(Effect.orElseSucceed((): Array<string> => []));
+    const atCwd = new Set<number>();
+    let pid = 0;
+    for (const line of lines) {
+      if (line.startsWith("p")) pid = Number(line.slice(1));
+      else if (line === `n${cwd}`) atCwd.add(pid);
+    }
+    return agents
+      .filter((row) => atCwd.has(row.pid))
+      .map(({ pid, command }): AgentProcess => ({ pid, command }));
+  });
+
+/** Waits (up to 30 s) until a Claude and a Codex session run at `cwd`. */
+const awaitAgentSessions = (cwd: string) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 300; attempt++) {
+      const found = yield* agentProcessesAt(cwd);
+      const claude = found.filter((proc) => /\bclaude\b/.test(proc.command));
+      const codex = found.filter((proc) => /\bcodex\b/.test(proc.command));
+      if (claude.length > 0 && codex.length > 0) return { claude, codex };
+      yield* Effect.sleep("100 millis");
+    }
+    return assert.fail(`no Claude and Codex probe sessions ran at ${cwd}`);
+  });
+
+const isAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
   // Real clock: CLI timeouts and the pending-server wait must not run on the TestClock.
@@ -480,6 +566,69 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
 
             // Let the last list's background context probe finish before the sandbox goes.
             yield* probeClaude(sandbox.claude, project);
+          }),
+        ),
+      TIMEOUT,
+    );
+
+    it.effect(
+      "a write stops the probes in flight, then lands in both apps and the probes rerun",
+      () =>
+        withSandbox((sandbox) =>
+          Effect.gen(function* () {
+            const { project } = sandbox;
+            // A Codex server that never answers keeps the (otherwise quick)
+            // Codex probe running for a few seconds, like a Claude one.
+            yield* expectOk({
+              action: "upsert",
+              name: "slowpoke",
+              spec: {
+                type: "stdio",
+                command: "node",
+                args: ["-e", "setTimeout(() => process.exit(1), 4000)"],
+              },
+              apps: { claude: false, codex: true },
+            });
+            // Both CLIs rewrite their config when they start (Claude again on
+            // exit), so a probe overlapping the write could drop it.
+            const claudeProbe = yield* Effect.forkChild(
+              probeClaude(sandbox.claude, project, { refresh: true }),
+            );
+            const codexProbe = yield* Effect.forkChild(
+              probeCodex(sandbox.codex, project, { refresh: true }),
+            );
+            const sessions = yield* awaitAgentSessions(project);
+            yield* Effect.log("[live] probe sessions before the write", sessions);
+
+            yield* expectOk({
+              action: "upsert",
+              name: "racer",
+              spec: { type: "stdio", command: "node", args: [sandbox.echoServer] },
+              apps: { claude: true, codex: true },
+            });
+            // The write interrupted both probes and waited for their processes.
+            for (const proc of [...sessions.claude, ...sessions.codex]) {
+              assert.isFalse(isAlive(proc.pid), `${proc.command} (${proc.pid}) outlived the write`);
+            }
+            const inBothApps = Effect.gen(function* () {
+              assert.deepInclude((yield* readClaudeServers(sandbox.claudeJson)).mcpServers?.racer, {
+                command: "node",
+                args: [sandbox.echoServer],
+              });
+              assert.isTrue(codexHas(yield* readText(sandbox.codexToml), "racer"));
+            });
+            yield* inBothApps;
+
+            // The probes reran after the write, so they see the new server...
+            const claude = yield* Fiber.join(claudeProbe);
+            assert.isUndefined(claude.error);
+            assert.isDefined(claude.statuses.find((server) => server.name === "racer"));
+            const codex = yield* Fiber.join(codexProbe);
+            assert.isUndefined(codex.error);
+            assert.isDefined(codex.statuses.find((server) => server.name === "racer"));
+            // ...their own config rewrites kept it, and nothing is left running.
+            yield* inBothApps;
+            assert.deepStrictEqual(yield* agentProcessesAt(project), []);
           }),
         ),
       TIMEOUT,

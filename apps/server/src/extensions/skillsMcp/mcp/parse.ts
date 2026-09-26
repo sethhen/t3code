@@ -138,6 +138,11 @@ export interface ClaudeServerStatus {
   readonly status: string;
   readonly error?: string | undefined;
   readonly scope?: string | undefined;
+  /**
+   * Where the definition came from; the CLI sends it though the SDK types omit
+   * it: `plugin` for a plugin's server, `sdk`, or the config scope.
+   */
+  readonly source?: string | undefined;
   readonly serverInfo?: { readonly version?: string | undefined } | undefined;
   readonly tools?:
     | ReadonlyArray<{
@@ -162,14 +167,24 @@ const CLAUDE_STATUSES: Readonly<Record<string, McpLiveStatus>> = {
   disabled: "disabled",
 };
 
-const claudeScope = (scope: string | undefined): { scope: McpScope; source?: string } => {
-  switch (scope) {
+/**
+ * Claude names a plugin's server `plugin:<plugin>:<server>` and reports it
+ * with scope `dynamic`; the plugin's name is the part between the colons.
+ */
+const CLAUDE_PLUGIN_SERVER = /^plugin:([^:]+):./;
+
+const claudeScope = (status: ClaudeServerStatus): { scope: McpScope; source?: string } => {
+  const plugin = CLAUDE_PLUGIN_SERVER.exec(status.name)?.[1];
+  if (status.source === "plugin" || (status.source === undefined && plugin)) {
+    return plugin ? { scope: "plugin", source: plugin } : { scope: "plugin" };
+  }
+  switch (status.scope) {
     case "user":
     case "project":
     case "local":
     case "plugin":
     case "managed":
-      return { scope };
+      return { scope: status.scope };
     case "claudeai":
       return { scope: "managed", source: "claude.ai" };
     case "enterprise":
@@ -181,7 +196,7 @@ const claudeScope = (scope: string | undefined): { scope: McpScope; source?: str
 
 /** One entry of `query.mcpServerStatus()`. */
 export const claudeLiveServer = (status: ClaudeServerStatus): LiveServer => {
-  const { scope, source } = claudeScope(status.scope);
+  const { scope, source } = claudeScope(status);
   const version = nonEmpty(status.serverInfo?.version);
   const error = nonEmpty(status.error);
   return {

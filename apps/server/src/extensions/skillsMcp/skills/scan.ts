@@ -17,6 +17,7 @@ import * as Result from "effect/Result";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
 import { type AgentCli, withCodexClient } from "../shared/agents.ts";
+import { gatedRead } from "../mcp/probes.ts";
 import { ExtensionFailure, discoverClaudeSkills } from "../shared/t3.ts";
 import { isSymlink, readSkillInfo } from "./archive.ts";
 import type { DeploymentState } from "./deploy.ts";
@@ -222,8 +223,13 @@ export const listCodexSkills = Effect.fn("skillsMcp.skills.listCodexSkills")(fun
   let error: string | undefined;
   if (available) {
     const listed = yield* Effect.result(
-      withCodexClient(cli, cwd, (client) =>
-        client.request("skills/list", { cwds: [cwd], forceReload: true }),
+      // Gated: a codex app-server rewrites config.toml at startup, so it must
+      // not overlap an MCP config write (see mcp/probes.ts).
+      gatedRead(
+        "codex",
+        withCodexClient(cli, cwd, (client) =>
+          client.request("skills/list", { cwds: [cwd], forceReload: true }),
+        ),
       ).pipe(
         Effect.timeoutOrElse({
           duration: CODEX_LIST_TIMEOUT,

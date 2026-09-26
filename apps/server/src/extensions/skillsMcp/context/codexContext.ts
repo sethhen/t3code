@@ -13,7 +13,12 @@ import * as Exit from "effect/Exit";
 import * as Path from "effect/Path";
 
 import { readJsonFile } from "../mcp/claude.ts";
-import { codexSnapshot, type CodexMcpServerStatus, type CodexMcpTool } from "../mcp/probes.ts";
+import {
+  codexSnapshot,
+  type CodexMcpServerStatus,
+  type CodexMcpTool,
+  gatedRead,
+} from "../mcp/probes.ts";
 import { isRecord } from "../mcp/spec.ts";
 import { type AgentCli, describeCause, withCodexClient } from "../shared/agents.ts";
 import { expandHomePath, ExtensionFailure } from "../shared/t3.ts";
@@ -165,8 +170,13 @@ const SKILLS_TIMEOUT = Duration.seconds(30);
 /** Module-level: the handler registry is rebuilt per ws connection. */
 const skillsSlots = new Map<string, SkillsSlot>();
 
+// Gated like the MCP probes: the app-server rewrites config.toml at startup, so
+// a Codex config write stops it and the listing reruns afterwards.
 const listSkills = (cli: AgentCli, cwd: string) =>
-  withCodexClient(cli, cwd, (client) => client.request("skills/list", { cwds: [cwd] })).pipe(
+  gatedRead(
+    "codex",
+    withCodexClient(cli, cwd, (client) => client.request("skills/list", { cwds: [cwd] })),
+  ).pipe(
     Effect.timeoutOrElse({
       duration: SKILLS_TIMEOUT,
       orElse: () => Effect.fail(new ExtensionFailure({ message: "Codex skills/list timed out" })),

@@ -1,7 +1,7 @@
 import type { AgentApp } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
-import { adoptUserServers } from "./index.ts";
+import { adoptUserServers, codexWriteHeld } from "./index.ts";
 import type { ConfigServer } from "./parse.ts";
 import { makeMcpPresets } from "./presets.ts";
 import { specFromClaude, specFromCodex } from "./spec.ts";
@@ -174,5 +174,32 @@ describe("makeMcpPresets", () => {
     const presets = makeMcpPresets("linux");
     assert.strictEqual(new Set(presets.map((preset) => preset.id)).size, presets.length);
     for (const preset of presets) assert.match(preset.name, /^[A-Za-z0-9_-]+$/);
+  });
+});
+
+describe("codexWriteHeld", () => {
+  const value = { command: "npx", args: ["-y", "srv"], enabled: true };
+
+  it("checks a written table by spec and enabled flag", () => {
+    const write = { name: "srv", value };
+    assert.isTrue(codexWriteHeld(write, codex("srv", value)));
+    // A stale copy put back the old command, or the table is gone.
+    assert.isFalse(codexWriteHeld(write, codex("srv", { ...value, args: ["-y", "old"] })));
+    assert.isFalse(codexWriteHeld(write, codex("srv", { ...value, enabled: false })));
+    assert.isFalse(codexWriteHeld(write, undefined));
+    // Update-only writes skip a missing table.
+    assert.isTrue(codexWriteHeld({ ...write, ifPresent: true }, undefined));
+  });
+
+  it("checks deletes and toggles", () => {
+    assert.isTrue(codexWriteHeld({ name: "srv", value: null }, undefined));
+    assert.isFalse(codexWriteHeld({ name: "srv", value: null }, codex("srv", value)));
+    assert.isTrue(
+      codexWriteHeld({ name: "srv", enabled: false }, codex("srv", { ...value, enabled: false })),
+    );
+    assert.isFalse(codexWriteHeld({ name: "srv", enabled: false }, codex("srv", value)));
+    assert.isTrue(codexWriteHeld({ name: "srv", enabled: true }, codex("srv", value)));
+    assert.isFalse(codexWriteHeld({ name: "srv", enabled: true, restore: value }, undefined));
+    assert.isTrue(codexWriteHeld({ name: "srv", enabled: true }, undefined));
   });
 });

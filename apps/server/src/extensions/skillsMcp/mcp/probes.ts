@@ -3,9 +3,18 @@
  * panel open starts at most one Claude session and one Codex app-server per
  * cwd. Results are cached for a minute per CLI and cwd and concurrent callers
  * share a probe in flight; `refresh` skips a settled result but still joins a
- * probe in flight (a listing only while its statuses are pending). Any write to agent config calls `invalidateAgentProbes`.
+ * probe in flight (a listing only while its statuses are pending).
  * Probes never fail the caller: problems land in `error`.
+ *
+ * Claude and Codex rewrite their config files when they start (and Claude
+ * again on exit), so a probe overlapping a config write can put back its stale
+ * copy and silently drop the write. Every read that spawns an app goes through
+ * `gatedRead` and every write to its config through `withAgentWrite`: a write
+ * first interrupts the reads in flight for that app and waits for their
+ * processes to exit, and new reads wait until the write is done (then rerun,
+ * so their callers get post-write results).
  */
+import type { AgentApp } from "@t3tools/contracts";
 import type {
   McpServerStatus,
   Query,
@@ -18,7 +27,9 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
+import * as Semaphore from "effect/Semaphore";
 
 import { type AgentCli, describeCause, withCodexClient } from "../shared/agents.ts";
 import { ExtensionFailure } from "../shared/t3.ts";
@@ -103,6 +114,130 @@ const causeMessage = (cause: Cause.Cause<ExtensionFailure>) =>
   Cause.hasInterruptsOnly(cause) ? "Probe was interrupted" : describeCause(Cause.squash(cause));
 
 // ---------------------------------------------------------------------------
+// Write gate
+
+interface Reader {
+  /** Completed by a write that needs this read out of the way. */
+  readonly preempt: Deferred.Deferred<void>;
+  /** Completed once the read (and so its process) is gone. */
+  readonly done: Deferred.Deferred<void>;
+}
+
+interface Gate {
+  /** One write at a time per app. */
+  readonly lock: Semaphore.Semaphore;
+  /** Set while a write runs; new reads wait for it. */
+  writing: Deferred.Deferred<void> | undefined;
+  readonly readers: Set<Reader>;
+}
+
+const makeGate = (): Gate => ({
+  lock: Semaphore.makeUnsafe(1),
+  writing: undefined,
+  readers: new Set(),
+});
+
+/** Module-level, like the slots: one gate per app for the whole server. */
+const gates: Record<AgentApp, Gate> = { claude: makeGate(), codex: makeGate() };
+
+/**
+ * Runs `read`, a session of `app` that may rewrite its config, outside that
+ * app's writes: it waits while a write runs, and a write that starts while it
+ * runs interrupts it (its process exits before the write begins) and then
+ * reruns it. Never call it inside a write to the same app.
+ */
+export const gatedRead = <A, E, R>(
+  app: AgentApp,
+  read: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.suspend(() => {
+    const gate = gates[app];
+    if (gate.writing) return Effect.andThen(Deferred.await(gate.writing), gatedRead(app, read));
+    const reader: Reader = { preempt: Deferred.makeUnsafe(), done: Deferred.makeUnsafe() };
+    gate.readers.add(reader);
+    return Effect.raceFirst(
+      Effect.map(read, Option.some),
+      Effect.as(Deferred.await(reader.preempt), Option.none<A>()),
+    ).pipe(
+      // `raceFirst` returns only after the loser's finalizers ran.
+      Effect.ensuring(
+        Effect.suspend(() => {
+          gate.readers.delete(reader);
+          return Deferred.succeed(reader.done, undefined);
+        }),
+      ),
+      Effect.flatMap((result) =>
+        Option.isSome(result) ? Effect.succeed(result.value) : gatedRead(app, read),
+      ),
+    );
+  });
+
+/** Cached results from before a write to `app`; probes still running rerun after it. */
+const dropSettledSlots = (app: AgentApp) => {
+  if (app === "claude") {
+    for (const [key, slot] of claudeSlots) {
+      if (slot.settledAt !== undefined || Deferred.isDoneUnsafe(slot.statuses)) {
+        claudeSlots.delete(key);
+      }
+    }
+  } else {
+    for (const [key, slot] of codexSlots) {
+      if (slot.settledAt !== undefined) codexSlots.delete(key);
+    }
+  }
+};
+
+const writeGate = <A, E, R>(app: AgentApp, write: Effect.Effect<A, E, R>) =>
+  Effect.suspend(() => {
+    const gate = gates[app];
+    return gate.lock.withPermit(
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const writing = Deferred.makeUnsafe<void>();
+          gate.writing = writing;
+          return writing;
+        }),
+        () =>
+          Effect.suspend(() => {
+            const readers = [...gate.readers];
+            return Effect.forEach(
+              readers,
+              (reader) => Deferred.succeed(reader.preempt, undefined),
+              {
+                discard: true,
+              },
+            ).pipe(
+              Effect.andThen(
+                Effect.forEach(readers, (reader) => Deferred.await(reader.done), { discard: true }),
+              ),
+              Effect.andThen(write),
+            );
+          }),
+        (writing) =>
+          Effect.suspend(() => {
+            gate.writing = undefined;
+            dropSettledSlots(app);
+            return Deferred.succeed(writing, undefined);
+          }),
+      ),
+    );
+  });
+
+/**
+ * Runs `write` (to the config of each of `apps`) with no gated read of those
+ * apps running: reads in flight are interrupted and awaited first, new ones
+ * wait, and cached probe results of those apps are dropped afterwards. Gates
+ * are taken in a fixed order (Claude, then Codex).
+ */
+export const withAgentWrite = <A, E, R>(
+  apps: ReadonlyArray<AgentApp>,
+  write: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  (["claude", "codex"] as const)
+    .filter((app) => apps.includes(app))
+    .reduceRight((inner, app) => writeGate(app, inner), write);
+
+// ---------------------------------------------------------------------------
 // Claude
 
 export interface ClaudeProbe {
@@ -160,14 +295,18 @@ const contextUsageOf = (query: Query) =>
   );
 
 const runClaudeProbe = (cli: AgentCli, cwd: string, slot: ClaudeSlot) =>
-  withClaudeQuery(cli, cwd, (query) =>
-    Effect.gen(function* () {
-      const statuses = yield* settledStatuses(query);
-      const checkedAt = yield* nowIso;
-      yield* Deferred.succeed(slot.statuses, { statuses, checkedAt });
-      const usage = yield* contextUsageOf(query);
-      return { statuses, checkedAt, ...usage } satisfies ClaudeProbe;
-    }),
+  gatedRead(
+    "claude",
+    withClaudeQuery(cli, cwd, (query) =>
+      Effect.gen(function* () {
+        const statuses = yield* settledStatuses(query);
+        const checkedAt = yield* nowIso;
+        // A no-op when a run interrupted by a write already sent its statuses.
+        yield* Deferred.succeed(slot.statuses, { statuses, checkedAt });
+        const usage = yield* contextUsageOf(query);
+        return { statuses, checkedAt, ...usage } satisfies ClaudeProbe;
+      }),
+    ),
   ).pipe(
     Effect.onExit((exit) =>
       Effect.gen(function* () {
@@ -297,16 +436,19 @@ const codexStatus = (item: unknown): CodexMcpServerStatus[] =>
     : [];
 
 const runCodexProbe = (cli: AgentCli, cwd: string, reload: boolean, slot: CodexSlot) =>
-  withCodexClient(cli, cwd, (client) =>
-    Effect.gen(function* () {
-      if (reload) yield* codexCall(client, "config/mcpServer/reload");
-      const config = yield* codexCall(client, "config/read", { includeLayers: false, cwd });
-      const listed = yield* Effect.result(listCodexStatuses(client));
-      const checkedAt = yield* nowIso;
-      return Result.isFailure(listed)
-        ? { config, statuses: undefined, error: listed.failure.message, checkedAt }
-        : { config, statuses: listed.success.flatMap(codexStatus), checkedAt };
-    }),
+  gatedRead(
+    "codex",
+    withCodexClient(cli, cwd, (client) =>
+      Effect.gen(function* () {
+        if (reload) yield* codexCall(client, "config/mcpServer/reload");
+        const config = yield* codexCall(client, "config/read", { includeLayers: false, cwd });
+        const listed = yield* Effect.result(listCodexStatuses(client));
+        const checkedAt = yield* nowIso;
+        return Result.isFailure(listed)
+          ? { config, statuses: undefined, error: listed.failure.message, checkedAt }
+          : { config, statuses: listed.success.flatMap(codexStatus), checkedAt };
+      }),
+    ),
   ).pipe(
     Effect.onExit((exit) =>
       Effect.gen(function* () {

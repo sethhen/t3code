@@ -19,7 +19,7 @@ import * as Effect from "effect/Effect";
 import type { SkillsMcpServices } from "../index.ts";
 import { type AgentCli, agentAppInfo, resolveAgentClis } from "../shared/agents.ts";
 import type { ExtensionFailure } from "../shared/t3.ts";
-import { invalidateAgentProbes } from "../mcp/probes.ts";
+import { gatedRead, invalidateAgentProbes, withAgentWrite } from "../mcp/probes.ts";
 import { listClaudePlugins, mutateClaudePlugin } from "./claude.ts";
 import { listCodexPlugins, mutateCodexPlugin } from "./codex.ts";
 import { byName } from "./common.ts";
@@ -55,7 +55,9 @@ const listApp = Effect.fn("skillsMcp.plugins.listApp")(function* (
 ) {
   const info = yield* agentAppInfo(cli);
   if (!info.available) return { info, installed: [], available: [] } satisfies AppPlugins;
-  return yield* listRows(cli, cwd, includeAvailable).pipe(
+  // Gated: a plugin write to this app stops the listing CLI (it rewrites the
+  // app's config at startup) and the listing reruns after the write.
+  return yield* gatedRead(cli.app, listRows(cli, cwd, includeAvailable)).pipe(
     Effect.map((rows): AppPlugins => ({ info, ...rows })),
     Effect.catch((failure) =>
       Effect.succeed<AppPlugins>({
@@ -101,7 +103,10 @@ const mutatePluginsEffect = Effect.fn("skillsMcp.plugins.mutate")(function* (
     } satisfies MutationResult;
   }
   const { claude, codex } = yield* resolveAgentClis;
-  return yield* mutateApp(mutation.app === "claude" ? claude : codex, mutation).pipe(
+  return yield* withAgentWrite(
+    [mutation.app],
+    mutateApp(mutation.app === "claude" ? claude : codex, mutation),
+  ).pipe(
     Effect.map((message): MutationResult => ({ failures: [], message })),
     Effect.catch((failure) =>
       Effect.succeed<MutationResult>({

@@ -34,6 +34,7 @@ import {
   claudeRemoveUser,
   claudeReplaceUser,
   claudeSetProjectEnabled,
+  effectiveCwd,
   readClaudeConfig,
   readClaudeUserEntry,
 } from "./claude.ts";
@@ -45,7 +46,13 @@ import {
   parseCodexStatuses,
 } from "./parse.ts";
 import { makeMcpPresets } from "./presets.ts";
-import { codexSnapshot, invalidateAgentProbes, probeClaudeStatuses } from "./probes.ts";
+import {
+  codexSnapshot,
+  gatedRead,
+  invalidateAgentProbes,
+  probeClaudeStatuses,
+  withAgentWrite,
+} from "./probes.ts";
 import { APP_LABELS, type AppSnapshot, buildRows } from "./rows.ts";
 import {
   claudeEntryFor,
@@ -54,6 +61,8 @@ import {
   codexExtras,
   type JsonObject,
   specFromClaude,
+  specFromCodex,
+  specToClaude,
 } from "./spec.ts";
 import { mcpStore, type McpStore, type StoredMcpServer } from "./store.ts";
 import { HostProcessPlatform } from "./t3.ts";
@@ -351,6 +360,80 @@ const saveServer = (server: StoredMcpServer) =>
     return Effect.succeed([undefined, { ...current, servers }] as const);
   });
 
+// ---------------------------------------------------------------------------
+// Verified writes
+
+/**
+ * Runs one app's config write and checks it held. Claude and Codex rewrite
+ * their config when they start, so a session the gate does not cover (the
+ * user's own) can read the file before the write and put its stale copy back
+ * after. A lost write is applied once more; lost again, it fails rather than
+ * reporting success.
+ */
+const verified = <R1, R2>(
+  app: AgentApp,
+  write: Effect.Effect<unknown, ExtensionFailure, R1>,
+  holds: Effect.Effect<boolean, ExtensionFailure, R2>,
+) =>
+  Effect.gen(function* () {
+    yield* write;
+    if (yield* holds) return;
+    yield* Effect.logWarning(`${APP_LABELS[app]} dropped an MCP config write; applying it again`);
+    yield* write;
+    if (yield* holds) return;
+    return yield* new ExtensionFailure({
+      message: `${APP_LABELS[app]} rewrote its config while saving; try again`,
+    });
+  });
+
+/** What a Claude user entry should be after a write: this spec, any entry, or none. */
+type ClaudeWant = McpServerSpec | "present" | "absent";
+
+const claudeHolds = (cli: AgentCli, wants: ReadonlyArray<readonly [string, ClaudeWant]>) =>
+  Effect.gen(function* () {
+    for (const [name, want] of wants) {
+      const entry = yield* readClaudeUserEntry(cli, name);
+      const held =
+        want === "absent"
+          ? entry === undefined
+          : entry !== undefined &&
+            (want === "present" ||
+              canonical(specFromClaude(entry)) === canonical(specFromClaude(specToClaude(want))));
+      if (!held) return false;
+    }
+    return true;
+  });
+
+/** Whether Codex's user config (`found` for the write's name) reflects `write`. */
+export const codexWriteHeld = (write: CodexWrite, found: ConfigServer | undefined) => {
+  if ("enabled" in write) {
+    if (!write.enabled) return found === undefined || found.disabled;
+    // Enabling a missing table without a restore writes nothing.
+    return found === undefined ? write.restore === undefined : !found.disabled;
+  }
+  if (write.value === null) return found === undefined;
+  if (found === undefined) return write.ifPresent === true;
+  return (
+    found.disabled === (write.value.enabled === false) &&
+    canonical(found.spec) === canonical(specFromCodex(write.value))
+  );
+};
+
+/** `applyCodexWrites`, verified against a fresh read of the user config. */
+const writeCodex = (cli: AgentCli, writes: ReadonlyArray<CodexWrite>) =>
+  verified(
+    "codex",
+    applyCodexWrites(cli, writes),
+    readCodexConfigServers(cli, effectiveCwd(undefined)).pipe(
+      Effect.map((servers) => {
+        const byName = firstByName(servers.filter(isUserScope));
+        // The last write to a name decides its state.
+        const last = new Map(writes.map((write) => [write.name, write]));
+        return [...last.values()].every((write) => codexWriteHeld(write, byName.get(write.name)));
+      }),
+    ),
+  );
+
 /**
  * Writes `server` to Claude's user scope, reusing the fields the spec does not
  * model from the live entry (or the store) while the transport is unchanged.
@@ -460,14 +543,21 @@ const upsert = Effect.fn("skillsMcp.mcp.upsert")(function* (clis: Clis, input: U
   const [claudeFailures, codexFailures] = yield* Effect.all(
     [
       forApp(clis, "claude", server.apps.claude, (cli) =>
-        Effect.gen(function* () {
-          if (server.apps.claude) yield* writeClaude(cli, server, previousName);
-          else yield* claudeRemoveUser(cli, name);
-          if (renamed) yield* claudeRemoveUser(cli, previousName);
-        }),
+        verified(
+          "claude",
+          Effect.gen(function* () {
+            if (server.apps.claude) yield* writeClaude(cli, server, previousName);
+            else yield* claudeRemoveUser(cli, name);
+            if (renamed) yield* claudeRemoveUser(cli, previousName);
+          }),
+          claudeHolds(cli, [
+            [name, server.apps.claude ? server.spec : "absent"],
+            ...(renamed ? [[previousName, "absent"] as const] : []),
+          ]),
+        ),
       ),
       forApp(clis, "codex", server.apps.codex, (cli) =>
-        applyCodexWrites(cli, [
+        writeCodex(cli, [
           ...(renamed ? [{ name: previousName, value: null }] : []),
           codexWriteFor(server),
         ]),
@@ -547,10 +637,18 @@ const setEnabled = Effect.fn("skillsMcp.mcp.setEnabled")(function* (
   }
   const failures = yield* forApp(clis, input.app, input.enabled, (cli) =>
     input.app === "codex"
-      ? applyCodexWrites(cli, [codexToggle(server, input.enabled)])
+      ? writeCodex(cli, [codexToggle(server, input.enabled)])
       : input.enabled
-        ? enableClaude(cli, server)
-        : disableClaude(cli, server),
+        ? verified(
+            "claude",
+            enableClaude(cli, server),
+            claudeHolds(cli, [[server.name, "present"]]),
+          )
+        : verified(
+            "claude",
+            disableClaude(cli, server),
+            claudeHolds(cli, [[server.name, "absent"]]),
+          ),
   );
   if (failures.length > 0) return { failures } satisfies MutationResult;
   const latest = yield* findStored(yield* mcpStore.read, input.id);
@@ -568,10 +666,14 @@ const deleteServer = Effect.fn("skillsMcp.mcp.delete")(function* (clis: Clis, id
   const server = yield* findStored(yield* mcpStore.read, id);
   const [claudeFailures, codexFailures] = yield* Effect.all(
     [
-      forApp(clis, "claude", false, (cli) => claudeRemoveUser(cli, server.name)),
-      forApp(clis, "codex", false, (cli) =>
-        applyCodexWrites(cli, [{ name: server.name, value: null }]),
+      forApp(clis, "claude", false, (cli) =>
+        verified(
+          "claude",
+          claudeRemoveUser(cli, server.name),
+          claudeHolds(cli, [[server.name, "absent"]]),
+        ),
       ),
+      forApp(clis, "codex", false, (cli) => writeCodex(cli, [{ name: server.name, value: null }])),
     ],
     { concurrency: 2 },
   );
@@ -595,7 +697,7 @@ const importServers = Effect.fn("skillsMcp.mcp.import")(function* (clis: Clis) {
         ? Effect.result(readClaudeConfig(clis.claude, home))
         : Effect.succeed(Result.succeed<ReadonlyArray<ConfigServer>>([])),
       clis.available.codex.available
-        ? Effect.result(readCodexConfigServers(clis.codex, home))
+        ? Effect.result(gatedRead("codex", readCodexConfigServers(clis.codex, home)))
         : Effect.succeed(Result.succeed<ReadonlyArray<ConfigServer>>([])),
     ],
     { concurrency: 2 },
@@ -690,23 +792,31 @@ const login = Effect.fn("skillsMcp.mcp.login")(function* (
       } satisfies MutationResult);
 });
 
-/** Writes run one at a time and drop the cached probes, so the next list sees them. */
-const exclusiveWrite = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  mutationLock.withPermit(effect).pipe(Effect.ensuring(invalidateAgentProbes));
+/**
+ * Writes run one at a time and drop the cached probes, so the next list sees
+ * them. Writing to an app's config also holds that app's gate: probes spawn the
+ * app's CLI, which rewrites its config at startup and would put back a copy
+ * read before the write.
+ */
+const exclusiveWrite = <A, E, R>(apps: ReadonlyArray<AgentApp>, effect: Effect.Effect<A, E, R>) =>
+  mutationLock
+    .withPermit(withAgentWrite(apps, effect))
+    .pipe(Effect.ensuring(invalidateAgentProbes));
 
 const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpMutation) {
   const clis = yield* resolveClis;
   switch (input.action) {
     case "upsert":
-      return yield* exclusiveWrite(upsert(clis, input));
+      return yield* exclusiveWrite(["claude", "codex"], upsert(clis, input));
     case "setEnabled":
-      return yield* exclusiveWrite(setEnabled(clis, input));
+      return yield* exclusiveWrite([input.app], setEnabled(clis, input));
     case "delete":
-      return yield* exclusiveWrite(deleteServer(clis, input.id));
+      return yield* exclusiveWrite(["claude", "codex"], deleteServer(clis, input.id));
     case "import":
-      return yield* exclusiveWrite(importServers(clis));
+      return yield* exclusiveWrite([], importServers(clis));
     case "setProjectEnabled":
       return yield* exclusiveWrite(
+        ["claude"],
         forApp(clis, "claude", true, (cli) =>
           claudeSetProjectEnabled(cli, input.cwd, input.name, input.enabled),
         ).pipe(

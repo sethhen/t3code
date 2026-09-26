@@ -140,6 +140,33 @@ describe("claudeLiveServer", () => {
     assert.include(of(undefined, "failed"), { scope: "unknown", status: "failed" });
     assert.include(of("plugin", "disabled"), { scope: "plugin", status: "disabled" });
   });
+
+  it("maps a plugin's server to the plugin scope with the plugin as its source", () => {
+    // What claude 2.1.282 reports for the Vercel plugin's `vercel` server.
+    assert.deepStrictEqual(
+      claudeLiveServer({
+        name: "plugin:vercel:vercel",
+        status: "needs-auth",
+        scope: "dynamic",
+        source: "plugin",
+      }),
+      { name: "plugin:vercel:vercel", scope: "plugin", source: "vercel", status: "needs-auth" },
+    );
+    // Older CLIs send no source: the name alone decides.
+    assert.include(claudeLiveServer({ name: "plugin:linear:api", status: "connected" }), {
+      scope: "plugin",
+      source: "linear",
+    });
+    // A source other than `plugin` wins over a lookalike name.
+    assert.include(
+      claudeLiveServer({ name: "plugin:x:y", status: "connected", scope: "user", source: "user" }),
+      { scope: "user" },
+    );
+    assert.notProperty(
+      claudeLiveServer({ name: "odd", status: "connected", scope: "dynamic", source: "plugin" }),
+      "source",
+    );
+  });
 });
 
 // Captured from codex-cli 0.157.0 (`config/read {includeLayers: false}`) against a

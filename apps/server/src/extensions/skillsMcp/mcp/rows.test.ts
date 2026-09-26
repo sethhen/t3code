@@ -2,7 +2,7 @@ import type { AgentApp, McpServerSpec } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
 import { builtinRow } from "./builtin.ts";
-import type { ConfigServer, LiveServer } from "./parse.ts";
+import { claudeLiveServer, type ConfigServer, type LiveServer } from "./parse.ts";
 import { type AppSnapshot, buildRows, effectiveConfig } from "./rows.ts";
 import type { StoredMcpServer } from "./store.ts";
 
@@ -112,6 +112,28 @@ describe("buildRows", () => {
     );
     assert.strictEqual(rows[2]?.apps.claude?.source, "claude.ai");
     assert.strictEqual(rows[1]?.apps.claude?.status, "unknown");
+  });
+
+  it("shows a Claude plugin's server as a read-only plugin row", () => {
+    const [row] = buildRows({
+      store: [],
+      apps: {
+        claude: {
+          config: [],
+          live: [
+            claudeLiveServer({
+              name: "plugin:vercel:vercel",
+              status: "needs-auth",
+              scope: "dynamic",
+              source: "plugin",
+            }),
+          ],
+        },
+        codex: { config: [], live: [] },
+      },
+    });
+    assert.strictEqual(row?.key, "plugin:plugin:vercel:vercel");
+    assert.include(row?.apps.claude, { scope: "plugin", source: "vercel", editable: false });
   });
 
   it("keys managed rows by store id and applies the desired per-app flag", () => {
