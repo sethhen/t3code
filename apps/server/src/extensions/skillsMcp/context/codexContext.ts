@@ -1,7 +1,8 @@
 /**
  * Codex's context cost, estimated locally: Codex has no `/context` report, so
  * MCP tool definitions (from the MCP module's live probe) and the skills list
- * are sized at about four characters per token.
+ * are sized at about four characters per token. Codex's own system prompt and
+ * built-in tools are not included.
  */
 import type { AppContext, ContextCategory, McpContextCost } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -213,6 +214,12 @@ const joinErrors = (errors: ReadonlyArray<string | undefined>) => {
   return present.length > 0 ? present.join("; ") : undefined;
 };
 
+/**
+ * Only what the panel can size is counted, so there is no "free space": the
+ * rest of Codex's baseline is unknown.
+ */
+const CODEX_NOTE = "MCP tools and skills only; excludes Codex's system prompt and built-in tools";
+
 /** Assembles the estimate; exported for tests. */
 export const codexAppContextFrom = (input: {
   readonly model?: string | undefined;
@@ -229,16 +236,10 @@ export const codexAppContextFrom = (input: {
     { name: "MCP tools", tokens: mcpTokens, kind: "used" },
     { name: "Skills", tokens: skillTokens, kind: "used" },
   ];
-  if (input.windowTokens !== undefined && input.windowTokens > baselineTokens) {
-    categories.push({
-      name: "Free space",
-      tokens: input.windowTokens - baselineTokens,
-      kind: "free",
-    });
-  }
   const error = joinErrors(input.errors);
   return {
     exact: false,
+    note: CODEX_NOTE,
     ...(input.model ? { model: input.model } : {}),
     ...(input.windowTokens !== undefined ? { windowTokens: input.windowTokens } : {}),
     baselineTokens,

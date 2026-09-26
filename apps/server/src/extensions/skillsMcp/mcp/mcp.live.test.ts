@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 import { type AgentCli, resolveAgentClis } from "../shared/agents.ts";
 import { listMcp, mutateMcp } from "./index.ts";
 import { probeClaude, probeCodex } from "./probes.ts";
+import { mcpStore } from "./store.ts";
 import { serverConfigLayerTest, serverSettingsLayerTest } from "./t3.ts";
 
 const LIVE = process.env.SKILLS_MCP_LIVE_TESTS === "1";
@@ -106,7 +107,11 @@ const withSandbox = <A, E, R>(use: (sandbox: Sandbox) => Effect.Effect<A, E, R>)
     yield* fs.writeFileString(claudeJson, seededClaudeJson(echoServer));
     yield* fs.writeFileString(
       codexToml,
-      codexTable("seeded", echoServer, ['type = "stdio"', "startup_timeout_sec = 20"]),
+      codexTable("seeded", echoServer, [
+        'type = "stdio"',
+        "startup_timeout_sec = 20",
+        'enabled_tools = ["echo"]',
+      ]),
     );
 
     const layer = Layer.mergeAll(
@@ -168,6 +173,7 @@ interface ClaudeJson {
 }
 
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const readClaudeServers = (file: string) =>
   Effect.gen(function* () {
@@ -181,6 +187,20 @@ const readText = (file: string) =>
     return yield* fs.readFileString(file);
   });
 
+/** Edits `.claude.json` the way another tool would, keeping everything else. */
+const editClaudeServer = (file: string, name: string, entry: unknown) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const json = (yield* decodeJson(yield* fs.readFileString(file))) as Record<string, unknown>;
+    const mcpServers = { ...(json.mcpServers as Record<string, unknown>) };
+    if (entry === undefined) delete mcpServers[name];
+    else mcpServers[name] = entry;
+    yield* fs.writeFileString(file, yield* encodeJson({ ...json, mcpServers }));
+  });
+
+const storedNamed = (name: string) =>
+  Effect.map(mcpStore.read, (store) => store.servers.find((server) => server.name === name));
+
 const codexHas = (toml: string, name: string) =>
   new RegExp(`^\\[mcp_servers\\.${name}[\\].]`, "m").test(toml);
 
@@ -193,6 +213,7 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
         withSandbox((sandbox) =>
           Effect.gen(function* () {
             const { project } = sandbox;
+            const fs = yield* FileSystem.FileSystem;
 
             // First list auto-imports the user server both apps define.
             const first = yield* overview(project);
@@ -210,19 +231,76 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
             connected(seeded, "codex");
             assert.strictEqual((yield* mutate({ action: "import" })).message, "Imported 0 servers");
 
-            // Disabling in Codex rewrites the table: `enabled = false`, extras kept, no `type`.
+            // A Codex toggle writes only `enabled`: the table, edited outside T3
+            // since the import, keeps every other key.
             const seededId = seeded?.id ?? "";
+            const importedToml = yield* readText(sandbox.codexToml);
+            yield* fs.writeFileString(
+              sandbox.codexToml,
+              importedToml.replace("startup_timeout_sec = 20", "startup_timeout_sec = 25"),
+            );
+            const keptLines = [
+              'type = "stdio"',
+              "startup_timeout_sec = 25",
+              'enabled_tools = ["echo"]',
+            ];
             yield* expectOk({ action: "setEnabled", id: seededId, app: "codex", enabled: false });
             const disabledToml = yield* readText(sandbox.codexToml);
-            assert.match(disabledToml, /enabled = false/);
-            assert.match(disabledToml, /startup_timeout_sec = 20/);
-            assert.notMatch(disabledToml, /^type\s*=/m);
+            for (const line of ["enabled = false", ...keptLines])
+              assert.include(disabledToml, line);
             assert.include((yield* rowNamed(project, "seeded"))?.apps.codex, {
               enabled: false,
               status: "disabled",
             });
             yield* expectOk({ action: "setEnabled", id: seededId, app: "codex", enabled: true });
+            const enabledToml = yield* readText(sandbox.codexToml);
+            for (const line of ["enabled = true", ...keptLines]) assert.include(enabledToml, line);
             connected(yield* rowNamed(project, "seeded"), "codex");
+
+            // Claude keeps nothing for a removed server, so disabling stashes its
+            // live entry (edited outside T3, with fields the spec does not model)
+            // and enabling re-adds it verbatim.
+            const editedClaude = {
+              type: "stdio",
+              command: "node",
+              args: [sandbox.echoServer],
+              env: {},
+              timeout: 45000,
+              alwaysLoad: true,
+            };
+            yield* editClaudeServer(sandbox.claudeJson, "seeded", editedClaude);
+            yield* expectOk({ action: "setEnabled", id: seededId, app: "claude", enabled: false });
+            assert.isUndefined((yield* readClaudeServers(sandbox.claudeJson)).mcpServers?.seeded);
+            assert.deepStrictEqual((yield* storedNamed("seeded"))?.raw?.claude, editedClaude);
+            yield* expectOk({ action: "setEnabled", id: seededId, app: "claude", enabled: true });
+            assert.deepStrictEqual(
+              (yield* readClaudeServers(sandbox.claudeJson)).mcpServers?.seeded,
+              editedClaude,
+            );
+            assert.isUndefined((yield* storedNamed("seeded"))?.raw);
+            connected(yield* rowNamed(project, "seeded"), "claude");
+
+            // Restore: enabling re-creates an entry deleted outside T3 in either app.
+            yield* editClaudeServer(sandbox.claudeJson, "seeded", undefined);
+            yield* fs.writeFileString(sandbox.codexToml, "");
+            const drifted = (yield* listMcp({ cwd: project, refresh: true })).servers.find(
+              (row) => row.name === "seeded",
+            );
+            assert.include(drifted?.apps.claude, { enabled: true, present: false });
+            assert.include(drifted?.apps.codex, { enabled: true, present: false });
+            for (const app of ["claude", "codex"] as const) {
+              yield* expectOk({ action: "setEnabled", id: seededId, app, enabled: true });
+            }
+            assert.deepInclude((yield* readClaudeServers(sandbox.claudeJson)).mcpServers?.seeded, {
+              command: "node",
+              args: [sandbox.echoServer],
+            });
+            const restoredToml = yield* readText(sandbox.codexToml);
+            assert.isTrue(codexHas(restoredToml, "seeded"));
+            assert.include(restoredToml, "startup_timeout_sec = 20");
+            const restored = yield* rowNamed(project, "seeded");
+            connected(restored, "claude");
+            connected(restored, "codex");
 
             // Upsert a new server into both apps.
             const saved = yield* expectOk({
@@ -365,7 +443,6 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
               "connected",
             );
             yield* Effect.log("[live] claude context", {
-              detail: claudeProbe.contextDetail,
               error: claudeProbe.contextError,
               totalTokens: claudeProbe.contextUsage?.totalTokens,
             });
@@ -387,7 +464,6 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
             assert.isUndefined(yield* rowNamed(project, "echo3"));
 
             // A server added outside T3 is adopted by an explicit import.
-            const fs = yield* FileSystem.FileSystem;
             const toml = yield* fs.readFileString(sandbox.codexToml);
             yield* fs.writeFileString(
               sandbox.codexToml,

@@ -1,7 +1,7 @@
 /**
- * Claude's context cost, measured by Claude itself: the `/context` breakdown
- * the MCP module's probe session reports (`getContextUsage`), mapped onto the
- * contract. Pure, so it is tested without a Claude session.
+ * Claude's context cost, estimated by Claude itself: the `/context` breakdown
+ * the MCP module's probe session reports (`getContextUsage`, summary detail),
+ * mapped onto the contract. Pure, so it is tested without a Claude session.
  */
 import type { AppContext, ContextCategory, McpContextCost } from "@t3tools/contracts";
 
@@ -102,8 +102,11 @@ const mcpServersOf = (
     );
 };
 
+/** The summary detail is Claude's own estimate; the exact one calls the API. */
+const CLAUDE_NOTE = "Claude's local estimate";
+
 const emptyContext = (error: string): AppContext => ({
-  exact: true,
+  exact: false,
   baselineTokens: 0,
   categories: [],
   mcpServers: [],
@@ -112,11 +115,7 @@ const emptyContext = (error: string): AppContext => ({
   error,
 });
 
-/**
- * `AppContext` from a Claude probe; a probe without context usage becomes an
- * error. Counts are exact unless the probe fell back to Claude's local
- * `"summary"` estimate (the token-count API was unavailable).
- */
+/** `AppContext` from a Claude probe; a probe without context usage becomes an error. */
 export const claudeAppContext = (probe: ClaudeProbe): AppContext => {
   const usage = probe.contextUsage;
   if (!usage) {
@@ -138,7 +137,8 @@ export const claudeAppContext = (probe: ClaudeProbe): AppContext => {
   );
   const windowTokens = usage.rawMaxTokens || usage.maxTokens;
   return {
-    exact: probe.contextDetail !== "summary",
+    exact: false,
+    note: CLAUDE_NOTE,
     ...(usage.model ? { model: usage.model } : {}),
     ...(windowTokens > 0 ? { windowTokens } : {}),
     baselineTokens,

@@ -54,7 +54,6 @@ const usage = (overrides: Partial<ClaudeContextUsage> = {}): ClaudeContextUsage 
 const probe = (overrides: Partial<ClaudeProbe> = {}): ClaudeProbe => ({
   statuses: [status("docs"), status("my.server")],
   contextUsage: usage(),
-  contextDetail: "full",
   checkedAt: "2026-06-15T00:00:00.000Z",
   ...overrides,
 });
@@ -86,9 +85,10 @@ describe("normalizeClaudeServerName", () => {
 });
 
 describe("claudeAppContext", () => {
-  it("maps the /context breakdown exactly", () => {
+  it("maps the /context breakdown as Claude's local estimate", () => {
     const context = claudeAppContext(probe());
-    assert.strictEqual(context.exact, true);
+    assert.strictEqual(context.exact, false);
+    assert.strictEqual(context.note, "Claude's local estimate");
     assert.strictEqual(context.model, "claude-test-model");
     assert.strictEqual(context.windowTokens, 200_000);
     // Used categories only, without the conversation itself.
@@ -163,10 +163,6 @@ describe("claudeAppContext", () => {
     );
     assert.strictEqual(context.mcpServers[0]?.loadedTokens, 10);
     assert.strictEqual(context.mcpServers[0]?.deferredTokens, 0);
-  });
-
-  it("marks Claude's local summary estimate as not exact", () => {
-    assert.strictEqual(claudeAppContext(probe({ contextDetail: "summary" })).exact, false);
   });
 
   it("reports why context usage is missing", () => {

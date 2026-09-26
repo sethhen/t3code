@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect";
 import type { SkillsMcpServices } from "../index.ts";
 import { type AgentCli, agentAppInfo, resolveAgentClis } from "../shared/agents.ts";
 import type { ExtensionFailure } from "../shared/t3.ts";
+import { invalidateAgentProbes } from "../mcp/probes.ts";
 import { listClaudePlugins, mutateClaudePlugin } from "./claude.ts";
 import { listCodexPlugins, mutateCodexPlugin } from "./codex.ts";
 import { byName } from "./common.ts";
@@ -107,6 +108,8 @@ const mutatePluginsEffect = Effect.fn("skillsMcp.plugins.mutate")(function* (
         failures: [{ app: mutation.app, message: failure.message }],
       }),
     ),
+    // A plugin can bring MCP servers and skills, so the cached probes are stale.
+    Effect.ensuring(invalidateAgentProbes),
   );
 });
 

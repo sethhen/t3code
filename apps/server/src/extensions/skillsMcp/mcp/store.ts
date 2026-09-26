@@ -3,7 +3,7 @@
  * manages, each with a desired per-app enabled flag. The apps' own configs stay
  * the source of truth for what actually loads; the store remembers servers
  * that are switched off in an app (Claude has no disabled flag, so a disabled
- * server is removed from Claude and only the store keeps it).
+ * server is removed from Claude and only the store keeps its entry).
  */
 import { AgentAppFlags, McpServerSpec } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -26,6 +26,16 @@ export const StoredMcpServer = Schema.Struct({
    * to the stored spec's transport and are dropped when it changes.
    */
   extras: Schema.optional(
+    Schema.Struct({ claude: Schema.optional(Extras), codex: Schema.optional(Extras) }),
+  ),
+  /**
+   * An app's own complete entry, written back verbatim instead of one built
+   * from `spec`: Claude's entry while the server is disabled there (Claude
+   * keeps nothing for a removed server; re-added on enable, then cleared), and
+   * Codex's table when an import found it defined differently from Claude's
+   * (restored if the table goes missing). An upsert drops both.
+   */
+  raw: Schema.optional(
     Schema.Struct({ claude: Schema.optional(Extras), codex: Schema.optional(Extras) }),
   ),
 });

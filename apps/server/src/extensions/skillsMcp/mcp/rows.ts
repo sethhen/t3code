@@ -82,7 +82,7 @@ const managedEntry = (
   view: AppView,
   server: StoredMcpServer,
 ): McpAppEntry | undefined => {
-  if (app === "codex" && server.spec.type === "sse") {
+  if (app === "codex" && server.spec.type === "sse" && !server.raw?.codex) {
     return {
       present: false,
       enabled: false,

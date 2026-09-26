@@ -147,7 +147,7 @@ describe("codex model window", () => {
 });
 
 describe("codexAppContextFrom", () => {
-  it("adds MCP tools and skills into an estimated baseline", () => {
+  it("adds MCP tools and skills into an estimated baseline, with no free space", () => {
     const statuses = [server("docs", { mcp__docs__search: tool("search", "Search", SCHEMA) })];
     const skills = [{ name: "alpha", tokens: 30 }];
     const context = codexAppContextFrom({
@@ -159,13 +159,13 @@ describe("codexAppContextFrom", () => {
     });
     const mcpTokens = codexToolTokens("mcp__docs__search", statuses[0]!.tools.mcp__docs__search!);
     assert.strictEqual(context.exact, false);
+    assert.match(context.note ?? "", /MCP tools and skills only/);
     assert.strictEqual(context.model, "model-a");
     assert.strictEqual(context.windowTokens, 1_000);
     assert.strictEqual(context.baselineTokens, mcpTokens + 30);
     assert.deepStrictEqual(context.categories, [
       { name: "MCP tools", tokens: mcpTokens, kind: "used" },
       { name: "Skills", tokens: 30, kind: "used" },
-      { name: "Free space", tokens: 1_000 - mcpTokens - 30, kind: "free" },
     ]);
     assert.deepStrictEqual(context.skills, skills);
     assert.strictEqual(context.error, undefined);

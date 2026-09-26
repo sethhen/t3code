@@ -1,6 +1,6 @@
 /**
  * `context.get`: what each agent loads into a new thread before the first
- * message (Claude measured by Claude, Codex estimated). `usage.get`: what the
+ * message (both estimated: Claude by Claude, Codex by the panel). `usage.get`: what the
  * agents actually called, counted from their own transcripts.
  */
 import type { AppContext, ContextOverview, UsageReport } from "@t3tools/contracts";
@@ -18,7 +18,7 @@ import { clampUsageDays, collectUsage, type UsageRoot } from "./usage.ts";
 const APP_NAMES = { claude: "Claude Code", codex: "Codex" } as const;
 
 const unavailable = (cli: AgentCli, reason: string | undefined): AppContext => ({
-  exact: cli.app === "claude",
+  exact: false,
   baselineTokens: 0,
   categories: [],
   mcpServers: [],

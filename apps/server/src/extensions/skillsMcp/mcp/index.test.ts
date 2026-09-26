@@ -68,10 +68,17 @@ describe("adoptUserServers", () => {
     ]);
   });
 
-  it("prefers Claude's definition and keeps extras only for the matching transport", () => {
+  it("keeps both definitions when the apps disagree, with Claude's as the spec", () => {
     const { servers } = adopt({
       claude: [claude("s", { type: "http", url: "https://c/mcp", timeout: 5000 })],
-      codex: [codex("s", { command: "node", startup_timeout_sec: 20, enabled: true })],
+      codex: [
+        codex("s", {
+          command: "node",
+          startup_timeout_sec: 20,
+          enabled_tools: ["a"],
+          enabled: true,
+        }),
+      ],
     });
     assert.deepStrictEqual(servers[0], {
       id: "id-1",
@@ -80,21 +87,33 @@ describe("adoptUserServers", () => {
       apps: { claude: true, codex: true },
       tags: [],
       extras: { claude: { timeout: 5000 } },
-    });
-
-    const same = adopt({
-      claude: [claude("s", { command: "node", timeout: 5000 })],
-      codex: [codex("s", { command: "node", startup_timeout_sec: 20, type: "stdio" })],
-    });
-    assert.deepStrictEqual(same.servers[0]?.extras, {
-      claude: { timeout: 5000 },
-      codex: { startup_timeout_sec: 20 },
+      raw: {
+        codex: { command: "node", startup_timeout_sec: 20, enabled_tools: ["a"], enabled: true },
+      },
     });
   });
 
-  it("never enables Codex for an SSE server", () => {
-    const { servers } = adopt({ claude: [claude("s", { type: "sse", url: "https://x/sse" })] });
-    assert.deepStrictEqual(servers[0]?.apps, { claude: true, codex: false });
+  it("keeps one definition and both apps' extras when the apps agree", () => {
+    const { servers } = adopt({
+      claude: [claude("s", { command: "node", timeout: 5000 })],
+      codex: [codex("s", { command: "node", startup_timeout_sec: 20, type: "stdio" })],
+    });
+    assert.deepStrictEqual(servers[0]?.extras, {
+      claude: { timeout: 5000 },
+      codex: { startup_timeout_sec: 20 },
+    });
+    assert.isUndefined(servers[0]?.raw);
+  });
+
+  it("enables Codex for an SSE server only when Codex has its own definition", () => {
+    const sse = claude("s", { type: "sse", url: "https://x/sse" });
+    assert.deepStrictEqual(adopt({ claude: [sse] }).servers[0]?.apps, {
+      claude: true,
+      codex: false,
+    });
+    const both = adopt({ claude: [sse], codex: [codex("s", { url: "https://x/mcp" })] }).servers[0];
+    assert.deepStrictEqual(both?.apps, { claude: true, codex: true });
+    assert.deepStrictEqual(both?.raw, { codex: { url: "https://x/mcp", enabled: true } });
   });
 
   it("skips taken, builtin, invalid, non-user and unmodelled servers", () => {

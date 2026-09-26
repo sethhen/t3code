@@ -1,9 +1,10 @@
 /**
  * The live MCP probes, shared by `mcp.list` and the context module so one
  * panel open starts at most one Claude session and one Codex app-server per
- * cwd. Results are cached for a minute per CLI and cwd (`refresh` bypasses the
- * cache) and concurrent callers share a probe in flight. Probes never fail the
- * caller: problems land in `error`.
+ * cwd. Results are cached for a minute per CLI and cwd and concurrent callers
+ * share a probe in flight; `refresh` skips a settled result but still joins a
+ * probe in flight (a listing only while its statuses are pending). Any write to agent config calls `invalidateAgentProbes`.
+ * Probes never fail the caller: problems land in `error`.
  */
 import type {
   McpServerStatus,
@@ -31,16 +32,25 @@ export type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 export interface ProbeOptions {
-  /** Start a new probe even when a cached one is under a minute old. */
+  /**
+   * Skip a settled result even when it is under a minute old. A probe in flight
+   * is still shared, except one whose Claude statuses were already listed.
+   */
   readonly refresh?: boolean | undefined;
 }
+
+/**
+ * `cached` reuses a fresh slot, `refresh` only one still in flight, `force`
+ * none (the probe must do something an in-flight one will not).
+ */
+export type SlotMode = "cached" | "refresh" | "force";
 
 const CACHE_TTL_MS = 60_000;
 /** Failed probes are retried sooner, but not by every request in a burst. */
 const FAILURE_TTL_MS = 10_000;
 
 /** One cached probe per CLI and cwd; `settledAt` stays undefined while it runs. */
-interface Slot {
+export interface Slot {
   settledAt: number | undefined;
   failed: boolean;
 }
@@ -51,21 +61,30 @@ const isFresh = (slot: Slot, now: number) =>
 
 const slotKey = (cli: AgentCli, cwd: string) => `${cli.binaryPath}|${cli.configDir}|${cwd}`;
 
+const modeOf = (options: ProbeOptions | undefined): SlotMode =>
+  options?.refresh ? "refresh" : "cached";
+
 /**
- * The fresh slot for `key`, or a new one whose probe runs detached, so a
- * caller that goes away does not strand the others waiting on it.
+ * The reusable slot for `key` under `mode`, or a new one whose probe runs
+ * detached, so a caller that goes away does not strand the others waiting on it.
+ * Exported for tests.
  */
-const slotFor = <S extends Slot, R>(
+export const slotFor = <S extends Slot, R>(
   slots: Map<string, S>,
   key: string,
-  refresh: boolean,
+  mode: SlotMode,
   make: () => S,
   run: (slot: S) => Effect.Effect<void, never, R>,
 ) =>
   Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
     const cached = slots.get(key);
-    if (!refresh && cached && isFresh(cached, now)) return cached;
+    const reusable =
+      cached !== undefined &&
+      (mode === "cached"
+        ? isFresh(cached, now)
+        : mode === "refresh" && cached.settledAt === undefined);
+    if (reusable) return cached;
     const slot = make();
     slots.set(key, slot);
     yield* Effect.forkDetach(run(slot));
@@ -89,10 +108,11 @@ const causeMessage = (cause: Cause.Cause<ExtensionFailure>) =>
 export interface ClaudeProbe {
   /** `query.mcpServerStatus()` once no server is pending (or the wait ran out); empty on error. */
   readonly statuses: ReadonlyArray<McpServerStatus>;
-  /** `query.getContextUsage()` from the same session; undefined when both detail levels failed. */
+  /**
+   * `query.getContextUsage({ detail: "summary" })` from the same session:
+   * Claude's local estimate (the "full" detail calls the token-count API).
+   */
   readonly contextUsage?: SDKControlGetContextUsageResponse | undefined;
-  /** `"full"` counts tokens through the API; `"summary"` is Claude's local estimate. */
-  readonly contextDetail?: "full" | "summary" | undefined;
   /** Why `contextUsage` is missing. */
   readonly contextError?: string | undefined;
   /** The session or status listing failed. */
@@ -127,31 +147,16 @@ const settledStatuses = Effect.fn("skillsMcp.mcp.claudeSettledStatuses")(functio
   return statuses;
 });
 
-const contextUsageAt = (query: Query, detail: "full" | "summary") =>
-  claudeCall(`context usage (${detail})`, () => query.getContextUsage({ detail })).pipe(
+/** Claude's local estimate; the "full" detail calls the token-count API per category. */
+const contextUsageOf = (query: Query) =>
+  claudeCall("context usage", () => query.getContextUsage({ detail: "summary" })).pipe(
     Effect.timeoutOrElse({
       duration: CONTEXT_TIMEOUT,
       orElse: () =>
-        Effect.fail(
-          new ExtensionFailure({ message: `Claude context usage (${detail}) timed out` }),
-        ),
+        Effect.fail(new ExtensionFailure({ message: "Claude context usage timed out" })),
     }),
-    Effect.map((contextUsage) => ({ contextUsage, contextDetail: detail })),
-  );
-
-/**
- * Exact token counts first; a local proxy may not support the count API, so
- * fall back to Claude's estimate, and to nothing when that fails too.
- */
-const contextUsageOf = (query: Query) =>
-  contextUsageAt(query, "full").pipe(
-    Effect.catch((full) =>
-      contextUsageAt(query, "summary").pipe(
-        Effect.catch((summary) =>
-          Effect.succeed({ contextError: `${full.message}; ${summary.message}` }),
-        ),
-      ),
-    ),
+    Effect.map((contextUsage) => ({ contextUsage })),
+    Effect.catch((failure) => Effect.succeed({ contextError: failure.message })),
   );
 
 const runClaudeProbe = (cli: AgentCli, cwd: string, slot: ClaudeSlot) =>
@@ -182,37 +187,48 @@ const runClaudeProbe = (cli: AgentCli, cwd: string, slot: ClaudeSlot) =>
 /** Module-level: the handler registry is rebuilt per ws connection. */
 const claudeSlots = new Map<string, ClaudeSlot>();
 
-const claudeSlot = (cli: AgentCli, cwd: string, refresh: boolean) =>
-  slotFor(
-    claudeSlots,
-    slotKey(cli, cwd),
-    refresh,
-    (): ClaudeSlot => ({
-      settledAt: undefined,
-      failed: false,
-      statuses: Deferred.makeUnsafe(),
-      probe: Deferred.makeUnsafe(),
-    }),
-    (slot) => runClaudeProbe(cli, cwd, slot),
-  );
+/**
+ * A refreshed listing (`statusesOnly`) does not join a probe whose statuses
+ * already went out: that one is only finishing context usage.
+ */
+const claudeSlot = (
+  cli: AgentCli,
+  cwd: string,
+  options: ProbeOptions | undefined,
+  statusesOnly = false,
+) =>
+  Effect.suspend(() => {
+    const key = slotKey(cli, cwd);
+    const current = claudeSlots.get(key);
+    const listed =
+      statusesOnly &&
+      options?.refresh === true &&
+      current !== undefined &&
+      Deferred.isDoneUnsafe(current.statuses);
+    return slotFor(
+      claudeSlots,
+      key,
+      listed ? "force" : modeOf(options),
+      (): ClaudeSlot => ({
+        settledAt: undefined,
+        failed: false,
+        statuses: Deferred.makeUnsafe(),
+        probe: Deferred.makeUnsafe(),
+      }),
+      (slot) => runClaudeProbe(cli, cwd, slot),
+    );
+  });
 
 /**
  * Claude's live MCP servers and context usage at `cwd`, from one thread-less
  * Agent SDK session that loads MCP config the way a thread does.
  */
 export const probeClaude = (cli: AgentCli, cwd: string, options?: ProbeOptions) =>
-  Effect.flatMap(claudeSlot(cli, cwd, options?.refresh ?? false), (slot) =>
-    Deferred.await(slot.probe),
-  );
+  Effect.flatMap(claudeSlot(cli, cwd, options), (slot) => Deferred.await(slot.probe));
 
 /** The statuses part of `probeClaude`, without waiting for context usage. */
 export const probeClaudeStatuses = (cli: AgentCli, cwd: string, options?: ProbeOptions) =>
-  Effect.flatMap(claudeSlot(cli, cwd, options?.refresh ?? false), (slot) =>
-    Deferred.await(slot.statuses),
-  );
-
-/** Drops every cached Claude probe (after a write); probes in flight still finish. */
-export const invalidateClaudeProbes = Effect.sync(() => claudeSlots.clear());
+  Effect.flatMap(claudeSlot(cli, cwd, options, true), (slot) => Deferred.await(slot.statuses));
 
 // ---------------------------------------------------------------------------
 // Codex
@@ -315,7 +331,8 @@ const codexSlots = new Map<string, CodexSlot>();
 
 /**
  * Codex's config and live MCP status at `cwd` from one app-server session.
- * `reload` first restarts the MCP servers from config (and implies `refresh`).
+ * `reload` first restarts the MCP servers from config, so it never joins a
+ * probe that did not.
  */
 export const codexSnapshot = (
   cli: AgentCli,
@@ -327,7 +344,7 @@ export const codexSnapshot = (
     slotFor(
       codexSlots,
       slotKey(cli, cwd),
-      reload || (options?.refresh ?? false),
+      reload ? "force" : modeOf(options),
       (): CodexSlot => ({ settledAt: undefined, failed: false, snapshot: Deferred.makeUnsafe() }),
       (slot) => runCodexProbe(cli, cwd, reload, slot),
     ),
@@ -343,5 +360,12 @@ export const probeCodex = (cli: AgentCli, cwd: string, options?: ProbeOptions) =
     checkedAt: snapshot.checkedAt,
   }));
 
-/** Drops every cached Codex probe (after a write); probes in flight still finish. */
-export const invalidateCodexProbes = Effect.sync(() => codexSlots.clear());
+/**
+ * Drops every cached Claude and Codex probe after a write to agent config (MCP
+ * servers, plugins, skills). Probes in flight still finish for their callers,
+ * but later ones start fresh.
+ */
+export const invalidateAgentProbes = Effect.sync(() => {
+  claudeSlots.clear();
+  codexSlots.clear();
+});

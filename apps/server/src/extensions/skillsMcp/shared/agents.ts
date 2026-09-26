@@ -35,7 +35,7 @@ export interface AgentCli {
   readonly configDir: string;
   /** Claude only: the `.claude.json` that holds user/local MCP servers. */
   readonly claudeJsonPath?: string | undefined;
-  /** Codex only: the raw `homePath` setting, forwarded to the app-server helper. */
+  /** Codex only: the effective `CODEX_HOME`, forwarded to the app-server helper. */
   readonly codexHomeSetting?: string | undefined;
   readonly launchArgs?: string | undefined;
 }
@@ -45,6 +45,12 @@ export interface CommandOutput {
   readonly stderr: string;
   readonly code: number;
 }
+
+/** An absolute config home from a setting or env value; undefined when blank. */
+const explicitHome = (path: Path.Path, value: string | undefined) => {
+  const trimmed = value?.trim();
+  return trimmed ? path.resolve(expandHomePath(trimmed)) : undefined;
+};
 
 /** The Claude and Codex CLIs as the default provider instances configure them. */
 export const resolveAgentClis = Effect.gen(function* () {
@@ -57,37 +63,26 @@ export const resolveAgentClis = Effect.gen(function* () {
   const claudeSettings = settings.providers.claudeAgent;
   const codexSettings = settings.providers.codex;
 
-  const claudeHomeSetting = claudeSettings.homePath.trim();
+  // One resolver per app: the home the CLI actually gets (T3's setting, else
+  // the inherited environment variable) also locates every file we read.
   const claudeEnv = yield* makeClaudeEnvironment(claudeSettings);
-  const claudeConfigDir =
-    claudeHomeSetting.length > 0
-      ? path.resolve(expandHomePath(claudeHomeSetting))
-      : path.join(NodeOS.homedir(), ".claude");
+  const claudeHome = explicitHome(path, claudeEnv.CLAUDE_CONFIG_DIR);
   const claude: AgentCli = {
     app: "claude",
     binaryPath: claudeSettings.binaryPath,
     env: claudeEnv,
-    configDir: claudeConfigDir,
-    claudeJsonPath:
-      claudeHomeSetting.length > 0
-        ? path.join(claudeConfigDir, ".claude.json")
-        : path.join(NodeOS.homedir(), ".claude.json"),
+    configDir: claudeHome ?? path.join(NodeOS.homedir(), ".claude"),
+    claudeJsonPath: path.join(claudeHome ?? NodeOS.homedir(), ".claude.json"),
     launchArgs: claudeSettings.launchArgs,
   };
 
-  const codexHomeSetting = codexSettings.homePath.trim();
-  const codexConfigDir =
-    codexHomeSetting.length > 0
-      ? path.resolve(expandHomePath(codexHomeSetting))
-      : process.env.CODEX_HOME
-        ? path.resolve(expandHomePath(process.env.CODEX_HOME))
-        : path.join(NodeOS.homedir(), ".codex");
+  const codexHome = explicitHome(path, codexSettings.homePath || process.env.CODEX_HOME);
   const codex: AgentCli = {
     app: "codex",
     binaryPath: codexSettings.binaryPath,
-    env: codexHomeSetting.length > 0 ? { ...process.env, CODEX_HOME: codexConfigDir } : process.env,
-    configDir: codexConfigDir,
-    codexHomeSetting: codexHomeSetting.length > 0 ? codexHomeSetting : undefined,
+    env: codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env,
+    configDir: codexHome ?? path.join(NodeOS.homedir(), ".codex"),
+    codexHomeSetting: codexHome,
     launchArgs: codexSettings.launchArgs,
   };
   return { claude, codex } as const;
@@ -95,15 +90,50 @@ export const resolveAgentClis = Effect.gen(function* () {
 
 const DEFAULT_CLI_TIMEOUT = Duration.seconds(60);
 
+export interface AgentCliOptions {
+  readonly cwd?: string;
+  readonly timeout?: Duration.Input;
+  /** Replaces the default "`claude mcp login github` timed out" message. */
+  readonly timeoutMessage?: string;
+}
+
+/**
+ * A label for `args` that is safe to show: the app, the subcommand and, for
+ * `mcp` commands, the server name - never the rest of argv, which can carry
+ * secrets (e.g. the JSON of `claude mcp add-json`).
+ */
+export const commandLabel = (cli: AgentCli, args: ReadonlyArray<string>) =>
+  [cli.app, ...args.slice(0, 2), ...(args[0] === "mcp" && args[2] ? [args[2]] : [])].join(" ");
+
+const tagOf = (value: unknown) =>
+  value && typeof value === "object" && "_tag" in value && typeof value._tag === "string"
+    ? value._tag
+    : undefined;
+
+/**
+ * Why the CLI could not start. Only tags are used: a spawn `PlatformError`'s
+ * message embeds the whole command line.
+ */
+const spawnFailureReason = (cli: AgentCli, cause: unknown) => {
+  const reason =
+    cause && typeof cause === "object" && "reason" in cause ? tagOf(cause.reason) : undefined;
+  const tag = reason ?? tagOf(cause);
+  return tag === "NotFound" || tag === "ProviderCommandNotFoundError"
+    ? `${cli.binaryPath} was not found`
+    : `${cli.binaryPath} failed to start (${tag ?? "unknown error"})`;
+};
+
 /**
  * Runs the agent's CLI with its provider environment. Non-zero exits are
- * returned, not failed, so callers can surface the CLI's own stderr.
+ * returned, not failed, so callers can surface the CLI's own stderr. Failure
+ * messages name the command by `commandLabel` only.
  */
 export const runAgentCli = Effect.fn("skillsMcp.runAgentCli")(function* (
   cli: AgentCli,
   args: ReadonlyArray<string>,
-  options?: { readonly cwd?: string; readonly timeout?: Duration.Input },
+  options?: AgentCliOptions,
 ) {
+  const label = commandLabel(cli, args);
   const spawnCommand = yield* resolveSpawnCommand(cli.binaryPath, args, { env: cli.env });
   const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
     env: cli.env,
@@ -111,21 +141,20 @@ export const runAgentCli = Effect.fn("skillsMcp.runAgentCli")(function* (
     ...(options?.cwd ? { cwd: options.cwd } : {}),
   });
   const result = yield* spawnAndCollect(cli.binaryPath, command).pipe(
+    Effect.mapError(
+      (cause) =>
+        new ExtensionFailure({
+          message: `Could not run \`${label}\`: ${spawnFailureReason(cli, cause)}`,
+          cause,
+        }),
+    ),
     Effect.timeoutOrElse({
       duration: options?.timeout ?? DEFAULT_CLI_TIMEOUT,
       orElse: () =>
         Effect.fail(
-          new ExtensionFailure({ message: `\`${cli.binaryPath} ${args.join(" ")}\` timed out` }),
+          new ExtensionFailure({ message: options?.timeoutMessage ?? `\`${label}\` timed out` }),
         ),
     }),
-    Effect.mapError((cause) =>
-      cause instanceof ExtensionFailure
-        ? cause
-        : new ExtensionFailure({
-            message: `Could not run \`${cli.binaryPath}\`: ${String(cause)}`,
-            cause,
-          }),
-    ),
   );
   return result satisfies CommandOutput;
 });
@@ -134,7 +163,7 @@ export const runAgentCli = Effect.fn("skillsMcp.runAgentCli")(function* (
 export const runAgentCliOk = (
   cli: AgentCli,
   args: ReadonlyArray<string>,
-  options?: { readonly cwd?: string; readonly timeout?: Duration.Input },
+  options?: AgentCliOptions,
 ) =>
   runAgentCli(cli, args, options).pipe(
     Effect.flatMap((output) =>
@@ -144,7 +173,7 @@ export const runAgentCliOk = (
             new ExtensionFailure({
               message:
                 (output.stderr.trim() || output.stdout.trim() || `exit code ${output.code}`) +
-                ` (${cli.app} ${args.slice(0, 3).join(" ")})`,
+                ` (${commandLabel(cli, args)})`,
             }),
           ),
     ),

@@ -30,6 +30,7 @@ import { type AgentCli, agentAppInfo, resolveAgentClis, runAgentCliOk } from "..
 import { ExtensionFailure, ServerSettingsService } from "../shared/t3.ts";
 import { BUILTIN_SERVER_NAME, type BuiltinAccess, builtinRow } from "./builtin.ts";
 import {
+  claudeAddUser,
   claudeRemoveUser,
   claudeReplaceUser,
   claudeSetProjectEnabled,
@@ -44,12 +45,7 @@ import {
   parseCodexStatuses,
 } from "./parse.ts";
 import { makeMcpPresets } from "./presets.ts";
-import {
-  codexSnapshot,
-  invalidateClaudeProbes,
-  invalidateCodexProbes,
-  probeClaudeStatuses,
-} from "./probes.ts";
+import { codexSnapshot, invalidateAgentProbes, probeClaudeStatuses } from "./probes.ts";
 import { APP_LABELS, type AppSnapshot, buildRows } from "./rows.ts";
 import {
   claudeEntryFor,
@@ -108,10 +104,12 @@ const firstByName = (servers: ReadonlyArray<ConfigServer>) => {
 
 /**
  * Adopts every user-scope server in either app's config that the store does
- * not already have. Claude's definition wins when both apps have the name; an
- * app's extras are kept only when its transport matches the adopted spec.
- * Claude has no global off switch (its per-project toggles are not one), so a
- * Claude definition always imports as enabled; Codex honours `enabled = false`.
+ * not already have. Claude's definition becomes the spec when both apps have
+ * the name; when Codex defines it differently, Codex's table is kept in
+ * `raw.codex` so Codex is never handed Claude's definition. An app's extras
+ * are kept only when its transport matches the adopted spec. Claude has no
+ * global off switch (its per-project toggles are not one), so a Claude
+ * definition always imports as enabled; Codex honours `enabled = false`.
  */
 export const adoptUserServers = (
   existing: ReadonlyArray<StoredMcpServer>,
@@ -132,13 +130,23 @@ export const adoptUserServers = (
       fromClaude?.spec?.type === spec.type ? claudeExtras(fromClaude.entry) : undefined;
     const codexFields =
       fromCodex?.spec?.type === spec.type ? codexExtras(fromCodex.entry) : undefined;
+    const rawCodex =
+      fromCodex?.spec && canonical(fromCodex.spec) !== canonical(spec)
+        ? codexEntryFor(fromCodex.spec, !fromCodex.disabled, {
+            spec: fromCodex.spec,
+            fields: fromCodex.entry,
+          })
+        : undefined;
     added.push({
       id: newId(),
       name,
       spec,
       apps: {
         claude: fromClaude !== undefined,
-        codex: fromCodex !== undefined && !fromCodex.disabled && spec.type !== "sse",
+        codex:
+          fromCodex !== undefined &&
+          !fromCodex.disabled &&
+          (spec.type !== "sse" || rawCodex !== undefined),
       },
       tags: [],
       ...(claudeFields || codexFields
@@ -149,6 +157,7 @@ export const adoptUserServers = (
             },
           }
         : {}),
+      ...(rawCodex ? { raw: { codex: rawCodex } } : {}),
     });
   }
   return { servers: [...existing, ...added], added: added.length };
@@ -378,14 +387,37 @@ type Upsert = Extract<McpMutation, { readonly action: "upsert" }>;
 const optionalText = (next: string | undefined, current: string | undefined) =>
   next === undefined ? current : next.trim() || undefined;
 
-/** The stored record an upsert produces; extras survive only an unchanged transport. */
+/**
+ * The extras an upsert keeps: an unchanged transport's, with Claude's taken
+ * from its stashed entry while the server is disabled there.
+ */
+const keptExtras = (current: StoredMcpServer | undefined, spec: McpServerSpec) => {
+  const sameTransport = current?.spec.type === spec.type;
+  const stash = current?.raw?.claude;
+  const claude = stash
+    ? specFromClaude(stash)?.type === spec.type
+      ? claudeExtras(stash)
+      : undefined
+    : sameTransport
+      ? current?.extras?.claude
+      : undefined;
+  const codex = sameTransport ? current?.extras?.codex : undefined;
+  return claude || codex
+    ? { ...(claude ? { claude } : {}), ...(codex ? { codex } : {}) }
+    : undefined;
+};
+
+/**
+ * The stored record an upsert produces. The spec replaces both apps'
+ * definitions, so the verbatim `raw` entries are dropped.
+ */
 const upsertRecord = (
   input: Upsert,
   name: string,
   current: StoredMcpServer | undefined,
 ): StoredMcpServer => {
   const spec: McpServerSpec = input.spec;
-  const sameTransport = current?.spec.type === spec.type;
+  const extras = keptExtras(current, spec);
   const description = optionalText(input.description, current?.description);
   const homepage = optionalText(input.homepage, current?.homepage);
   return {
@@ -396,7 +428,7 @@ const upsertRecord = (
     ...(description ? { description } : {}),
     ...(homepage ? { homepage } : {}),
     tags: [...(input.tags ?? current?.tags ?? [])],
-    ...(sameTransport && current?.extras ? { extras: current.extras } : {}),
+    ...(extras ? { extras } : {}),
   };
 };
 
@@ -450,45 +482,82 @@ const upsert = Effect.fn("skillsMcp.mcp.upsert")(function* (clis: Clis, input: U
   } satisfies MutationResult;
 });
 
-/**
- * Claude keeps nothing for a server it no longer has, so before disabling one
- * there the store takes over the fields the spec does not model.
- */
-const withLiveClaudeExtras = (server: StoredMcpServer, live: JsonObject | undefined) => {
-  if (!live || specFromClaude(live)?.type !== server.spec.type) return server;
-  const { claude: _previous, ...rest } = server.extras ?? {};
-  const fields = claudeExtras(live);
-  const extras = { ...rest, ...(fields ? { claude: fields } : {}) };
-  const { extras: _extras, ...base } = server;
-  return Object.keys(extras).length > 0 ? { ...base, extras } : base;
+/** `server` with `app`'s verbatim entry set, or cleared when `entry` is undefined. */
+const withRaw = (
+  server: StoredMcpServer,
+  app: AgentApp,
+  entry: JsonObject | undefined,
+): StoredMcpServer => {
+  const { [app]: _previous, ...others } = server.raw ?? {};
+  const raw = entry ? { ...others, [app]: entry } : others;
+  const { raw: _raw, ...base } = server;
+  return Object.keys(raw).length > 0 ? { ...base, raw } : base;
 };
 
-/** Flips one app's flag; the store only changes when the app write succeeded. */
+/**
+ * Claude has no disabled flag, so disabling removes the entry; the complete
+ * live entry is stashed first, for enabling to put back exactly.
+ */
+const disableClaude = Effect.fn("skillsMcp.mcp.disableClaude")(function* (
+  cli: AgentCli,
+  server: StoredMcpServer,
+) {
+  const live = yield* readClaudeUserEntry(cli, server.name);
+  if (!live) return;
+  yield* saveServer(withRaw(server, "claude", live));
+  yield* claudeRemoveUser(cli, server.name);
+});
+
+/** Re-adds the stashed entry (else one built from the spec); an existing entry is kept. */
+const enableClaude = Effect.fn("skillsMcp.mcp.enableClaude")(function* (
+  cli: AgentCli,
+  server: StoredMcpServer,
+) {
+  if (yield* readClaudeUserEntry(cli, server.name)) return;
+  yield* claudeAddUser(
+    cli,
+    server.name,
+    server.raw?.claude ??
+      claudeEntryFor(server.spec, { spec: server.spec, fields: server.extras?.claude }),
+  );
+});
+
+/** Sets only Codex's `enabled`; enabling a missing table restores it. */
+const codexToggle = (server: StoredMcpServer, enabled: boolean): CodexWrite => {
+  if (!enabled) return { name: server.name, enabled };
+  const restore = server.raw?.codex
+    ? { ...server.raw.codex, enabled }
+    : codexEntryFor(server.spec, enabled, { spec: server.spec, fields: server.extras?.codex });
+  return { name: server.name, enabled, restore };
+};
+
+/**
+ * Flips one app's flag without rewriting what the app has: Codex gets only
+ * `enabled`, and Claude's entry is stashed on disable and re-added verbatim on
+ * enable. Enabling a server missing from the app's config restores it. The
+ * flag is only saved when the app write succeeded.
+ */
 const setEnabled = Effect.fn("skillsMcp.mcp.setEnabled")(function* (
   clis: Clis,
   input: Extract<McpMutation, { readonly action: "setEnabled" }>,
 ) {
-  const stored = yield* findStored(yield* mcpStore.read, input.id);
-  if (input.app === "codex" && input.enabled && stored.spec.type === "sse") {
+  const server = yield* findStored(yield* mcpStore.read, input.id);
+  if (input.app === "codex" && input.enabled && server.spec.type === "sse" && !server.raw?.codex) {
     return { failures: [{ app: "codex", message: SSE_UNSUPPORTED }] } satisfies MutationResult;
   }
-  const liveClaude =
-    input.app === "claude" && !input.enabled && clis.available.claude.available
-      ? yield* readClaudeUserEntry(clis.claude, stored.name)
-      : undefined;
-  const server = withLiveClaudeExtras(
-    { ...stored, apps: { ...stored.apps, [input.app]: input.enabled } },
-    liveClaude,
-  );
   const failures = yield* forApp(clis, input.app, input.enabled, (cli) =>
     input.app === "codex"
-      ? applyCodexWrites(cli, [codexWriteFor(server)])
+      ? applyCodexWrites(cli, [codexToggle(server, input.enabled)])
       : input.enabled
-        ? writeClaude(cli, server, server.name)
-        : claudeRemoveUser(cli, server.name),
+        ? enableClaude(cli, server)
+        : disableClaude(cli, server),
   );
   if (failures.length > 0) return { failures } satisfies MutationResult;
-  yield* saveServer(server);
+  const latest = yield* findStored(yield* mcpStore.read, input.id);
+  const flipped = { ...latest, apps: { ...latest.apps, [input.app]: input.enabled } };
+  yield* saveServer(
+    input.app === "claude" && input.enabled ? withRaw(flipped, "claude", undefined) : flipped,
+  );
   return {
     failures,
     message: `${input.enabled ? "Enabled" : "Disabled"} ${server.name} in ${APP_LABELS[input.app]}`,
@@ -607,19 +676,23 @@ const login = Effect.fn("skillsMcp.mcp.login")(function* (
   input: Extract<McpMutation, { readonly action: "login" }>,
 ) {
   const failures = yield* forApp(clis, input.app, true, (cli) =>
-    runAgentCliOk(cli, ["mcp", "login", input.name], { timeout: LOGIN_TIMEOUT }),
+    runAgentCliOk(cli, ["mcp", "login", input.name], {
+      timeout: LOGIN_TIMEOUT,
+      timeoutMessage: `Sign-in to ${input.name} wasn't completed (timed out after 5 minutes)`,
+    }),
   );
-  yield* input.app === "claude" ? invalidateClaudeProbes : invalidateCodexProbes;
+  yield* invalidateAgentProbes;
   return failures.length > 0
     ? ({ failures } satisfies MutationResult)
-    : ({ failures, message: `Signed in to ${input.name}` } satisfies MutationResult);
+    : ({
+        failures,
+        message: `Signed in to ${input.name} (browser opened on the machine running T3)`,
+      } satisfies MutationResult);
 });
 
 /** Writes run one at a time and drop the cached probes, so the next list sees them. */
 const exclusiveWrite = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  mutationLock
-    .withPermit(effect)
-    .pipe(Effect.ensuring(Effect.andThen(invalidateClaudeProbes, invalidateCodexProbes)));
+  mutationLock.withPermit(effect).pipe(Effect.ensuring(invalidateAgentProbes));
 
 const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpMutation) {
   const clis = yield* resolveClis;

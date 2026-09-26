@@ -444,7 +444,7 @@ export const McpContextCost = Schema.Struct({
 export type McpContextCost = typeof McpContextCost.Type;
 
 export const AppContext = Schema.Struct({
-  /** True when the agent measured it (Claude `/context`); false for a local estimate (Codex). */
+  /** True only when measured with the provider's token counter; local estimates (both apps today) are false. */
   exact: Schema.Boolean,
   /** What an estimate covers, e.g. Codex: "MCP tools and skills only". */
   note: Schema.optional(Schema.String),
