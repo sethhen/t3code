@@ -7,7 +7,6 @@ export { ServerSettingsService } from "../../serverSettings.ts";
 export { expandHomePath } from "../../pathExpansion.ts";
 export { UsageLimitSources } from "../../usage/UsageLimitSources.ts";
 export { deriveProviderInstanceConfigMap } from "../../provider/Layers/ProviderInstanceRegistryHydration.ts";
-export { ProviderInstanceRegistryMutator } from "../../provider/Services/ProviderInstanceRegistryMutator.ts";
 export { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 export { makeClaudeEnvironment } from "../../provider/Drivers/ClaudeHome.ts";
 export { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";

@@ -27,7 +27,6 @@ import {
   deriveProviderInstanceConfigMap,
   expandHomePath,
   mergeProviderInstanceEnvironment,
-  ProviderInstanceRegistryMutator,
   resolveClaudeSdkExecutablePath,
   resolveSpawnCommand,
   ServerConfig,
@@ -48,10 +47,9 @@ export const PoolLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const settings = yield* ServerSettingsService;
-    // Both exist in the server runtime; optional so the pool degrades instead of failing a
-    // layer build if an upstream refactor moves them (the host-seam test catches that).
+    // Optional so the pool degrades instead of failing a layer build if an upstream
+    // refactor moves it.
     const usageSources = yield* Effect.serviceOption(UsageLimitSources);
-    const mutator = yield* Effect.serviceOption(ProviderInstanceRegistryMutator);
 
     const getSettings = () => Effect.runPromise(settings.getSettings);
     const instanceMap = async () => deriveProviderInstanceConfigMap(await getSettings());
@@ -59,14 +57,11 @@ export const PoolLive = Layer.effectDiscard(
     const deps: PoolDeps = {
       paths: poolPaths(config.stateDir),
       instanceMap,
+      // An empty patch still writes and emits, so the settings watcher (the registry's only
+      // reconciler, serial by design) re-derives the instance map with the pool's overlay.
+      // Never call the registry mutator directly: concurrent reconciles race.
       reconcile: async () => {
-        if (Option.isNone(mutator)) {
-          console.warn(
-            "[pool] no instance registry mutator; routing applies after the next settings change",
-          );
-          return;
-        }
-        await Effect.runPromise(mutator.value.reconcile(await instanceMap()));
+        await Effect.runPromise(settings.updateSettings({}));
       },
       usageSource: async () => (await getSettings()).usageLimitSources[POOL_USAGE_SOURCE],
       setUsageSource: async (entry) => {

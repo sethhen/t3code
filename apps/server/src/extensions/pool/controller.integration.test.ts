@@ -11,6 +11,7 @@
  * Run it after bumping CLIPROXY_VERSION or when an upstream merge touches the
  * seams. No real account is used: a fake auth file stands in for a sign-in.
  */
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFs from "node:fs";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
@@ -167,6 +168,35 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
       assert.isTrue(status.routes.every((route) => route.mode === "direct" || route.active));
       status = await pool.setSource({ source: "local" });
       assert.strictEqual(status.source, "local");
+      // A proxy left behind by a hard-killed server (this pool's binary + config + pid file)
+      // is killed by the next start; a foreign CLIProxyAPI never is (lifecycle.test.ts).
+      await pool.shutdown();
+      const binDir = NodePath.join(
+        paths.binDir,
+        NodeFs.readdirSync(paths.binDir).find((d) => !d.startsWith("."))!,
+      );
+      const leftover = NodeChildProcess.spawn(
+        NodePath.join(binDir, "cli-proxy-api"),
+        ["-config", paths.configPath],
+        {
+          stdio: "ignore",
+        },
+      );
+      NodeFs.writeFileSync(paths.pidPath, String(leftover.pid));
+      await sleep(1_500);
+      const next = new PoolController(deps);
+      await next.init();
+      await next.startLogin("claude");
+      await sleep(500);
+      const leftoverExited =
+        leftover.exitCode !== null ||
+        leftover.signalCode !== null ||
+        (await Promise.race([
+          new Promise<boolean>((resolve) => leftover.once("exit", () => resolve(true))),
+          sleep(3_000).then(() => false),
+        ]));
+      assert.isTrue(leftoverExited, "the next start must kill a proxy this pool left behind");
+      await next.shutdown();
     } finally {
       await pool.shutdown();
       assert.isFalse(NodeFs.existsSync(paths.pidPath));

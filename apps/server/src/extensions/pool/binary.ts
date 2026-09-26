@@ -86,6 +86,9 @@ export const ensureBinary = async (
     readonly platform?: string;
     readonly arch?: string;
     readonly fetch?: typeof fetch;
+    /** Cancels the download (the pool stopped, T3 is quitting). */
+    readonly signal?: AbortSignal;
+    readonly timeoutMs?: number;
   } = {},
 ): Promise<string> => {
   const platform = options.platform ?? process.platform;
@@ -102,8 +105,13 @@ export const ensureBinary = async (
   const staging = await NodeFsPromises.mkdtemp(NodePath.join(binDir, ".download-"));
   try {
     const archive = NodePath.join(staging, asset.file);
+    const signal = AbortSignal.any([
+      ...(options.signal ? [options.signal] : []),
+      AbortSignal.timeout(options.timeoutMs ?? 180_000),
+    ]);
     const response = await (options.fetch ?? fetch)(`${RELEASE_URL}/${asset.file}`, {
       redirect: "follow",
+      signal,
     });
     if (!response.ok || !response.body) {
       throw new Error(`Downloading CLIProxyAPI failed (HTTP ${response.status}).`);
@@ -111,6 +119,7 @@ export const ensureBinary = async (
     await pipeline(
       Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
       NodeFs.createWriteStream(archive),
+      { signal },
     );
     const digest = await sha256Of(archive);
     if (digest !== asset.sha256) {

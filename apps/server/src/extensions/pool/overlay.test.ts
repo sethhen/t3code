@@ -7,17 +7,19 @@ import {
   CODEX_KEY_ENV,
   codexPoolArgs,
   describeRoutes,
+  keyHelperCommand,
   poolOverlay,
   routeInstance,
   type PoolRoutingContext,
 } from "./overlay.ts";
 import { defaultRouteMode } from "./state.ts";
 
-const endpoint = { baseUrl: "http://127.0.0.1:18417", key: "client-key" };
+const endpoint = { baseUrl: "http://127.0.0.1:18417", key: "fake-pool-key-9f3a" };
 const context = (over: Partial<PoolRoutingContext> = {}): PoolRoutingContext => ({
   claude: endpoint,
   codex: endpoint,
   modeFor: defaultRouteMode,
+  keyHelper: { path: "/state/pool/client-key", platform: "darwin" },
   ...over,
 });
 
@@ -43,16 +45,32 @@ describe("routeInstance: Claude", () => {
     assert.strictEqual(env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL?.value, "1");
     assert.strictEqual(env.ENABLE_TOOL_SEARCH?.value, "true");
     assert.strictEqual(env.CLAUDE_CODE_PROMPT_CACHE_TTL?.value, "1h");
+    assert.strictEqual(env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY?.value, "0");
 
     // Flag settings outrank ~/.claude/settings.json's env block.
     const settings = launchArgSettings(launchArgs(routed)) as {
       env: Record<string, string>;
       advisorModel: string;
+      apiKeyHelper: string;
     };
     assert.strictEqual(settings.advisorModel, "opus");
     assert.strictEqual(settings.env.ANTHROPIC_BASE_URL, endpoint.baseUrl);
     assert.strictEqual(settings.env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL, "1");
+    assert.strictEqual(settings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, "0");
     assert.isTrue(launchArgs(routed).startsWith("--chrome "));
+  });
+
+  it("never puts the key on the command line: blank tokens plus apiKeyHelper", () => {
+    const routed = routeInstance("claudeAgent", claude(), context());
+    const args = launchArgs(routed);
+    assert.notInclude(args, endpoint.key);
+    const settings = launchArgSettings(args) as {
+      env: Record<string, string>;
+      apiKeyHelper: string;
+    };
+    assert.strictEqual(settings.env.ANTHROPIC_AUTH_TOKEN, "");
+    assert.strictEqual(settings.env.ANTHROPIC_API_KEY, "");
+    assert.strictEqual(settings.apiKeyHelper, "cat '/state/pool/client-key'");
   });
 
   it("replaces a user env entry of the same name instead of duplicating it", () => {
@@ -102,6 +120,54 @@ describe("routeInstance: Codex", () => {
     );
     assert.strictEqual(envOf(routed)[CODEX_KEY_ENV]?.value, endpoint.key);
     assert.isTrue(envOf(routed)[CODEX_KEY_ENV]?.sensitive);
+  });
+});
+
+describe("keyHelperCommand", () => {
+  it("prints the key file with the shell Claude Code uses", () => {
+    assert.strictEqual(
+      keyHelperCommand({ path: "/Users/o'brien/pool/client-key", platform: "linux" }),
+      `cat '/Users/o'\\''brien/pool/client-key'`,
+    );
+    assert.strictEqual(
+      keyHelperCommand({ path: String.raw`C:\Users\me\pool\client-key`, platform: "win32" }),
+      String.raw`type "C:\Users\me\pool\client-key"`,
+    );
+  });
+});
+
+describe("model families", () => {
+  const models = [
+    "claude-opus-5-5",
+    { slug: "gpt-6-astra" },
+    "o3",
+    "codex-mini",
+    { slug: "claude-fable-5" },
+    "my-alias",
+  ];
+
+  it("keeps OpenAI models out of a pooled Claude instance", () => {
+    const routed = routeInstance("claudeAgent", claude({ customModels: models }), context());
+    assert.deepStrictEqual((routed.config as { customModels: unknown }).customModels, [
+      "claude-opus-5-5",
+      { slug: "claude-fable-5" },
+      "my-alias",
+    ]);
+  });
+
+  it("keeps Claude models out of a pooled Codex instance", () => {
+    const routed = routeInstance("codex", codex({ customModels: models }), context());
+    assert.deepStrictEqual((routed.config as { customModels: unknown }).customModels, [
+      { slug: "gpt-6-astra" },
+      "o3",
+      "codex-mini",
+      "my-alias",
+    ]);
+  });
+
+  it("leaves a direct instance's models alone", () => {
+    const instance = claude({ customModels: models });
+    assert.strictEqual(routeInstance("claudeAgent_work", instance, context()), instance);
   });
 });
 

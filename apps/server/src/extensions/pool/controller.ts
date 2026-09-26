@@ -82,6 +82,8 @@ export interface PoolDeps {
   ) => Promise<ToolSearchProbe & { readonly configDir?: string }>;
   /** The version of the Codex CLI the pooled Codex instance runs (`client_version` for its catalog). */
   readonly codexVersion: () => Promise<string | undefined>;
+  /** Tests replace the download; production uses `ensureBinary`. */
+  readonly installBinary?: (signal: AbortSignal) => Promise<string>;
   readonly log: (message: string, cause?: unknown) => void;
 }
 
@@ -140,6 +142,11 @@ export class PoolController {
   private fetchingCatalog: Promise<void> | undefined;
   private unregisterOverlay: (() => void) | undefined;
   private closed = false;
+  /** Bumped by every stop; a start that began under an older generation must not spawn. */
+  private generation = 0;
+  private startAbort: AbortController | undefined;
+  /** Serialises state writes: one file, one writer at a time. */
+  private stateQueue: Promise<void> = Promise.resolve();
 
   private readonly deps: PoolDeps;
 
@@ -157,7 +164,10 @@ export class PoolController {
     this.unregisterOverlay = registerInstanceOverlay("pool", (map) =>
       poolOverlay(this.routingContext())(map),
     );
-    await this.applyRouting();
+    // Rewriting settings to re-reconcile is only needed when the overlay changes something.
+    const context = this.routingContext();
+    if (context.claude || context.codex) await this.applyRouting();
+    else this.signature = this.routingSignature(context);
     if (this.state.source === "local" && this.accounts.length > 0) {
       void this.ensureStarted().catch((error) => this.deps.log("Pool failed to start", error));
     } else if (this.state.source === "external") {
@@ -170,7 +180,7 @@ export class PoolController {
   async shutdown() {
     this.closed = true;
     this.unregisterOverlay?.();
-    await this.sidecar?.stop();
+    await this.stopLocal();
   }
 
   // -------------------------------------------------------------------------
@@ -184,12 +194,13 @@ export class PoolController {
     const state = this.state;
     const modeFor = (instanceId: string): PoolRouteMode =>
       state.routes[instanceId] ?? defaultRouteMode(instanceId);
+    const keyHelper = { path: this.deps.paths.clientKeyPath, platform: process.platform };
     if (state.source === "external") {
       const endpoint =
         state.external.url && state.external.key
           ? { baseUrl: state.external.url.replace(/\/+$/, ""), key: state.external.key }
           : undefined;
-      return { claude: endpoint, codex: endpoint, modeFor };
+      return { claude: endpoint, codex: endpoint, modeFor, keyHelper };
     }
     const endpoint = { baseUrl: this.localBaseUrl, key: state.clientKey };
     const serves = (provider: PoolProvider) =>
@@ -199,27 +210,52 @@ export class PoolController {
       codex: serves("codex") ? endpoint : undefined,
       codexCatalogPath: serves("codex") ? this.codexCatalogPath : undefined,
       modeFor,
+      keyHelper,
     };
   }
 
-  /** Reconciles the provider instances when anything the overlay reads has changed. */
-  private async applyRouting() {
-    const context = this.routingContext();
-    const signature = JSON.stringify({
+  private routingSignature(context: PoolRoutingContext) {
+    return JSON.stringify({
       claude: context.claude ?? null,
       codex: context.codex ?? null,
       codexCatalogPath: context.codexCatalogPath ?? null,
       routes: this.state.routes,
     });
+  }
+
+  /** Reconciles the provider instances when anything the overlay reads has changed. */
+  private async applyRouting() {
+    const context = this.routingContext();
+    const signature = this.routingSignature(context);
     if (signature === this.signature) return;
     this.signature = signature;
+    await this.writeClientKey(context.claude?.key ?? context.codex?.key);
     await this.deps.reconcile();
     void this.runChecks();
   }
 
-  private async saveState(next: PoolState) {
-    this.state = next;
-    await savePoolState(this.deps.paths, next);
+  /** The key file `apiKeyHelper` prints (0600; the key never goes on a command line). */
+  private async writeClientKey(key: string | undefined) {
+    if (!key) return;
+    const path = this.deps.paths.clientKeyPath;
+    await NodeFsPromises.mkdir(this.deps.paths.root, { recursive: true, mode: 0o700 });
+    await NodeFsPromises.writeFile(path, key, { mode: 0o600 });
+    await NodeFsPromises.chmod(path, 0o600);
+  }
+
+  /** Serialised: the change sees the latest state, and memory follows only a successful write. */
+  private updateState(change: (current: PoolState) => PoolState): Promise<PoolState> {
+    const run = this.stateQueue.then(async () => {
+      const next = change(this.state);
+      await savePoolState(this.deps.paths, next);
+      this.state = next;
+      return next;
+    });
+    this.stateQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   // -------------------------------------------------------------------------
@@ -237,24 +273,32 @@ export class PoolController {
     if (this.closed) throw new Error("T3 is shutting down.");
     if (this.running) return;
     if (this.starting) return this.starting;
+    // A stop (shutdown, switch to External, restart) between here and the spawn cancels it.
+    const generation = this.generation;
+    const abort = new AbortController();
+    this.startAbort = abort;
+    const stillWanted = () =>
+      generation === this.generation && !this.closed && this.state.source === "local";
+    const stopped = () => new Error("The pool was stopped.");
     this.starting = (async () => {
       this.startError = undefined;
       try {
         this.startPhase = "downloading";
-        const binaryPath = await ensureBinary(this.deps.paths.binDir);
+        const install =
+          this.deps.installBinary ??
+          ((signal: AbortSignal) => ensureBinary(this.deps.paths.binDir, { signal }));
+        const binaryPath = await install(abort.signal);
+        if (!stillWanted()) throw stopped();
         this.startPhase = "starting";
         if (!this.sidecar) {
-          await killStaleProxy(this.deps.paths.pidPath, "cli-proxy-api");
-          if (!(await isPortFree(this.state.port))) {
-            await this.saveState({ ...this.state, port: await findFreePort() });
-            await this.applyRouting();
-          }
+          await killStaleProxy(this.deps.paths);
+          if (!stillWanted()) throw stopped();
           this.sidecar = new Sidecar({
             paths: this.deps.paths,
             binaryPath,
-            port: this.state.port,
             clientKey: this.state.clientKey,
             managementKey: this.state.managementKey,
+            ensurePort: () => this.ensurePort(),
             onChange: () => {
               if (this.running) void this.afterProxyUp();
             },
@@ -262,17 +306,27 @@ export class PoolController {
         }
         await this.sidecar.start();
         if (!this.running) {
-          throw new Error(this.sidecar.state.message ?? "The pool did not start.");
+          throw new Error(this.sidecar?.state.message ?? "The pool did not start.");
         }
       } catch (error) {
-        this.startError = messageOf(error);
+        if (stillWanted()) this.startError = messageOf(error);
         throw error;
       } finally {
         this.startPhase = undefined;
         this.starting = undefined;
+        if (this.startAbort === abort) this.startAbort = undefined;
       }
     })();
     return this.starting;
+  }
+
+  /** The pool's port, moved to a free one (and routing re-applied) if something else took it. */
+  private async ensurePort(): Promise<number> {
+    if (await isPortFree(this.state.port)) return this.state.port;
+    const port = await findFreePort();
+    await this.updateState((current) => ({ ...current, port }));
+    await this.applyRouting();
+    return port;
   }
 
   private async afterProxyUp() {
@@ -282,10 +336,17 @@ export class PoolController {
     void this.runChecks();
   }
 
+  /** Stops the proxy, cancelling (and waiting out) a start in progress. */
   private async stopLocal() {
+    this.generation++;
+    this.startAbort?.abort();
     const sidecar = this.sidecar;
     this.sidecar = undefined;
     await sidecar?.stop();
+    await this.starting?.catch(() => undefined);
+    const late = this.sidecar as Sidecar | undefined;
+    this.sidecar = undefined;
+    await late?.stop();
   }
 
   private async refreshAccounts() {
@@ -446,13 +507,17 @@ export class PoolController {
       if (!/^https?:\/\/\S+$/i.test(url))
         throw new Error("Enter the pool's URL, e.g. https://pool.example.com");
       if (!key) throw new Error("Enter the key the pool gave you.");
-      await this.saveState({ ...this.state, source: "external", external: { url, key } });
+      await this.updateState((current) => ({
+        ...current,
+        source: "external",
+        external: { url, key },
+      }));
       await this.stopLocal();
       await this.syncUsageSource().catch(() => undefined);
       await this.applyRouting();
       await this.probeExternal();
     } else {
-      await this.saveState({ ...this.state, source: "local" });
+      await this.updateState((current) => ({ ...current, source: "local" }));
       this.external = {};
       this.accounts = await scanAuthDir(this.deps.paths.authDir);
       await this.applyRouting();
@@ -462,10 +527,12 @@ export class PoolController {
   }
 
   async setRoute(instanceId: string, mode: PoolRouteMode) {
-    const routes = { ...this.state.routes };
-    if (mode === defaultRouteMode(instanceId)) delete routes[instanceId];
-    else routes[instanceId] = mode;
-    await this.saveState({ ...this.state, routes });
+    await this.updateState((current) => {
+      const routes = { ...current.routes };
+      if (mode === defaultRouteMode(instanceId)) delete routes[instanceId];
+      else routes[instanceId] = mode;
+      return { ...current, routes };
+    });
     await this.applyRouting();
     return this.status();
   }
@@ -495,8 +562,14 @@ export class PoolController {
     return result;
   }
 
+  /** Only ids the pool listed: never pass a client-supplied name straight to the proxy. */
+  private requireAccount(id: string) {
+    if (!this.accounts.some((account) => account.name === id)) throw new Error("Unknown account");
+  }
+
   async setAccountEnabled(id: string, enabled: boolean) {
     this.requireLocal();
+    this.requireAccount(id);
     await this.ensureStarted();
     await setAuthFileDisabled(this.target, id, !enabled);
     await this.refreshAccounts();
@@ -505,6 +578,7 @@ export class PoolController {
 
   async removeAccount(id: string) {
     this.requireLocal();
+    this.requireAccount(id);
     await this.ensureStarted();
     await deleteAuthFile(this.target, id);
     await this.refreshAccounts();

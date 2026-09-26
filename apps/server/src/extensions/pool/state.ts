@@ -32,6 +32,8 @@ export interface PoolPaths {
   readonly binDir: string;
   readonly logPath: string;
   readonly pidPath: string;
+  /** The key T3's Claude sessions read through `apiKeyHelper`, so it never appears in argv. */
+  readonly clientKeyPath: string;
   /** OpenAI's Codex model catalog, as fetched through a pool account. */
   readonly codexCatalogPath: string;
 }
@@ -46,6 +48,7 @@ export const poolPaths = (stateDir: string): PoolPaths => {
     binDir: NodePath.join(root, "bin"),
     logPath: NodePath.join(root, "proxy.log"),
     pidPath: NodePath.join(root, "proxy.pid"),
+    clientKeyPath: NodePath.join(root, "client-key"),
     codexCatalogPath: NodePath.join(root, "codex-models.json"),
   };
 };
@@ -120,7 +123,8 @@ export const loadPoolState = async (paths: PoolPaths): Promise<PoolState> => {
 
 export const savePoolState = async (paths: PoolPaths, state: PoolState) => {
   await NodeFsPromises.mkdir(paths.root, { recursive: true, mode: 0o700 });
-  const temp = `${paths.statePath}.${process.pid}.tmp`;
+  // Unique per write: concurrent saves must never share (and delete) one temp file.
+  const temp = `${paths.statePath}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
   await NodeFsPromises.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await NodeFsPromises.rename(temp, paths.statePath);
 };

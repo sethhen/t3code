@@ -20,6 +20,16 @@
  * - `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`: subscribers get the 1-hour cache from
  *   their claude.ai login, which a proxied session doesn't carry.
  * - `advisorModel`: the advisor's model normally comes from the account.
+ *
+ * The pool key never appears in a command line (argv shows up in `ps`, in trace
+ * attributes and in T3's resource telemetry): flag settings blank both token
+ * variables, which also neutralises a stale token in `~/.claude/settings.json`,
+ * and `apiKeyHelper` reads the key from a 0600 file. Claude Code runs the helper
+ * with `shell: true`, i.e. `/bin/sh` or `cmd.exe`.
+ *
+ * Models stay in their own harness (Seth's rule): Claude models only through
+ * Claude Code, OpenAI models only through Codex, although the proxy would serve
+ * any model on either endpoint.
  */
 import type {
   ProviderInstanceConfig,
@@ -42,6 +52,17 @@ export interface PoolEndpoint {
   readonly key: string;
 }
 
+export interface KeyHelper {
+  /** The 0600 file holding the current endpoint's key. */
+  readonly path: string;
+  /** The platform Claude runs on (the T3 server's). */
+  readonly platform: string;
+}
+
+/** A shell command that prints the key file: `cmd.exe` on Windows, `/bin/sh` elsewhere. */
+export const keyHelperCommand = ({ path, platform }: KeyHelper) =>
+  platform === "win32" ? `type "${path}"` : `cat '${path.replaceAll("'", `'\\''`)}'`;
+
 export interface PoolRoutingContext {
   /** Present when the pool can serve Claude right now. */
   readonly claude?: PoolEndpoint | undefined;
@@ -50,20 +71,48 @@ export interface PoolRoutingContext {
   /** OpenAI's current Codex catalog, fetched through a pool account (native Codex reads the same one). */
   readonly codexCatalogPath?: string | undefined;
   readonly modeFor: (instanceId: string) => PoolRouteMode;
+  /** Where pooled Claude sessions read the key from (see `keyHelperCommand`). */
+  readonly keyHelper: KeyHelper;
 }
 
-/** The environment a pooled Claude session runs with. */
-export const claudePoolEnv = (endpoint: PoolEndpoint): Readonly<Record<string, string>> => ({
+/** Non-secret settings every pooled Claude session gets, in the env and in flag settings. */
+export const claudeParityEnv = (endpoint: PoolEndpoint): Readonly<Record<string, string>> => ({
   ANTHROPIC_BASE_URL: endpoint.baseUrl,
-  ANTHROPIC_AUTH_TOKEN: endpoint.key,
-  // A real API key would otherwise be sent to the pool alongside the token.
-  ANTHROPIC_API_KEY: "",
   _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
   ENABLE_TOOL_SEARCH: "true",
   CLAUDE_CODE_PROMPT_CACHE_TTL: "1h",
+  // Gateway model discovery would list the pool's OpenAI models in Claude Code.
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "0",
 });
 
-export const CLAUDE_POOL_SETTINGS = { advisorModel: "opus" } as const;
+/**
+ * Flag `--settings` for a pooled Claude session: no secret in it. The blank
+ * tokens outrank both the process env and `settings.json`, so the key can only
+ * come from `apiKeyHelper`.
+ */
+export const claudeFlagSettings = (endpoint: PoolEndpoint, keyHelper: KeyHelper) => ({
+  advisorModel: "opus",
+  apiKeyHelper: keyHelperCommand(keyHelper),
+  env: { ...claudeParityEnv(endpoint), ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_API_KEY: "" },
+});
+
+const OPENAI_MODEL = /^(gpt|o\d|codex|chatgpt)/i;
+const CLAUDE_MODEL = /(claude|opus|sonnet|haiku|fable)/i;
+
+/** Drops custom models of the other family from a pooled instance. */
+export const sameFamilyModels = (customModels: unknown, provider: PoolProvider): unknown => {
+  if (!Array.isArray(customModels)) return customModels;
+  const foreign = provider === "claude" ? OPENAI_MODEL : CLAUDE_MODEL;
+  return customModels.filter((model: unknown) => {
+    const slug =
+      typeof model === "string"
+        ? model
+        : typeof model === "object" && model !== null && "slug" in model
+          ? String((model as { slug: unknown }).slug)
+          : "";
+    return !foreign.test(slug);
+  });
+};
 
 /** `-c key=<TOML string>`, single-quoted for `tokenizeCliArgs` (JSON strings are valid TOML basic strings). */
 const codexOverride = (key: string, value: string) =>
@@ -120,20 +169,33 @@ export const routeInstance = (
   if (instance.enabled === false || context.modeFor(instanceId) !== "pool") return instance;
   const provider = providerOfDriver(instance.driver);
   if (provider === "claude" && context.claude) {
-    const env = claudePoolEnv(context.claude);
+    const config = configRecord(instance.config);
     return {
       ...instance,
-      environment: withEnv(instance.environment, env, new Set(["ANTHROPIC_AUTH_TOKEN"])),
+      // Process env (terminals, the status probe): the key is fine here, env is not argv.
+      environment: withEnv(
+        instance.environment,
+        {
+          ...claudeParityEnv(context.claude),
+          ANTHROPIC_AUTH_TOKEN: context.claude.key,
+          ANTHROPIC_API_KEY: "",
+        },
+        new Set(["ANTHROPIC_AUTH_TOKEN"]),
+      ),
       config: {
-        ...configRecord(instance.config),
-        launchArgs: withLaunchArgSettings(launchArgsOf(instance.config), {
-          ...CLAUDE_POOL_SETTINGS,
-          env,
-        }),
+        ...config,
+        ...("customModels" in config
+          ? { customModels: sameFamilyModels(config.customModels, "claude") }
+          : {}),
+        launchArgs: withLaunchArgSettings(
+          launchArgsOf(instance.config),
+          claudeFlagSettings(context.claude, context.keyHelper),
+        ),
       },
     };
   }
   if (provider === "codex" && context.codex) {
+    const codexConfig = configRecord(instance.config);
     const own = launchArgsOf(instance.config).trim();
     return {
       ...instance,
@@ -143,7 +205,10 @@ export const routeInstance = (
         new Set([CODEX_KEY_ENV]),
       ),
       config: {
-        ...configRecord(instance.config),
+        ...codexConfig,
+        ...("customModels" in codexConfig
+          ? { customModels: sameFamilyModels(codexConfig.customModels, "codex") }
+          : {}),
         // Ours last: a later `-c` for the same key wins.
         launchArgs: [own, codexPoolArgs(context.codex, context.codexCatalogPath)]
           .filter(Boolean)

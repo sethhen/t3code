@@ -1,0 +1,279 @@
+// @effect-diagnostics nodeBuiltinImport:off - drives fake proxy processes and temp state directories.
+// @effect-diagnostics globalTimers:off - waits on real child processes.
+/**
+ * Process and state lifecycle of the pool against a fake proxy (a tiny HTTP
+ * server behind a shell script), so these run everywhere without the network.
+ */
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFs from "node:fs";
+import * as NodeNet from "node:net";
+import * as NodeOs from "node:os";
+import * as NodePath from "node:path";
+
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { assert, describe, it } from "@effect/vitest";
+
+import { PoolController, type PoolDeps } from "./controller.ts";
+import { Sidecar, isOwnProxy, killStaleProxy } from "./sidecar.ts";
+import { poolPaths, savePoolState, decodePoolState, type PoolPaths } from "./state.ts";
+import { deriveProviderInstanceConfigMap } from "./t3.ts";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const tempDir = () => NodeFs.mkdtempSync(NodePath.join(NodeOs.tmpdir(), "pool-lc-"));
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** A stand-in proxy: answers every request with `{}` on the config's port. */
+const writeFakeProxy = (paths: PoolPaths, executable = true) => {
+  const dir = NodePath.join(paths.binDir, "test");
+  NodeFs.mkdirSync(dir, { recursive: true });
+  const script = NodePath.join(dir, "cli-proxy-api");
+  NodeFs.writeFileSync(
+    script,
+    [
+      "#!/bin/sh",
+      `PORT=$(sed -n 's/^port: //p' "$2")`,
+      `exec "${process.execPath}" -e "require('http').createServer((q,s)=>{s.setHeader('content-type','application/json');s.end(JSON.stringify({files:[]}))}).listen($PORT,'127.0.0.1')"`,
+      "",
+    ].join("\n"),
+    { mode: executable ? 0o755 : 0o644 },
+  );
+  return script;
+};
+
+const freePort = () =>
+  new Promise<number>((resolve) => {
+    const server = NodeNet.createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as NodeNet.AddressInfo;
+      server.close(() => resolve(port));
+    });
+  });
+
+const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
+  const calls = { reconcile: 0, install: 0 };
+  const deps: PoolDeps = {
+    paths,
+    instanceMap: async () => deriveProviderInstanceConfigMap(DEFAULT_SERVER_SETTINGS),
+    reconcile: async () => {
+      calls.reconcile++;
+    },
+    usageSource: async () => undefined,
+    setUsageSource: async () => undefined,
+    usageAccounts: async () => [],
+    refreshUsage: async () => undefined,
+    claudeProbe: async () => {
+      throw new Error("no probe in unit tests");
+    },
+    codexVersion: async () => undefined,
+    log: () => undefined,
+    ...over,
+  };
+  return { deps, calls };
+};
+
+const writeFakeAccount = (paths: PoolPaths, name = "claude-a@example.com.json") => {
+  NodeFs.mkdirSync(paths.authDir, { recursive: true });
+  NodeFs.writeFileSync(
+    NodePath.join(paths.authDir, name),
+    JSON.stringify({ type: "claude", email: "a@example.com" }),
+  );
+};
+
+describe("stale proxy cleanup", () => {
+  it("recognises only this pool's own proxy", () => {
+    const paths = { binDir: "/state/pool/bin", configPath: "/state/pool/config.yaml" };
+    const own = "/state/pool/bin/7.3.17/cli-proxy-api -config /state/pool/config.yaml";
+    assert.isTrue(isOwnProxy({ executable: own, commandLine: own }, paths, "darwin"));
+    const gui =
+      "/Users/me/Library/Application Support/com.cpa.gui/cpa-core/cli-proxy-api -config /Users/me/Library/Application Support/com.cpa.gui/cpa-core/config.yaml";
+    assert.isFalse(isOwnProxy({ executable: gui, commandLine: gui }, paths, "darwin"));
+    const otherConfig = "/state/pool/bin/7.3.17/cli-proxy-api -config /elsewhere/config.yaml";
+    assert.isFalse(
+      isOwnProxy({ executable: otherConfig, commandLine: otherConfig }, paths, "darwin"),
+    );
+    assert.isTrue(
+      isOwnProxy(
+        {
+          executable: String.raw`C:\Users\Me\AppData\t3\pool\bin\7.3.17\cli-proxy-api.exe`,
+          commandLine: String.raw`"C:\Users\Me\AppData\t3\pool\bin\7.3.17\cli-proxy-api.exe" -config C:\Users\Me\AppData\t3\pool\config.yaml`,
+        },
+        {
+          binDir: String.raw`c:\users\me\appdata\t3\pool\bin`,
+          configPath: String.raw`c:\users\me\appdata\t3\pool\config.yaml`,
+        },
+        "win32",
+      ),
+    );
+  });
+
+  it("leaves a foreign process named in the pid file alone", async () => {
+    const paths = poolPaths(tempDir());
+    NodeFs.mkdirSync(paths.root, { recursive: true });
+    const foreign = NodeChildProcess.spawn("sleep", ["30"], { stdio: "ignore" });
+    try {
+      NodeFs.writeFileSync(paths.pidPath, String(foreign.pid));
+      await killStaleProxy(paths);
+      assert.isTrue(alive(foreign.pid!), "a process outside the pool's bin dir must survive");
+      assert.isFalse(NodeFs.existsSync(paths.pidPath));
+    } finally {
+      foreign.kill("SIGKILL");
+    }
+  });
+});
+
+describe("sidecar", () => {
+  it("recovers from a spawn failure instead of sticking", { timeout: 30_000 }, async () => {
+    const paths = poolPaths(tempDir());
+    const binary = writeFakeProxy(paths, false);
+    const port = await freePort();
+    const sidecar = new Sidecar({
+      paths,
+      binaryPath: binary,
+      clientKey: "k",
+      managementKey: "m",
+      ensurePort: async () => port,
+      onChange: () => undefined,
+    });
+    try {
+      await sidecar.start();
+      assert.strictEqual(sidecar.state.phase, "error");
+      NodeFs.chmodSync(binary, 0o755);
+      // The failure scheduled a retry; start() must not be stuck on the dead child either.
+      for (let i = 0; i < 50 && sidecar.state.phase !== "running"; i++) await sleep(200);
+      assert.strictEqual(sidecar.state.phase, "running");
+      assert.strictEqual(NodeFs.readFileSync(paths.pidPath, "utf8").length > 0, true);
+    } finally {
+      await sidecar.stop();
+    }
+    assert.isFalse(NodeFs.existsSync(paths.pidPath));
+  });
+});
+
+describe("controller", () => {
+  it("does not touch settings at launch when nothing is routed", async () => {
+    const paths = poolPaths(tempDir());
+    const { deps, calls } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    assert.strictEqual(calls.reconcile, 0);
+    await pool.shutdown();
+  });
+
+  it("cancels a start in progress on shutdown; nothing spawns afterwards", async () => {
+    const paths = poolPaths(tempDir());
+    writeFakeAccount(paths);
+    const marker = NodePath.join(paths.root, "spawned");
+    const binary = NodePath.join(paths.root, "never-run.sh");
+    NodeFs.mkdirSync(paths.root, { recursive: true });
+    NodeFs.writeFileSync(binary, `#!/bin/sh\ntouch "${marker}"\nsleep 30\n`, { mode: 0o755 });
+    let aborted = false;
+    let finishDownload: () => void = () => undefined;
+    const { deps } = fakeDeps(paths, {
+      installBinary: (signal) =>
+        new Promise<string>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+          });
+          // Deliberately ignores the abort: the controller must still not spawn.
+          finishDownload = () => resolve(binary);
+        }),
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    await sleep(50);
+    const shutdown = pool.shutdown();
+    finishDownload();
+    await shutdown;
+    await sleep(500);
+    assert.isTrue(aborted);
+    assert.isFalse(NodeFs.existsSync(marker));
+  });
+
+  it("rejects account ids the pool never listed", async () => {
+    const paths = poolPaths(tempDir());
+    writeFakeAccount(paths);
+    let installs = 0;
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        installs++;
+        throw new Error("offline");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    await sleep(50);
+    const before = installs;
+    for (const attempt of [
+      () => pool.setAccountEnabled("../../etc/passwd", false),
+      () => pool.removeAccount("claude-b@example.com.json"),
+    ]) {
+      let failure: unknown;
+      await attempt().catch((error) => {
+        failure = error;
+      });
+      assert.match(String(failure), /Unknown account/);
+    }
+    assert.strictEqual(installs, before, "the guard runs before any start");
+    await pool.shutdown();
+  });
+
+  it("serialises concurrent state changes", async () => {
+    const paths = poolPaths(tempDir());
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    const ids = Array.from({ length: 12 }, (_, i) => `claudeAgent_extra${i}`);
+    await Promise.all(ids.map((id) => pool.setRoute(id, "pool")));
+    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+      routes: Record<string, string>;
+    };
+    assert.deepStrictEqual(Object.keys(saved.routes).toSorted(), ids.toSorted());
+    assert.deepStrictEqual(
+      NodeFs.readdirSync(paths.root).filter((name) => name.endsWith(".tmp")),
+      [],
+    );
+    await pool.shutdown();
+  });
+
+  it("moves to a free port when its port is taken", { timeout: 30_000 }, async () => {
+    const paths = poolPaths(tempDir());
+    writeFakeAccount(paths);
+    const taken = await freePort();
+    await savePoolState(paths, { ...decodePoolState({}, taken), port: taken });
+    const blocker = NodeNet.createServer().listen(taken, "127.0.0.1");
+    const binary = writeFakeProxy(paths);
+    const { deps, calls } = fakeDeps(paths, { installBinary: async () => binary });
+    const pool = new PoolController(deps);
+    try {
+      await pool.init();
+      for (let i = 0; i < 50; i++) {
+        const status = await pool.status();
+        if (status.runtime.state === "running") break;
+        await sleep(200);
+      }
+      const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as { port: number };
+      assert.notStrictEqual(saved.port, taken);
+      assert.notStrictEqual(saved.port, 8317);
+      assert.isAbove(calls.reconcile, 0, "routing must follow the new port");
+      assert.strictEqual((await pool.status()).runtime.endpoint, `127.0.0.1:${saved.port}`);
+    } finally {
+      await pool.shutdown();
+      blocker.close();
+    }
+  });
+});
