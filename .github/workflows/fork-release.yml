@@ -504,7 +504,6 @@ jobs:
             echo "Trusting the self-signed certificate for code signing on this runner."
             cert_pem="$RUNNER_TEMP/fork-signing.pem"
             security find-certificate -c "$identity_name" -p "$keychain" > "$cert_pem"
-            sudo security authorizationdb write com.apple.trust-settings.admin allow >/dev/null
             sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert_pem"
             if ! security find-identity -v -p codesigning "$keychain" | grep -q "$identity_hash"; then
               echo "::error::The certificate is still not a valid code-signing identity after trusting it."
