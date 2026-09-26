@@ -14,10 +14,12 @@ import type * as CodexSchema from "effect-codex-app-server/schema";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 
 import { resolveAgentClis } from "../shared/agents.ts";
 import {
@@ -27,7 +29,6 @@ import {
   hashDirectory,
   parseSkillFrontmatter,
   safeEntryPath,
-  symlinkStaysInside,
   validSkillName,
 } from "./archive.ts";
 import {
@@ -50,6 +51,18 @@ import {
 } from "./scan.ts";
 import { DEFAULT_REPOS, type ManagedSkill, resolveSkillsPaths, skillsDocument } from "./store.ts";
 import { serverConfigLayerTest, serverSettingsLayerTest } from "./t3.ts";
+
+/** Counts `invalidateAgentProbes` runs; the real probes would start Claude and Codex. */
+const probeInvalidations = vi.hoisted(() => ({ count: 0 }));
+vi.mock(import("../mcp/probes.ts"), async (importOriginal) => {
+  const { sync } = await import("effect/Effect");
+  return {
+    ...(await importOriginal()),
+    invalidateAgentProbes: sync(() => {
+      probeInvalidations.count += 1;
+    }),
+  };
+});
 
 const skillMd = (name: string, description: string) =>
   `---\nname: ${name}\ndescription: ${description}\n---\nBody of ${name}.\n`;
@@ -205,6 +218,16 @@ const rowByKey = (rows: ReadonlyArray<SkillRow>, key: string) => {
   return row!;
 };
 
+/** The error Node's `symlink` fails with for `code`, as the platform layer maps it. */
+const symlinkError = (code: string, link: string) =>
+  PlatformError.systemError({
+    _tag: code === "EEXIST" ? "AlreadyExists" : code === "EACCES" ? "PermissionDenied" : "Unknown",
+    module: "FileSystem",
+    method: "symlink",
+    pathOrDescriptor: link,
+    cause: Object.assign(new Error(code), { code }),
+  });
+
 describe("pure helpers", () => {
   it("parses frontmatter with a BOM, CRLF, and trimming", () => {
     assert.deepStrictEqual(
@@ -229,8 +252,8 @@ describe("pure helpers", () => {
   it("lists branch candidates", () => {
     assert.deepStrictEqual(branchCandidates(undefined), ["main", "master"]);
     assert.deepStrictEqual(branchCandidates("HEAD"), ["main", "master"]);
-    assert.deepStrictEqual(branchCandidates("main"), ["main", "master"]);
-    assert.deepStrictEqual(branchCandidates("dev"), ["dev", "main", "master"]);
+    assert.deepStrictEqual(branchCandidates("main"), ["main"]);
+    assert.deepStrictEqual(branchCandidates("Dev"), ["Dev"]);
   });
 
   it("guards zip entry paths", () => {
@@ -240,16 +263,7 @@ describe("pure helpers", () => {
     }
   });
 
-  it("keeps symlinks inside the archive", () => {
-    const none = new Set<string>();
-    assert.isTrue(symlinkStaysInside("p", ".", none));
-    assert.isTrue(symlinkStaysInside("a/b", "../c", none));
-    assert.isFalse(symlinkStaysInside("a", "../x", none));
-    assert.isFalse(symlinkStaysInside("a/b", "/etc", none));
-    assert.isFalse(symlinkStaysInside("q", "p/..", new Set(["p", "q"])));
-  });
-
-  it("merges rows: managed absorbs same-name folders, plugins key apart, apps merge", () => {
+  it("merges rows: managed absorbs same-name user folders, plugins key apart, apps merge", () => {
     const managed: ManagedState = {
       skill: managedSkill(),
       states: {
@@ -286,16 +300,58 @@ describe("pure helpers", () => {
     assert.strictEqual(demo.apps.codex?.mode, "native");
     assert.strictEqual(demo.apps.codex?.path, "/x/codex/demo");
     assert.isFalse(demo.apps.codex?.editable);
+    // `adopt` refuses a name that's already managed.
+    assert.isFalse(demo.apps.codex?.adoptable);
 
     const shared = rowByKey(rows, "shared");
     assert.isFalse(shared.managed);
     assert.strictEqual(shared.apps.claude?.scope, "user");
+    assert.isTrue(shared.apps.claude?.adoptable);
     assert.strictEqual(shared.apps.codex?.enabled, false);
 
     const tool = rowByKey(rows, "plugin:x@m:tool");
     assert.strictEqual(tool.pluginId, "x@m");
     assert.isUndefined(tool.apps.claude);
     assert.strictEqual(tool.apps.codex?.scope, "plugin");
+  });
+
+  it("keeps a same-name project skill in its own row", () => {
+    const rows = buildRows(
+      [
+        {
+          skill: managedSkill(),
+          states: {
+            claude: { kind: "none", path: "/c/skills/demo" },
+            codex: { kind: "symlink", path: "/x/skills/demo" },
+          },
+        },
+      ],
+      [
+        unmanaged({
+          app: "claude",
+          name: "demo",
+          scope: "project",
+          dir: "/proj/.claude/skills/demo",
+          inAppDir: false,
+        }),
+      ],
+    );
+    assert.deepStrictEqual(
+      rows.map((row) => row.key),
+      ["demo", "id-demo"],
+    );
+    assert.isFalse(rowByKey(rows, "id-demo").apps.claude?.present);
+    const project = rowByKey(rows, "demo");
+    assert.isFalse(project.managed);
+    assert.deepStrictEqual(project.apps.claude, {
+      present: true,
+      enabled: true,
+      scope: "project",
+      path: "/proj/.claude/skills/demo",
+      mode: "native",
+      editable: false,
+      adoptable: false,
+    });
   });
 
   it("shows a managed skill that isn't deployed as absent", () => {
@@ -425,8 +481,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
 
         const noSymlinks: FileSystem.FileSystem = {
           ...fs,
-          symlink: () =>
-            Effect.fail(PlatformError.badArgument({ module: "FileSystem", method: "symlink" })),
+          symlink: (_target, link) => Effect.fail(symlinkError("EPERM", link)),
         };
         const mode = yield* deploy(paths, "codex", ref).pipe(
           Effect.provideService(FileSystem.FileSystem, noSymlinks),
@@ -460,6 +515,61 @@ it.layer(NodeServices.layer)("skills", (it) => {
     ),
   );
 
+  it.effect("never replaces a folder that appears while deploying", () =>
+    withSandbox(({ root }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { paths } = yield* resolveSkillsPaths;
+        const source = path.join(root, "src-demo");
+        yield* writeTree(source, { "SKILL.md": skillMd("demo", "Demo") });
+        yield* writeStoreSkill(paths, "demo", source);
+        const ref = { id: "id-demo", name: "demo" };
+        const mine = skillMd("demo", "Mine");
+        const target = path.join(paths.appDirs.claude, "demo");
+        // Another tool creates a real folder between our absence check and the link:
+        // the link then fails with EEXIST, or with EPERM so the copy fallback runs.
+        const racing = (code: "EEXIST" | "EPERM"): FileSystem.FileSystem => ({
+          ...fs,
+          symlink: (linkTarget, link) =>
+            fs
+              .makeDirectory(link)
+              .pipe(
+                Effect.andThen(fs.writeFileString(path.join(link, "SKILL.md"), mine)),
+                Effect.andThen(
+                  code === "EEXIST"
+                    ? fs.symlink(linkTarget, link)
+                    : Effect.fail(symlinkError(code, link)),
+                ),
+              ),
+        });
+        for (const code of ["EEXIST", "EPERM"] as const) {
+          const failure = yield* Effect.flip(
+            deploy(paths, "claude", ref).pipe(
+              Effect.provideService(FileSystem.FileSystem, racing(code)),
+            ),
+          );
+          assert.include(failure.message, "isn't managed here", code);
+          assert.strictEqual(yield* fs.readFileString(path.join(target, "SKILL.md")), mine);
+          assert.deepStrictEqual(yield* fs.readDirectory(target), ["SKILL.md"]);
+          assert.deepStrictEqual(yield* fs.readDirectory(paths.appDirs.claude), ["demo"]);
+          yield* fs.remove(target, { recursive: true });
+        }
+
+        // Any other link failure is reported, not papered over with a copy.
+        const denied: FileSystem.FileSystem = {
+          ...fs,
+          symlink: (_target, link) => Effect.fail(symlinkError("EACCES", link)),
+        };
+        const failure = yield* Effect.flip(
+          deploy(paths, "claude", ref).pipe(Effect.provideService(FileSystem.FileSystem, denied)),
+        );
+        assert.include(failure.message, "Could not enable demo");
+        assert.deepStrictEqual(yield* fs.readDirectory(paths.appDirs.claude), []);
+      }),
+    ),
+  );
+
   it.effect("hashes folders stably, ignoring the marker and .DS_Store", () =>
     withSandbox(({ root }) =>
       Effect.gen(function* () {
@@ -487,7 +597,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
     ),
   );
 
-  it.effect("keeps the newest backups", () =>
+  it.effect("keeps each skill's newest backup plus the newest older revisions", () =>
     withSandbox(({ root }) =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
@@ -500,17 +610,44 @@ it.layer(NodeServices.layer)("skills", (it) => {
           apps: { claude: true, codex: false },
         };
         const ids: Array<string> = [];
-        for (let n = 0; n <= MAX_BACKUPS; n++) {
+        for (let n = 0; n < MAX_BACKUPS + 2; n++) {
           ids.push(yield* createBackup(paths, meta, source));
           yield* TestClock.adjust(Duration.seconds(1));
         }
         const kept = yield* listBackups(paths);
-        assert.strictEqual(kept.length, MAX_BACKUPS);
         assert.deepStrictEqual(
           kept.map((entry) => entry.backup.id),
           ids.slice(1).toReversed(),
         );
         assert.strictEqual(kept[0]?.backup.skillName, "demo");
+      }),
+    ),
+  );
+
+  it.effect("keeps the latest backup of every skill in a large update", () =>
+    withSandbox(({ root }) =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const { paths } = yield* resolveSkillsPaths;
+        const source = path.join(root, "src");
+        yield* writeTree(source, { "SKILL.md": skillMd("demo", "Demo") });
+        const names = Array.from({ length: 50 }, (_, n) => `skill-${n}`);
+        const latest = new Map<string, string>();
+        for (let round = 0; round < 2; round++) {
+          for (const name of names) {
+            const meta = {
+              name,
+              source: { type: "local", path: source } as const,
+              apps: { claude: true, codex: false },
+            };
+            latest.set(name, yield* createBackup(paths, meta, source));
+          }
+          yield* TestClock.adjust(Duration.seconds(1));
+        }
+        const kept = yield* listBackups(paths);
+        assert.strictEqual(kept.length, names.length + MAX_BACKUPS);
+        const keptIds = new Set(kept.map((entry) => entry.backup.id));
+        for (const [name, id] of latest) assert.isTrue(keptIds.has(id), name);
       }),
     ),
   );
@@ -524,13 +661,6 @@ it.layer(NodeServices.layer)("skills", (it) => {
         const cases: ReadonlyArray<readonly [ReadonlyArray<ZipEntry>, string]> = [
           [[{ name: "../evil", data: "x" }], "Invalid zip"],
           [[{ name: "/abs-evil", data: "x" }], "Invalid zip"],
-          [
-            [
-              { name: "skill/SKILL.md", data: skillMd("s", "S") },
-              { name: "skill/link", data: "../../etc", kind: "symlink" },
-            ],
-            "points outside the archive",
-          ],
         ];
         for (const [entries, expected] of cases) {
           yield* fs.makeDirectory(dest, { recursive: true });
@@ -545,7 +675,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
     ),
   );
 
-  it.effect("unpacks a zip, stripping its common root and keeping inside links", () =>
+  it.effect("unpacks a zip, stripping its common root and skipping links", () =>
     withSandbox(({ root }) =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -562,15 +692,91 @@ it.layer(NodeServices.layer)("skills", (it) => {
             return {
               dir,
               rootName,
-              link: yield* fs.readLink(path.join(dir, "alias.md")),
-              doc: yield* fs.readFileString(path.join(dir, "alias.md")),
+              files: yield* fs.readDirectory(dir, { recursive: true }),
             };
           }),
         );
         assert.strictEqual(unpacked.rootName, "pack");
-        assert.strictEqual(unpacked.link, "refs/doc.md");
-        assert.strictEqual(unpacked.doc, "doc\n");
+        assert.sameMembers([...unpacked.files], ["SKILL.md", "refs", path.join("refs", "doc.md")]);
         assert.isFalse(yield* fs.exists(unpacked.dir));
+      }),
+    ),
+  );
+
+  it.effect("installs a nested skill from a zip without its links", () =>
+    withSandbox(() =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { paths } = yield* resolveSkillsPaths;
+        const zip = buildZip([
+          { name: "pack/a/b/skill/SKILL.md", data: skillMd("nested", "Nested") },
+          { name: "pack/a/b/skill/link", data: "../../../x", kind: "symlink" },
+          { name: "pack/x", data: "outside the skill\n" },
+        ]);
+        const installed = yield* mutateSkills({
+          action: "installZip",
+          fileName: "pack.zip",
+          dataBase64: toBase64(zip),
+          apps: { claude: true, codex: false },
+        });
+        assert.deepStrictEqual(installed.failures, []);
+        const store = storeSkillDir(path, paths, "skill");
+        assert.deepStrictEqual(yield* fs.readDirectory(store), ["SKILL.md"]);
+        assert.isFalse(yield* fs.exists(path.join(store, "link")));
+      }),
+    ),
+  );
+
+  it.effect("installs from the exact GitHub branch asked for", () =>
+    withSandbox(() =>
+      Effect.gen(function* () {
+        // Serves `Branchy/Tool` on `Dev` and `master` only; codeload branch names are case-sensitive.
+        const served = new Set(["Dev", "master"]);
+        const requested: Array<string> = [];
+        const fetch = ((input: string | URL | Request) => {
+          const branch = String(input).split("/zip/refs/heads/")[1] ?? "";
+          requested.push(branch);
+          const zip = buildZip([{ name: `Tool-${branch}/SKILL.md`, data: skillMd("tool", "T") }]);
+          return Promise.resolve(
+            served.has(branch)
+              ? new Response(new Uint8Array(zip))
+              : new Response("Not Found", { status: 404 }),
+          );
+        }) as typeof globalThis.fetch;
+        const install = (branch: string | undefined) =>
+          mutateSkills({
+            action: "install",
+            source: { owner: "Branchy", repo: "Tool", ...(branch ? { branch } : {}) },
+            apps: { claude: false, codex: false },
+          }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
+        const storedBranch = Effect.map(skillsDocument.read, (doc) =>
+          doc.skills.map((skill) => (skill.source.type === "github" ? skill.source.branch : "")),
+        );
+
+        assert.deepStrictEqual((yield* install("Dev")).failures, []);
+        assert.deepStrictEqual(yield* storedBranch, ["Dev"]);
+        assert.deepStrictEqual(requested, ["Dev"]);
+
+        // A branch that was asked for and fails is an error, not a switch to main/master,
+        // and `dev` isn't served from the cached `Dev` download.
+        yield* mutateSkills({
+          action: "uninstall",
+          id: (yield* skillsDocument.read).skills[0]!.id,
+        });
+        for (const branch of ["dev", "gone"]) {
+          requested.length = 0;
+          const failure = yield* Effect.flip(install(branch));
+          assert.include(failure.message, `tried ${branch})`);
+          assert.deepStrictEqual(requested, [branch]);
+          assert.deepStrictEqual(yield* storedBranch, []);
+        }
+
+        // With no branch, the default it resolves to is what gets stored.
+        requested.length = 0;
+        assert.deepStrictEqual((yield* install(undefined)).failures, []);
+        assert.deepStrictEqual(requested, ["main", "master"]);
+        assert.deepStrictEqual(yield* storedBranch, ["master"]);
       }),
     ),
   );
@@ -581,6 +787,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const { paths } = yield* resolveSkillsPaths;
+        probeInvalidations.count = 0;
         const installed = yield* mutateSkills({
           action: "installZip",
           fileName: "demo.zip",
@@ -588,6 +795,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
           apps: { claude: true, codex: false },
         });
         assert.deepStrictEqual(installed, { failures: [], message: "Installed demo" });
+        assert.strictEqual(probeInvalidations.count, 1);
         const [skill] = (yield* skillsDocument.read).skills;
         assert.isDefined(skill);
         assert.strictEqual(skill!.description, "Demo skill");
@@ -614,6 +822,8 @@ it.layer(NodeServices.layer)("skills", (it) => {
           }),
         );
         assert.include(garbage.message, "invalid base64 data");
+        // Failed and no-op actions still drop the cached probes.
+        assert.strictEqual(probeInvalidations.count, 3);
 
         const enabled = yield* mutateSkills({
           action: "setEnabled",
@@ -635,6 +845,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
         assert.strictEqual((yield* deploymentState(paths, "claude", skill!)).kind, "none");
         assert.strictEqual((yield* deploymentState(paths, "codex", skill!)).kind, "none");
         assert.strictEqual((yield* listBackups(paths)).length, 1);
+        assert.strictEqual(probeInvalidations.count, 5);
       }),
     ),
   );
@@ -702,9 +913,11 @@ it.layer(NodeServices.layer)("skills", (it) => {
   );
 
   it.effect("lists managed and unmanaged skills side by side", () =>
-    withSandbox(({ claudeHome, codexHome, project }) =>
+    withSandbox(({ root, claudeHome, codexHome, project }) =>
       Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
+        yield* writeTree(root, { "elsewhere/linked/SKILL.md": skillMd("linked", "Linked") });
         yield* writeTree(claudeHome, {
           "skills/shared/SKILL.md": skillMd("shared", "Shared (Claude)"),
           "skills/claude-only/SKILL.md": skillMd("claude-only", "Only Claude"),
@@ -725,6 +938,10 @@ it.layer(NodeServices.layer)("skills", (it) => {
           dataBase64: toBase64(DEMO_ZIP),
           apps: { claude: true, codex: true },
         });
+        yield* fs.symlink(
+          path.join(root, "elsewhere", "linked"),
+          path.join(claudeHome, "skills", "linked"),
+        );
 
         const overview = yield* listSkills({ cwd: project });
         const codexInfo = overview.apps.find((app) => app.app === "codex");
@@ -735,7 +952,7 @@ it.layer(NodeServices.layer)("skills", (it) => {
         const byName = (name: string) => overview.skills.filter((row) => row.name === name);
         assert.deepStrictEqual(
           overview.skills.map((row) => row.name),
-          ["claude-only", "demo", "proj", "shared", "synced-one", "sys-skill"],
+          ["claude-only", "demo", "linked", "proj", "shared", "synced-one", "sys-skill"],
         );
 
         const [demo] = byName("demo");
@@ -753,6 +970,16 @@ it.layer(NodeServices.layer)("skills", (it) => {
         assert.strictEqual(byName("synced-one")[0]?.apps.claude?.scope, "synced");
         assert.strictEqual(byName("sys-skill")[0]?.apps.codex?.scope, "system");
         assert.isUndefined(byName("sys-skill")[0]?.apps.claude);
+
+        // Only plain folders directly in an app's own skills folder can be adopted.
+        assert.isTrue(shared?.apps.claude?.adoptable);
+        assert.isTrue(shared?.apps.codex?.adoptable);
+        assert.isTrue(byName("claude-only")[0]?.apps.claude?.adoptable);
+        assert.strictEqual(byName("linked")[0]?.apps.claude?.scope, "user");
+        assert.isFalse(byName("linked")[0]?.apps.claude?.adoptable);
+        assert.isFalse(byName("proj")[0]?.apps.claude?.adoptable);
+        assert.isFalse(byName("synced-one")[0]?.apps.claude?.adoptable);
+        assert.isFalse(byName("sys-skill")[0]?.apps.codex?.adoptable);
       }),
     ),
   );

@@ -19,6 +19,7 @@ import * as Path from "effect/Path";
 import * as Random from "effect/Random";
 import * as Result from "effect/Result";
 
+import { invalidateAgentProbes } from "../mcp/probes.ts";
 import { ExtensionFailure } from "../shared/t3.ts";
 import {
   copyTree,
@@ -250,6 +251,7 @@ const install = Effect.fn("skillsMcp.skills.install")(function* (
           type: "github",
           owner,
           repo,
+          // The requested branch, or the default (`main`/`master`) it resolved to when none was given.
           branch,
           ...(rel !== "" ? { path: rel } : {}),
         };
@@ -399,7 +401,8 @@ const byCheckout = (skills: ReadonlyArray<GithubSkill>) => {
   const groups = new Map<string, Array<GithubSkill>>();
   for (const skill of skills) {
     const { owner, repo, branch } = skill.source;
-    const key = `${owner}/${repo}@${branch ?? ""}`.toLowerCase();
+    // GitHub owner and repo names are case-insensitive; branch names are not.
+    const key = `${owner.toLowerCase()}/${repo.toLowerCase()}@${branch ?? ""}`;
     groups.set(key, [...(groups.get(key) ?? []), skill]);
   }
   return [...groups.values()].flatMap((group) => {
@@ -496,7 +499,8 @@ const updateOne = (paths: SkillsPaths, root: string, branch: string, id: string)
         id: skill.id,
         name: skill.name,
         ...(description !== undefined ? { description } : {}),
-        source: { ...skill.source, branch },
+        // Keeps the stored branch; one resolved from `main`/`master` fills it in only when none was stored.
+        source: { ...skill.source, branch: skill.source.branch ?? branch },
         installedAt: skill.installedAt,
         hash,
         apps: {
@@ -759,7 +763,10 @@ const removeRepo = (input: Mutation<"removeRepo">) =>
     }),
   );
 
-/** Runs one `skills.mutate` action against the store. */
+/**
+ * Runs one `skills.mutate` action against the store, then drops the cached
+ * agent probes so the next one sees the changed skills.
+ */
 export const mutate = Effect.fn("skillsMcp.skills.mutate")(
   function* (input: SkillsMutation) {
     const { paths } = yield* resolveSkillsPaths;
@@ -789,5 +796,9 @@ export const mutate = Effect.fn("skillsMcp.skills.mutate")(
         return yield* removeRepo(input);
     }
   },
-  (effect, input) => Effect.mapError(effect, failWith(`Skills ${input.action} failed`)),
+  (effect, input) =>
+    effect.pipe(
+      Effect.ensuring(invalidateAgentProbes),
+      Effect.mapError(failWith(`Skills ${input.action} failed`)),
+    ),
 );

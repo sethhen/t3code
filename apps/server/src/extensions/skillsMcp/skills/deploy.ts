@@ -2,10 +2,11 @@
  * Store folders, per-app deployments, and backups.
  *
  * A skill is deployed to an app by symlinking `<appDir>/<name>` to its store
- * folder, or, where symlinks fail, by copying it there with a
- * `.t3code-managed` marker holding the skill id. Removal only ever touches a
- * link to the store or a copy carrying our marker. Backups mirror CC Switch:
- * `<backupDir>/<YYYYMMDD_HHMMSS>_<name>/skill/` plus `meta.json`, newest 20 kept.
+ * folder, or, where the folder can't hold symlinks, by copying it there with a
+ * `.t3code-managed` marker holding the skill id. Removal and replacement only
+ * ever touch a link to the store or a copy carrying our marker. Backups mirror
+ * CC Switch: `<backupDir>/<YYYYMMDD_HHMMSS>_<name>/skill/` plus `meta.json`;
+ * each skill's newest backup is kept, plus the newest 20 older ones overall.
  */
 import { AgentAppFlags, type AgentApp, type SkillBackup, SkillSource } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -13,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Random from "effect/Random";
 import * as Schema from "effect/Schema";
 
@@ -20,6 +22,7 @@ import { ExtensionFailure } from "../shared/t3.ts";
 import { MANAGED_MARKER, copyTree, failWith, isSymlink } from "./archive.ts";
 import type { SkillsPaths } from "./store.ts";
 
+/** Older revisions kept across all skills, beyond each skill's newest backup. */
 export const MAX_BACKUPS = 20;
 
 export type DeployMode = "symlink" | "copy";
@@ -97,14 +100,57 @@ export const deploymentState = Effect.fn("skillsMcp.skills.deploymentState")(fun
   } satisfies DeploymentState;
 });
 
-const copyDeployment = (paths: SkillsPaths, skill: SkillRef, at: string) =>
+const notManagedHere = (at: string) =>
+  new ExtensionFailure({
+    message: `${at} exists and isn't managed here; adopt or remove it first`,
+  });
+
+/**
+ * Symlink errors meaning the folder can't hold symlinks (Windows without
+ * Developer Mode, FAT/exFAT, some network mounts). Only these fall back to a
+ * copy; `EEXIST` and everything else is reported.
+ */
+const SYMLINKS_UNSUPPORTED = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"]);
+
+const symlinksUnsupported = (error: PlatformError.PlatformError) => {
+  const cause = error.reason.cause;
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    typeof cause.code === "string" &&
+    SYMLINKS_UNSUPPORTED.has(cause.code)
+  );
+};
+
+/**
+ * Publishes a marked copy of the store folder at `<appDir>/<name>`: staged in
+ * a sibling temp folder, then renamed into place only if the destination is
+ * still absent or is our own link or copy. Anything else is left untouched
+ * and reported. (rename(2) can't refuse an empty folder created in the instant
+ * between the check and the rename; replacing one loses nothing.)
+ */
+const copyDeployment = (paths: SkillsPaths, app: AgentApp, skill: SkillRef) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    yield* fs.remove(at, { recursive: true, force: true });
-    yield* copyTree(storeSkillDir(path, paths, skill.name), at);
-    yield* fs.writeFileString(path.join(at, MANAGED_MARKER), `${skill.id}\n`);
-    return "copy" as const;
+    const staging = path.join(
+      paths.appDirs[app],
+      `.${skill.name}.t3code-tmp-${yield* randomSuffix}`,
+    );
+    return yield* Effect.gen(function* () {
+      yield* copyTree(storeSkillDir(path, paths, skill.name), staging);
+      yield* fs.writeFileString(path.join(staging, MANAGED_MARKER), `${skill.id}\n`);
+      const current = yield* deploymentState(paths, app, skill);
+      if (current.kind === "foreign") return yield* notManagedHere(current.path);
+      if (current.kind !== "none") {
+        yield* fs.remove(current.path, { recursive: current.kind === "copy" });
+      }
+      yield* fs.rename(staging, current.path);
+      return "copy" as const;
+    }).pipe(
+      Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
+    );
   });
 
 /** Links (or copies) the store folder into `app`'s skills folder. */
@@ -115,19 +161,23 @@ export const deploy = Effect.fn("skillsMcp.skills.deploy")(
     const state = yield* deploymentState(paths, app, skill);
     switch (state.kind) {
       case "foreign":
-        return yield* new ExtensionFailure({
-          message: `${state.path} exists and isn't managed here; adopt or remove it first`,
-        });
+        return yield* notManagedHere(state.path);
       case "symlink":
         return "symlink" as const;
       case "copy":
-        return yield* copyDeployment(paths, skill, state.path);
+        return yield* copyDeployment(paths, app, skill);
       case "none": {
         yield* fs.makeDirectory(paths.appDirs[app], { recursive: true });
         const store = storeSkillDir(path, paths, skill.name);
         return yield* fs.symlink(store, state.path).pipe(
           Effect.as("symlink" as const),
-          Effect.catch(() => copyDeployment(paths, skill, state.path)),
+          Effect.catch((error) =>
+            symlinksUnsupported(error)
+              ? copyDeployment(paths, app, skill)
+              : Effect.fail(
+                  error.reason._tag === "AlreadyExists" ? notManagedHere(state.path) : error,
+                ),
+          ),
         );
       }
     }
@@ -210,7 +260,24 @@ export const listBackups = Effect.fn("skillsMcp.skills.listBackups")(function* (
   );
 });
 
-/** Copies `sourceDir` into a new backup, then prunes to the newest {@link MAX_BACKUPS}. */
+/**
+ * Backups to prune from `all` (newest first): every skill keeps its newest
+ * backup, and at most {@link MAX_BACKUPS} older revisions survive overall.
+ */
+const staleBackups = (all: ReadonlyArray<StoredBackup>) => {
+  const seen = new Set<string>();
+  let older = 0;
+  return all.filter((entry) => {
+    if (!seen.has(entry.meta.skill.name)) {
+      seen.add(entry.meta.skill.name);
+      return false;
+    }
+    older += 1;
+    return older > MAX_BACKUPS;
+  });
+};
+
+/** Copies `sourceDir` into a new backup, then prunes old revisions. */
 export const createBackup = Effect.fn("skillsMcp.skills.createBackup")(
   function* (paths: SkillsPaths, skill: BackupMeta["skill"], sourceDir: string) {
     const fs = yield* FileSystem.FileSystem;
@@ -224,8 +291,7 @@ export const createBackup = Effect.fn("skillsMcp.skills.createBackup")(
     yield* copyTree(sourceDir, path.join(dir, "skill"));
     const meta = yield* encodeMeta({ skill, createdAt, sourcePath: sourceDir });
     yield* fs.writeFileString(path.join(dir, "meta.json"), `${meta}\n`);
-    const all = yield* listBackups(paths);
-    for (const stale of all.slice(MAX_BACKUPS)) {
+    for (const stale of staleBackups(yield* listBackups(paths))) {
       yield* fs.remove(stale.dir, { recursive: true, force: true });
     }
     return id;

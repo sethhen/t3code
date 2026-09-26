@@ -1,7 +1,7 @@
 /**
- * Network side of the skills module: GitHub repo zips from codeload (tried
- * as the given branch, then `main`, then `master`, cached for ten minutes)
- * and skills.sh search. Uses its own fetch client so callers only need the
+ * Network side of the skills module: GitHub repo zips from codeload (the
+ * given branch, or `main` then `master` when none is given, cached for ten
+ * minutes) and skills.sh search. Uses its own fetch client so callers only need the
  * extension's services.
  */
 import { SkillSearchResult, type SkillRepo } from "@t3tools/contracts";
@@ -38,11 +38,14 @@ export const validGithubName = (raw: string): string | undefined => {
   return GITHUB_NAME.test(name) && name !== "." && name !== ".." ? name : undefined;
 };
 
-/** Branches to try, in order: the given one (unless empty or `HEAD`), then `main`, then `master`. */
+/**
+ * Branches to try: exactly the given one, or `main` then `master` when none is
+ * given (empty or `HEAD`). A given branch that fails is an error, never a
+ * silent switch to another branch.
+ */
 export const branchCandidates = (branch: string | undefined): ReadonlyArray<string> => {
   const given = branch?.trim();
-  const candidates = given && given !== "HEAD" ? [given, "main", "master"] : ["main", "master"];
-  return [...new Set(candidates)];
+  return given && given !== "HEAD" ? [given] : ["main", "master"];
 };
 
 const codeloadUrl = (owner: string, repo: string, branch: string) =>
@@ -120,7 +123,8 @@ export const downloadRepo = Effect.fn("skillsMcp.skills.downloadRepo")(function*
   const candidates = branchCandidates(repo.branch);
   const errors: Array<string> = [];
   for (const branch of candidates) {
-    const key = `${owner}/${name}@${branch}`.toLowerCase();
+    // GitHub owner and repo names are case-insensitive; branch names are not.
+    const key = `${owner.toLowerCase()}/${name.toLowerCase()}@${branch}`;
     const now = yield* Clock.currentTimeMillis;
     const cached = cachedZip(key, now);
     if (cached !== undefined) return { bytes: cached, branch };

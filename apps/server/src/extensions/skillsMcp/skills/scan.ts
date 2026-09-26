@@ -18,7 +18,7 @@ import type * as CodexSchema from "effect-codex-app-server/schema";
 
 import { type AgentCli, withCodexClient } from "../shared/agents.ts";
 import { ExtensionFailure, discoverClaudeSkills } from "../shared/t3.ts";
-import { readSkillInfo } from "./archive.ts";
+import { isSymlink, readSkillInfo } from "./archive.ts";
 import type { DeploymentState } from "./deploy.ts";
 import type { ManagedSkill, SkillsPaths } from "./store.ts";
 
@@ -36,7 +36,7 @@ export interface UnmanagedSkill {
   readonly dir: string;
   readonly enabled: boolean;
   readonly pluginId?: string | undefined;
-  /** Directly inside the app's user skills folder, so `adopt` can take it. */
+  /** A plain folder (not a link) directly inside the app's user skills folder, so `adopt` can take it. */
   readonly inAppDir: boolean;
 }
 
@@ -90,7 +90,7 @@ const scanFolder = (
         scope,
         dir: skillDir,
         enabled: true,
-        inAppDir,
+        inAppDir: inAppDir && !(yield* isSymlink(skillDir)),
       });
     }
     return found;
@@ -115,19 +115,22 @@ export const scanClaude = Effect.fn("skillsMcp.skills.scanClaude")(function* (
   cwd: string,
 ) {
   const path = yield* Path.Path;
+  const appDirs = new Set([paths.appDirs.claude, yield* realPathOr(paths.appDirs.claude)]);
   const discovered = yield* discoverClaudeSkills({ homePath: cli.configDir }, cwd, cli.env);
-  const skills = discovered.map((skill): UnmanagedSkill => {
+  const skills: Array<UnmanagedSkill> = [];
+  for (const skill of discovered) {
     const scope: SkillScope = skill.scope === "project" ? "project" : "user";
-    return {
+    const dir = path.dirname(skill.path);
+    skills.push({
       app: "claude",
       name: skill.name,
       description: skill.description,
       scope,
-      dir: path.dirname(skill.path),
+      dir,
       enabled: skill.enabled,
-      inAppDir: scope === "user",
-    };
-  });
+      inAppDir: scope === "user" && appDirs.has(path.dirname(dir)) && !(yield* isSymlink(dir)),
+    });
+  }
   return [...skills, ...(yield* scanSynced("claude", paths.appDirs.claude))];
 });
 
@@ -299,6 +302,7 @@ const unmanagedEntry = (skill: UnmanagedSkill): SkillAppEntry => ({
   path: skill.dir,
   mode: "native",
   editable: false,
+  adoptable: skill.inAppDir,
 });
 
 const managedEntry = (
@@ -317,8 +321,9 @@ const managedEntry = (
         editable: true,
       };
     case "foreign":
-      return unmanaged !== undefined && unmanaged.scope === "user"
-        ? unmanagedEntry(unmanaged)
+      // The name is already managed, so `adopt` would refuse this folder.
+      return unmanaged !== undefined
+        ? { ...unmanagedEntry(unmanaged), adoptable: false }
         : {
             present: true,
             enabled: true,
@@ -337,8 +342,9 @@ const rowKey = (skill: UnmanagedSkill) =>
 
 /**
  * One row per managed skill (keyed by id) and one per unmanaged name (keyed by
- * name, or by plugin and name). Unmanaged folders sharing a managed skill's
- * name fold into its row.
+ * name, or by plugin and name). Only user-scope folders sharing a managed
+ * skill's name fold into its row; project, synced and system skills of that
+ * name keep a row of their own, so an active project skill stays visible.
  */
 export const buildRows = (
   managed: ReadonlyArray<ManagedState>,
@@ -354,8 +360,11 @@ export const buildRows = (
 
   const rows: Array<SkillRow> = [];
   for (const { skill, states } of managed) {
-    const same = byKey.get(skill.name) ?? [];
-    byKey.delete(skill.name);
+    const named = byKey.get(skill.name) ?? [];
+    const same = named.filter((entry) => entry.scope === "user");
+    const rest = named.filter((entry) => entry.scope !== "user");
+    if (rest.length > 0) byKey.set(skill.name, rest);
+    else byKey.delete(skill.name);
     const description = skill.description ?? same.find((entry) => entry.description)?.description;
     rows.push({
       key: skill.id,

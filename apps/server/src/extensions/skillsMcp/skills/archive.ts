@@ -2,8 +2,8 @@
 /**
  * Skill folders on disk: SKILL.md frontmatter, content hashes, tree copies
  * that keep symlinks, and zip extraction with CC Switch's guards (at most
- * 30k entries and 512 MiB, no absolute or `..` paths, no symlink that points
- * outside the archive).
+ * 30k entries and 512 MiB, no absolute or `..` paths). Symlink entries in a
+ * zip are skipped, never created.
  */
 import * as NodeBuffer from "node:buffer";
 import * as NodeCrypto from "node:crypto";
@@ -21,7 +21,6 @@ import { ExtensionFailure } from "../shared/t3.ts";
 
 export const MAX_ZIP_ENTRIES = 30_000;
 export const MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024;
-const MAX_SYMLINK_TARGET_BYTES = 4096;
 const MAX_SKILL_DEPTH = 10;
 
 /** Marks a copy-mode deployment as ours; holds the managed skill id. */
@@ -190,42 +189,13 @@ export const safeEntryPath = (name: string): string | undefined => {
   return segments.join("/");
 };
 
-/**
- * Whether a symlink at `rel` pointing at `target` stays inside the archive,
- * resolving lexically and refusing to pass through another archive symlink
- * (so `p -> .` plus `q -> p/..` can't climb out).
- */
-export const symlinkStaysInside = (
-  rel: string,
-  target: string,
-  links: ReadonlySet<string>,
-): boolean => {
-  if (target === "" || target.startsWith("/") || target.includes("\\") || target.includes("\0")) {
-    return false;
-  }
-  if (/^[A-Za-z]:/.test(target)) return false;
-  const stack = rel.split("/").slice(0, -1);
-  const segments = target.split("/");
-  for (const [index, segment] of segments.entries()) {
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") {
-      if (stack.length === 0) return false;
-      stack.pop();
-      continue;
-    }
-    stack.push(segment);
-    if (index < segments.length - 1 && links.has(stack.join("/"))) return false;
-  }
-  return true;
-};
-
 const invalidZip = (message: string) =>
   Effect.fail(new ExtensionFailure({ message: `Invalid zip: ${message}` }));
 
 const isSymlinkEntry = (entry: Yauzl.Entry) =>
   ((entry.externalFileAttributes >>> 16) & 0o170000) === 0o120000;
 
-/** Extracts `bytes` into the existing folder `destDir`; symlinks are created last, after validation. */
+/** Extracts `bytes` into the existing folder `destDir`, skipping symlink entries. */
 export const extractZip = Effect.fn("skillsMcp.skills.extractZip")(
   function* (bytes: Uint8Array, destDir: string) {
     const fs = yield* FileSystem.FileSystem;
@@ -247,7 +217,6 @@ export const extractZip = Effect.fn("skillsMcp.skills.extractZip")(
       return yield* invalidZip(`more than ${MAX_ZIP_ENTRIES} entries`);
     }
     const iterator = zip.eachEntry();
-    const links: Array<{ readonly rel: string; readonly target: string }> = [];
     let total = 0;
     while (true) {
       const next = yield* Effect.tryPromise(() => iterator.next());
@@ -256,6 +225,7 @@ export const extractZip = Effect.fn("skillsMcp.skills.extractZip")(
       const rel = safeEntryPath(entry.fileName);
       if (rel === undefined) return yield* invalidZip(`unsafe path "${entry.fileName}"`);
       if (entry.isEncrypted()) return yield* invalidZip(`"${entry.fileName}" is encrypted`);
+      if (isSymlinkEntry(entry)) continue;
       total += entry.uncompressedSize;
       if (total > MAX_UNCOMPRESSED_BYTES) {
         return yield* invalidZip("more than 512 MiB uncompressed");
@@ -265,32 +235,14 @@ export const extractZip = Effect.fn("skillsMcp.skills.extractZip")(
         yield* fs.makeDirectory(dest, { recursive: true });
         continue;
       }
-      if (isSymlinkEntry(entry) && entry.uncompressedSize > MAX_SYMLINK_TARGET_BYTES) {
-        return yield* invalidZip(`symlink "${rel}" is too long`);
-      }
       const content = yield* Effect.tryPromise(async () =>
         NodeStreamConsumers.buffer(await zip.openReadStreamPromise(entry)),
       );
-      if (isSymlinkEntry(entry)) {
-        links.push({ rel, target: content.toString("utf8") });
-        continue;
-      }
       yield* fs.makeDirectory(path.dirname(dest), { recursive: true });
       const unixMode = (entry.externalFileAttributes >>> 16) & 0o777;
       yield* fs.writeFile(dest, content, {
         mode: unixMode === 0 ? 0o644 : (unixMode & 0o755) | 0o600,
       });
-    }
-    const linkPaths = new Set(links.map((link) => link.rel));
-    for (const link of links) {
-      if (!symlinkStaysInside(link.rel, link.target, linkPaths)) {
-        return yield* invalidZip(`symlink "${link.rel}" points outside the archive`);
-      }
-    }
-    for (const link of links) {
-      const dest = path.join(destDir, ...link.rel.split("/"));
-      yield* fs.makeDirectory(path.dirname(dest), { recursive: true });
-      yield* fs.symlink(link.target, dest);
     }
   },
   (effect) =>
