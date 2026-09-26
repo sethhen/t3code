@@ -37,7 +37,9 @@ if [ -z "$SINCE" ]; then
 fi
 
 echo "Secret scan: commits $SINCE..HEAD"
-gitleaks git --config "$CONFIG" --redact --no-banner --log-opts="$SINCE..HEAD" .
+# --diff-merges=remerge: also scan what a merge commit's conflict resolution added (a plain
+# `git log -p` shows no diff for merges), without re-scanning the merged-in upstream code.
+gitleaks git --config "$CONFIG" --redact --no-banner --log-opts="--diff-merges=remerge $SINCE..HEAD" .
 if [ "$WORKTREE" = 1 ]; then
   echo "Secret scan: uncommitted files"
   changed="$(

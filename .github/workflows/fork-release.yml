@@ -196,14 +196,12 @@ jobs:
             publish=true
           fi
 
-          # Once a signed Windows build is installed, the updater refuses any
-          # installer that isn't signed by the same publisher.
-          if [[ "$publish" == true && "$win_signed" != true ]]; then
-            latest_body="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || true)"
-            if grep -q 'windows-signed: true' <<<"$latest_body"; then
-              echo "::error title=Windows signing lapsed::The latest release has a signed Windows build, so installed Windows copies would refuse an unsigned update. Restore the Azure secrets (${win_missing% }) and re-run."
-              exit 1
-            fi
+          # Fail early (before any build) on a release installed copies would
+          # reject or that moves Latest backwards; publish re-checks with the
+          # macOS signer.
+          if [[ "$publish" == true ]]; then
+            gh api -H 'Accept: application/vnd.github.raw' "repos/$GITHUB_REPOSITORY/contents/scripts/fork/release-guard.sh?ref=$GITHUB_SHA" > "$RUNNER_TEMP/release-guard.sh"
+            bash "$RUNNER_TEMP/release-guard.sh" "${{ steps.version.outputs.version }}" "$win_signed"
           fi
 
           if [[ "$mac_signed" != true ]]; then
@@ -274,7 +272,7 @@ jobs:
           git show "$GITHUB_SHA:scripts/fork/gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml"
           echo "Scanning ${BASE_TAG}..${GITHUB_SHA}"
           if ! "$RUNNER_TEMP/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --redact --no-banner -v \
-            --log-opts="${BASE_TAG}..${GITHUB_SHA}" .; then
+            --log-opts="--diff-merges=remerge ${BASE_TAG}..${GITHUB_SHA}" .; then
             echo "::error title=Secret found::A secret was pushed to this public repo. Revoke/rotate it now (it is already public), then remove it from the code. This run will not publish."
             exit 1
           fi
@@ -506,8 +504,6 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          ALLOW_SIGNER_CHANGE: ${{ inputs.allow_mac_signer_change }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/fork-signing.keychain-db"
@@ -561,17 +557,6 @@ jobs:
             fi
           fi
 
-          # Installed Macs only accept updates signed by the certificate they
-          # were signed with (Developer ID: the same Apple team).
-          latest_signer="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null |
-            sed -n 's/.*mac-signer: \([0-9A-F]\{40\}\).*/\1/p' | head -n 1 || true)"
-          if [[ -n "$latest_signer" && "$latest_signer" != "$identity_hash" ]]; then
-            if [[ "$ALLOW_SIGNER_CHANGE" != true ]]; then
-              echo "::error title=macOS certificate changed::The latest release was signed by $latest_signer, this run by $identity_hash. Installed Macs would refuse the update (unless both are Developer ID certificates of the same team). Restore the old certificate, or run Fork release manually with allow_mac_signer_change and have every Mac reinstall from the DMG once."
-              exit 1
-            fi
-            echo "::warning title=macOS certificate changed::Allowed by allow_mac_signer_change; installed Macs must reinstall from the DMG."
-          fi
           echo "signer=$identity_hash" >> "$GITHUB_OUTPUT"
 
           {
@@ -845,6 +830,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       WIN_SIGNED: ${{ needs.plan.outputs.win_signed }}
       MAC_SIGNER: ${{ needs.mac.outputs.signer }}
+      ALLOW_MAC_SIGNER_CHANGE: ${{ inputs.allow_mac_signer_change }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -894,6 +880,11 @@ jobs:
             echo "Deleting the unfinished draft $tag left by an earlier attempt."
             gh release delete "$tag" --yes
           fi
+
+          # Authoritative continuity check, immediately before promotion.
+          [[ -n "$MAC_SIGNER" ]] || { echo "::error::The mac job reported no signer"; exit 1; }
+          gh api -H 'Accept: application/vnd.github.raw' "repos/$GITHUB_REPOSITORY/contents/scripts/fork/release-guard.sh?ref=$GITHUB_SHA" > "$RUNNER_TEMP/release-guard.sh"
+          bash "$RUNNER_TEMP/release-guard.sh" "$VERSION" "$WIN_SIGNED" "$MAC_SIGNER"
 
           shopt -s nullglob
           files=(release-assets/*.dmg release-assets/*.zip release-assets/*.exe release-assets/*.blockmap

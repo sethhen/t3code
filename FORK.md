@@ -118,6 +118,9 @@ merge and push with `fork_git` (see Traps).
   guards: GitHub push protection (known key formats, server-side), `scripts/fork/secret-scan.sh`
   (gitleaks + `scripts/fork/gitleaks.toml`, run by `update.sh` before pushing; run it yourself before
   pushing any branch), and the release workflow's secret scan, which blocks publishing.
+- **Publishing is guarded** by `scripts/fork/release-guard.sh` (plan job and right before promotion):
+  it refuses a version older than Latest (e.g. re-running an old run), a macOS certificate change, an
+  unsigned Windows build after a signed one, and fails closed if the Latest release can't be read.
 - **Never lose or replace the macOS certificate.** Installed Macs only accept updates signed by the
   certificate they were installed with; a new one (including a later move to Developer ID) means
   every Mac reinstalls from the DMG once. The workflow refuses a change unless run manually with
