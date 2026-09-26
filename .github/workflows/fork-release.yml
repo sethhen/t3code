@@ -1,0 +1,661 @@
+name: Fork release
+
+# Builds the fork's desktop app on every push to main and publishes it as the
+# repository's Latest GitHub Release, which is the feed T3's built-in updater
+# (electron-updater, GitHub provider) polls: installed copies read
+# releases/latest, then that release's latest-mac.yml / latest.yml.
+#
+#   plan     version X.Y.Z-wingman.<run_number> (X.Y.Z = newest stable upstream
+#            tag merged into this commit) and signing mode from secrets
+#   bundle   JS bundle (server + web client + Electron main), built once on Linux
+#   mac      macOS arm64 dmg + zip, Developer ID signed + notarized when the
+#            Apple secrets exist
+#   windows  Windows x64 NSIS installer, Azure Trusted Signing when those
+#            secrets exist
+#   publish  draft release with every asset, then flipped to Latest
+#
+# Without the Apple secrets a run is a dry run: unsigned builds, uploaded as
+# workflow artifacts only, never published (an unsigned macOS app cannot
+# install updates, and it would break the feed for signed installs).
+#
+# Upstream's release-desktop.yml is not reused: a signed macOS build there
+# requires T3's provisioning profile (passkey Associated Domains entitlement),
+# which this fork cannot have because the bundle id stays com.t3tools.t3code.
+# Here scripts/build-desktop-artifact.ts runs WITHOUT --signed (so no passkey
+# entitlements or provisioning profile), and electron-builder still signs and
+# notarizes because the identity comes from CSC_NAME/CSC_KEYCHAIN and the
+# notary credentials from APPLE_KEYCHAIN_PROFILE, none of which the unsigned
+# path scrubs. The app gets electron-builder's default hardened-runtime
+# entitlements (allow-jit, allow-unsigned-executable-memory,
+# disable-library-validation) and passkey sign-in is unavailable.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release (only happens when the macOS signing secrets are configured)
+        type: boolean
+        default: true
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM_REPOSITORY: pingdotgg/t3code
+
+jobs:
+  plan:
+    name: Plan version and signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      base_tag: ${{ steps.version.outputs.base_tag }}
+      mac_signed: ${{ steps.signing.outputs.mac_signed }}
+      win_signed: ${{ steps.signing.outputs.win_signed }}
+      publish: ${{ steps.signing.outputs.publish }}
+    steps:
+      # History and tags only; no working tree, so the orphaned gitlinks in the
+      # vendored .repos tree never matter here.
+      - name: Fetch history and tags
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --filter=blob:none --tags origin "$GITHUB_SHA"
+
+      # Base = the highest plain vX.Y.Z tag that is an ancestor of this commit.
+      # Upstream's tags are consulted too, so merging a stable tag without
+      # pushing the tag to the fork still bumps the base.
+      - name: Resolve version
+        id: version
+        env:
+          GIT_NO_LAZY_FETCH: "1"
+        run: |
+          set -euo pipefail
+          declare -A tag_commit=()
+          while IFS= read -r tag; do
+            tag_commit["$tag"]="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" || true)"
+          done < <(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          while read -r sha ref; do
+            name="${ref#refs/tags/}"
+            peeled=false
+            if [[ "$name" == *'^{}' ]]; then
+              name="${name%'^{}'}"
+              peeled=true
+            fi
+            [[ "$name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            if [[ "$peeled" == true || -z "${tag_commit[$name]:-}" ]]; then
+              tag_commit["$name"]="$sha"
+            fi
+          done < <(git ls-remote --tags "${GITHUB_SERVER_URL}/${UPSTREAM_REPOSITORY}.git" 'refs/tags/v*' 2>/dev/null || true)
+
+          base_tag=""
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            sha="${tag_commit[$tag]}"
+            if [[ -n "$sha" ]] && git merge-base --is-ancestor "$sha" "$GITHUB_SHA" 2>/dev/null; then
+              base_tag="$tag"
+              break
+            fi
+          done < <(printf '%s\n' "${!tag_commit[@]}" | sort -rV)
+          if [[ -z "$base_tag" ]]; then
+            echo "::error::No vX.Y.Z tag is an ancestor of ${GITHUB_SHA}. Push the upstream stable tag this fork is based on (git push origin vX.Y.Z)."
+            exit 1
+          fi
+
+          # A semver prerelease on the stable ("latest") channel: every run sorts
+          # above the previous one, and nothing in T3 reads -wingman.N as a
+          # nightly (-nightly.YYYYMMDD.N) or preview (-pr. / -preview.YYYYMMDD.N).
+          version="${base_tag#v}-wingman.${GITHUB_RUN_NUMBER}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-wingman\.[0-9]+$ ]]; then
+            echo "::error::Unexpected version '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "base_tag=$base_tag" >> "$GITHUB_OUTPUT"
+          echo "Version $version (base $base_tag, commit $GITHUB_SHA)"
+
+      - name: Resolve signing mode
+        id: signing
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          missing() {
+            local name
+            for name in "$@"; do
+              [[ -n "${!name:-}" ]] || printf '%s ' "$name"
+            done
+          }
+          mac_missing="$(missing CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER)"
+          win_missing="$(missing AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TRUSTED_SIGNING_ENDPOINT \
+            AZURE_TRUSTED_SIGNING_ACCOUNT_NAME AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME AZURE_TRUSTED_SIGNING_PUBLISHER_NAME)"
+
+          mac_signed=false
+          [[ -z "$mac_missing" ]] && mac_signed=true
+          win_signed=false
+          [[ -z "$win_missing" ]] && win_signed=true
+          requested=false
+          if [[ "$EVENT_NAME" == push || "$PUBLISH_INPUT" == true ]]; then
+            requested=true
+          fi
+          publish=false
+          if [[ "$mac_signed" == true && "$requested" == true ]]; then
+            publish=true
+          fi
+
+          if [[ "$mac_signed" != true ]]; then
+            echo "::warning title=Dry run: macOS signing secrets missing::Add repository secrets ${mac_missing% } to sign, notarize and publish. This run builds unsigned apps as workflow artifacts only and creates no release."
+          fi
+          if [[ "$win_signed" != true ]]; then
+            echo "::warning title=Windows build is unsigned::Add repository secrets ${win_missing% } for Azure Trusted Signing. Unsigned Windows installers are still published (SmartScreen warns on first install)."
+          fi
+          if [[ "$mac_signed" == true && "$requested" != true ]]; then
+            echo "::notice::publish=false: signed build, artifacts only."
+          fi
+
+          {
+            echo "mac_signed=$mac_signed"
+            echo "win_signed=$win_signed"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Fork release plan"
+            echo "- macOS signed + notarized: \`$mac_signed\`"
+            echo "- Windows signed: \`$win_signed\`"
+            echo "- Publish GitHub Release: \`$publish\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bundle:
+    name: Build JS bundle
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      # Same checkout as upstream's release-desktop.yml: actions/checkout's
+      # credential cleanup trips over the orphaned gitlinks in .repos.
+      - name: Checkout
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --quiet --detach FETCH_HEAD
+
+      - name: Load T3 Connect public config
+        run: |
+          set -euo pipefail
+          grep -E '^T3CODE_[A-Z0-9_]+=' scripts/fork/connect.env | tee -a "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      # @t3tools/desktop#build compiles the Linux browser secret helper, which
+      # needs libsecret headers.
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 3
+
+  mac:
+    name: Desktop macOS arm64
+    needs: [plan, bundle]
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      SIGNED: ${{ needs.plan.outputs.mac_signed }}
+    steps:
+      - name: Checkout
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --quiet --detach FETCH_HEAD
+
+      - name: Load T3 Connect public config
+        run: |
+          set -euo pipefail
+          grep -E '^T3CODE_[A-Z0-9_]+=' scripts/fork/connect.env | tee -a "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/aarch64-apple-darwin/release/t3-resource-monitor
+          key: resource-monitor-aarch64-apple-darwin-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-js-bundle
+          path: apps
+
+      # Imports the Developer ID certificate into a throwaway keychain and
+      # stores the App Store Connect API key as a notarytool keychain profile.
+      # electron-builder then signs (CSC_NAME + CSC_KEYCHAIN) and notarizes +
+      # staples (APPLE_KEYCHAIN_PROFILE) even though the build script runs
+      # without --signed, which is what keeps T3's passkey entitlements and
+      # provisioning profile out of the fork's app.
+      - name: Prepare macOS signing and notarization
+        if: env.SIGNED == 'true'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/fork-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          # Developer ID intermediates, in case the runner image lacks them.
+          for ca in DeveloperIDG2CA.cer DeveloperIDCA.cer; do
+            if curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ca" "https://www.apple.com/certificateauthority/$ca"; then
+              security import "$RUNNER_TEMP/$ca" -k "$keychain" >/dev/null 2>&1 || true
+            fi
+          done
+
+          cert_path="$RUNNER_TEMP/fork-signing.p12"
+          printf '%s' "$CSC_LINK" | base64 --decode > "$cert_path"
+          security import "$cert_path" -k "$keychain" -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$cert_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          search_list=()
+          while IFS= read -r entry; do
+            entry="$(sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' <<<"$entry")"
+            [[ -n "$entry" ]] && search_list+=("$entry")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${search_list[@]}"
+
+          identity_line="$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application:' | head -n 1 || true)"
+          if [[ -z "$identity_line" ]]; then
+            echo "::error::CSC_LINK contains no valid 'Developer ID Application' identity."
+            exit 1
+          fi
+          identity_hash="$(awk '{ print $2 }' <<<"$identity_line")"
+          echo "Signing identity: $(sed -n 's/.*"\(.*\)".*/\1/p' <<<"$identity_line")"
+
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s' "$APPLE_API_KEY" > "$key_path"
+          xcrun notarytool store-credentials t3code-fork-notary \
+            --key "$key_path" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+            --keychain "$keychain"
+          rm -f "$key_path"
+
+          {
+            echo "CSC_NAME=$identity_hash"
+            echo "CSC_KEYCHAIN=$keychain"
+            echo "APPLE_KEYCHAIN=$keychain"
+            echo "APPLE_KEYCHAIN_PROFILE=t3code-fork-notary"
+          } >> "$GITHUB_ENV"
+
+      - name: Build desktop artifact
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 \
+            --build-version "$VERSION" --skip-build --verbose
+
+      - name: Verify app
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(release/T3-Code-*-arm64.zip)
+          [[ ${#zips[@]} -eq 1 ]] || { echo "::error::Expected one arm64 zip, found ${#zips[@]}"; exit 1; }
+          grep -qx "version: $VERSION" release/latest-mac.yml || { echo "::error::latest-mac.yml is not for $VERSION"; exit 1; }
+          check_dir="$RUNNER_TEMP/verify-app"
+          rm -rf "$check_dir" && mkdir -p "$check_dir"
+          ditto -x -k "${zips[0]}" "$check_dir"
+          apps=("$check_dir"/*.app)
+          [[ ${#apps[@]} -eq 1 ]] || { echo "::error::Expected one .app in ${zips[0]}"; exit 1; }
+          app="${apps[0]}"
+
+          feed="$app/Contents/Resources/app-update.yml"
+          cat "$feed"
+          if ! grep -qx "owner: ${GITHUB_REPOSITORY%%/*}" "$feed" || ! grep -qx "repo: ${GITHUB_REPOSITORY#*/}" "$feed"; then
+            echo "::error::app-update.yml does not point at ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+
+          if [[ "$SIGNED" != true ]]; then
+            echo "Unsigned dry run: skipping signature and notarization checks."
+            exit 0
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign -dv --verbose=2 "$app" 2>&1)"
+          grep -E '^(Authority|TeamIdentifier|Timestamp|flags)=' <<<"$details" || true
+          grep -q 'Authority=Developer ID Application:' <<<"$details" || { echo "::error::App is not Developer ID signed"; exit 1; }
+          grep -q '(runtime)' <<<"$details" || { echo "::error::Hardened runtime is off"; exit 1; }
+          if codesign -d --entitlements - "$app" 2>/dev/null | grep -q 'associated-domains'; then
+            echo "::error::App carries the Associated Domains entitlement, which needs T3's provisioning profile"
+            exit 1
+          fi
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=4 "$app"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-desktop-mac-arm64
+          path: |
+            release/T3-Code-*.dmg
+            release/T3-Code-*.zip
+            release/*.blockmap
+            release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Desktop Windows x64
+    needs: [plan, bundle]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      SIGNED: ${{ needs.plan.outputs.win_signed }}
+    steps:
+      - name: Checkout
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --quiet --detach FETCH_HEAD
+
+      - name: Load T3 Connect public config
+        run: |
+          set -euo pipefail
+          grep -E '^T3CODE_[A-Z0-9_]+=' scripts/fork/connect.env | tee -a "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve Windows package cache path
+        id: package_cache_path
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache Windows packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.package_cache_path.outputs.path }}
+          key: fork-windows-packages-v1-x64-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe
+          key: resource-monitor-x86_64-pc-windows-msvc-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Download JS bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-js-bundle
+          path: apps
+
+      # The build script's Windows preflight requires the Spectre-mitigated
+      # MSVC libraries (same step as upstream's release-desktop.yml).
+      - name: Install Spectre-mitigated MSVC libs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      - name: Prepare Azure Trusted Signing
+        if: env.SIGNED == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          try {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -ErrorAction Stop
+          } catch {
+            Write-Warning "Could not bootstrap the NuGet package provider; continuing. $($_.Exception.Message)"
+          }
+          Install-Module -Name TrustedSigning -MinimumVersion 0.5.0 -Force -AllowClobber -Repository PSGallery -Scope CurrentUser -ErrorAction Stop
+          Import-Module TrustedSigning -MinimumVersion 0.5.0 -Force
+          Get-Command Invoke-TrustedSigning -ErrorAction Stop
+
+          $moduleRoots = @(
+            [System.IO.Path]::Combine([Environment]::GetFolderPath("MyDocuments"), "PowerShell", "Modules"),
+            [System.IO.Path]::Combine([Environment]::GetFolderPath("MyDocuments"), "WindowsPowerShell", "Modules"),
+            [System.IO.Path]::Combine($env:ProgramFiles, "PowerShell", "Modules"),
+            [System.IO.Path]::Combine($env:ProgramFiles, "WindowsPowerShell", "Modules")
+          )
+          $modulePathEntries = @($moduleRoots + ($env:PSModulePath -split ";")) |
+            Where-Object { $_ -and (Test-Path $_) } |
+            Select-Object -Unique
+          "PSModulePath=$($modulePathEntries -join ';')" >> $env:GITHUB_ENV
+
+      # No --wsl-runtime: embedding the Linux CLI archive would need upstream's
+      # Linux CLI build too. The native Windows backend works without it; the
+      # WSL backend does not.
+      - name: Build desktop artifact
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: ${{ steps.resource_monitor_cache.outputs.cache-hit == 'true' }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
+        run: |
+          set -euo pipefail
+          args=(--platform win --target nsis --arch x64 --build-version "$VERSION" --skip-build --verbose)
+          if [[ "$SIGNED" == true ]]; then
+            echo "Windows signing enabled (Azure Trusted Signing)."
+            args+=(--signed)
+          else
+            echo "Windows signing disabled (Azure Trusted Signing secrets missing)."
+          fi
+          vp run dist:desktop:artifact "${args[@]}"
+
+      - name: Verify installer
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(release/T3-Code-*-x64.exe)
+          [[ ${#installers[@]} -eq 1 ]] || { echo "::error::Expected one x64 installer, found ${#installers[@]}"; exit 1; }
+          cat release/latest.yml
+          grep -qx "version: $VERSION" release/latest.yml || { echo "::error::latest.yml is not for $VERSION"; exit 1; }
+          if [[ "$SIGNED" == true ]]; then
+            pwsh -NoProfile -Command "\$s = Get-AuthenticodeSignature '${installers[0]}'; \$s | Format-List Status, SignerCertificate; if (\$s.Status -ne 'Valid') { exit 1 }"
+          fi
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-desktop-win-x64
+          path: |
+            release/T3-Code-*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [plan, mac, windows]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: fork-desktop-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Check release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd release-assets
+          ls -la
+          require() {
+            local label="$1"
+            shift
+            if [[ $# -ne 1 ]]; then
+              echo "::error::Expected exactly one $label, found $#"
+              exit 1
+            fi
+          }
+          require "macOS dmg" ./*.dmg
+          require "macOS zip" ./*.zip
+          require "Windows installer" ./*.exe
+          blockmaps=(./*.blockmap)
+          [[ ${#blockmaps[@]} -ge 3 ]] || { echo "::error::Expected dmg, zip and exe blockmaps"; exit 1; }
+          for manifest in latest-mac.yml latest.yml; do
+            [[ -f "$manifest" ]] || { echo "::error::$manifest is missing"; exit 1; }
+            grep -qx "version: $VERSION" "$manifest" || { echo "::error::$manifest is not for $VERSION"; exit 1; }
+          done
+
+      # Created as a draft with every asset first, then flipped to Latest, so
+      # the updater never sees a Latest release without its manifests.
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if is_draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$is_draft" != true ]]; then
+              echo "::notice::Release $tag is already published; nothing to do."
+              exit 0
+            fi
+            echo "Deleting the unfinished draft $tag left by an earlier attempt."
+            gh release delete "$tag" --yes
+          fi
+
+          shopt -s nullglob
+          files=(release-assets/*.dmg release-assets/*.zip release-assets/*.exe release-assets/*.blockmap
+            release-assets/latest-mac.yml release-assets/latest.yml)
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "T3 Code $VERSION" --generate-notes "${files[@]}"
+          gh release edit "$tag" --draft=false --prerelease=false --latest
+
+          url="$(gh release view "$tag" --json url --jq .url)"
+          echo "Published $url"
+          echo "### Published [$tag]($url)" >> "$GITHUB_STEP_SUMMARY"

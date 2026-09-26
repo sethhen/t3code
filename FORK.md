@@ -1,17 +1,21 @@
 # Wingman fork of T3 Code
 
-Private fork (`sethhen/t3code`, remote `origin`) of `pingdotgg/t3code` (remote `upstream`).
-Branch `wingman` = one upstream **stable tag** + a short stack of fork commits
-(`git log --oneline <tag>..wingman`). The fork adds right-panel "extensions" (Skills & MCP, ...)
-and is installed over the official desktop app as an unsigned, non-updating build.
+Public fork (`sethhen/t3code`, remote `origin`) of `pingdotgg/t3code` (remote `upstream`).
+Branch `main` = the newest upstream **stable tag** merged in + the fork's commits. The fork adds
+right-panel "extensions" (Skills & MCP, ...). Every push to `main` runs the "Fork release"
+workflow (`.github/workflows/fork-release.yml`): a signed macOS arm64 DMG and a Windows x64
+installer, versioned `X.Y.Z-wingman.<run>` (X.Y.Z = the upstream release `main` is based on),
+published as a GitHub Release that installed fork apps update to.
 
-## The one rule: upstream files are touched by one commit only
+## The one rule: only the extension host commit edits upstream files
 
-Only the `feat(fork): extension host ...` commit edits upstream files (`update.sh` refuses to
-run while another commit does). Every edit in it is marked with a `t3-ext` comment so a rebase
-conflict is easy to recognise. Touch points:
+Against its base tag, `main` may change only fork-owned paths plus the upstream files of the
+`feat(fork): extension host ...` commit: `git diff --name-only <base-tag>..main` minus the
+fork-owned paths must equal that file list. `scripts/fork/update.sh` blocks otherwise. Every edit
+is marked with a `t3-ext` comment so merge conflicts are easy to recognise
+(`git grep -n t3-ext -- apps/server apps/web/src packages/contracts`).
 
-| File                                         | What the fork adds                                                   |
+| Host file                                    | What the fork adds                                                   |
 | -------------------------------------------- | -------------------------------------------------------------------- |
 | `packages/contracts/src/rpc.ts`              | `WS_METHODS.extensionCall` (`extension.call`) + `WsExtensionCallRpc` |
 | `packages/contracts/src/index.ts`            | `export * from "./extensions/index.ts"`                              |
@@ -21,90 +25,87 @@ conflict is easy to recognise. Touch points:
 | `apps/web/src/components/RightPanelTabs.tsx` | extension entries in the add-tab menu, label/icon                    |
 | `apps/web/src/components/ChatView.tsx`       | renders `ExtensionSurface`                                           |
 
-Find them with `git grep -n t3-ext -- apps/server apps/web/src packages/contracts`
-(`apps/mobile` has unrelated `font-t3-extrabold` matches). Everything else lives in fork-only
-directories, so new extensions never touch upstream files:
+Fork-owned paths (new extensions only touch these):
 
 - `packages/contracts/src/extensions/` - schemas (`host.ts` + one file per extension, `index.ts` barrel)
 - `apps/server/src/extensions/` - server handlers (`registry.ts`, `index.ts` registers extensions)
 - `apps/web/src/extensions/` - panels (`registry.ts`, `ExtensionSurface.tsx`)
+- `scripts/fork/`, `FORK.md`, `.github/workflows/fork-release.yml`
 
-If an extension needs an upstream internal, re-export it from a `t3.ts` inside the extension
-rather than editing the upstream file.
+If an extension needs an upstream internal, re-export it from a `t3.ts` inside the extension.
+If upstream moves code a host edit depends on, re-apply it in a new commit whose subject starts
+with `feat(fork): extension host` (the rule accepts the files of every such commit).
 
-## Prerequisites
+## For teammates
 
-- `source scripts/fork/env.sh` before any `pnpm`/`git` write (Node 24 + pnpm 11, defines `fork_git`).
-- Xcode Command Line Tools (`clang`, `make`, `iconutil`) and Rust:
-  `brew install rustup && rustup-init -y && rustup target add aarch64-apple-darwin`
-  (the desktop build compiles `native/resource-monitor` with cargo).
+- **Install:** download from https://github.com/sethhen/t3code/releases/latest - the `.dmg` on
+  an Apple Silicon Mac, the `.exe` on Windows. It replaces official T3 Code and shares its data
+  (threads, settings, connections).
+- **First launch:** macOS may ask for Keychain access ("t3code Safe Storage"): choose
+  **Always Allow**. On Windows, if SmartScreen blocks the installer: **More info -> Run anyway**
+  (once).
+- **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
+  available in fork builds.
+- **Updates:** an update button appears in the sidebar. Click it to download, click it again to
+  restart into the new version.
+- **Going back:** close any Skills & MCP tab first (official T3 Code shows it as a blank tab), then
+  install official T3 Code from https://github.com/pingdotgg/t3code/releases, at least the
+  fork's X.Y.Z.
 
-## Update to a new upstream release
+## For the maintainer
 
-```bash
-scripts/fork/update.sh --check          # read-only: base tag, target tag, blockers
-scripts/fork/update.sh                  # latest stable release, or: update.sh v0.0.43
-```
+`source scripts/fork/env.sh` before any `pnpm`/`git` write (Node 24 + pnpm 11), and commit,
+merge and push with `fork_git` (see Traps).
 
-It fetches upstream tags, rebases `wingman` with `git rebase --onto <new> <old> wingman`,
-runs `pnpm install`, typechecks contracts/server/web, runs the extension tests, builds an
-unsigned arm64 DMG without an update feed (`release/T3-Code-<version>-arm64.dmg`) and pushes
-`wingman` with `--force-with-lease` on the `origin/wingman` commit it checked before the rebase
-(`--no-push` to skip). On a conflict it stops and lists the files: fix them, `git add`,
-`fork_git rebase --continue`, then re-run `update.sh <tag>` (the base is then already the new
-tag, so it continues with install/build). Undo a finished rebase with the
-`git reset --hard <old tip>` it prints.
+- **Ship:** commit to `main` and `fork_git push origin main`, then watch "Fork release" in
+  [Actions](https://github.com/sethhen/t3code/actions). Every push to `main` publishes a release.
+- **Dry run:** run "Fork release" manually (Actions -> Fork release -> Run workflow) with publish
+  off. Pushes also run as dry runs while the signing secrets are missing.
+- **Signing setup:** `scripts/fork/SIGNING.md`.
+- **Update T3 Code:**
 
-## Install and roll back
+  ```bash
+  scripts/fork/update.sh --check          # read-only: base tag, target tag, blockers
+  scripts/fork/update.sh                  # latest upstream stable release, or: update.sh v0.0.43
+  ```
 
-Quit T3 Code, then `scripts/fork/install.sh [path/to/dmg-or-app]` (defaults to the newest DMG
-in `release/`). It refuses while the app runs (it never kills anything) and checks the build is
-`T3 Code (Alpha)` / `com.t3tools.t3code`, arm64, has no `app-update.yml` and is not older than
-the installed version. Backups go to `~/Applications/T3 Code backups/`:
+  It fetches the tag, merges it into `main` (`chore(fork): merge upstream vX.Y.Z`), enforces the
+  one rule, runs `pnpm install`, typechecks contracts/server/web and the extension tests, then
+  pushes `main` + the tag (this ships) and runs `scripts/fork/workflows.sh`. `--no-push` stops
+  before shipping. On a conflict the merge stays in progress: fix the files, `git add` them,
+  `fork_git commit --no-verify -m "chore(fork): merge upstream vX.Y.Z"`, re-run with the same tag
+  (or `git merge --abort`).
 
-- `T3 Code (Alpha) official-<ver>.zip` - the official bundle, kept forever;
-  `T3 Code (Alpha) fork-<ver>-<ts>.zip` - the fork build being replaced, only the latest kept.
-  Bundles are zipped (`ditto -c -k`) on purpose: an unzipped copy is a second
-  `com.t3tools.t3code` that LaunchServices could open for `t3code://` links.
-- `userdata-<ts>-<official|fork>-<ver>/` - `~/.t3/userdata` (every top-level `*.sqlite` via
-  `sqlite3 -readonly ... "VACUUM INTO ..."`, or an `immutable=1` open when the database has no
-  pending log, + `quick_check`; the rest copied without `-wal`/`-shm` and without `logs/`) and
-  the Chromium profile
-  (`~/Library/Application Support/t3code`, caches excluded). Backups taken over an official
-  app are kept forever, otherwise the newest 3.
-
-It then stages the new bundle in `/Applications`, clears quarantine, ad-hoc signs it if the
-unsigned build's signature does not verify, swaps it in as `/Applications/T3 Code (Alpha).app`
-(restoring the old bundle if the swap fails, or printing where it is kept), opens it and prints
-the rollback commands.
-
-Rollback: close any Skills & MCP tab first (the official app shows it as a blank tab, which you
-can close), quit T3 Code, then:
-
-```bash
-rm -rf "/Applications/T3 Code (Alpha).app"   # ditto merges into an existing bundle: remove first
-ditto -x -k "$HOME/Applications/T3 Code backups/T3 Code (Alpha) official-<ver>.zip" /Applications
-```
-
-If the fork ran on a newer tag than that official bundle, its DB migrations may be ahead:
-either install the official DMG of the fork's tag from https://github.com/pingdotgg/t3code/releases
-(keeps your data), or also move `~/.t3/userdata` aside and `ditto` the `userdata/` folder of the
-matching `userdata-*-official-<ver>` backup back (loses changes made since).
+- **Workflows:** `scripts/fork/workflows.sh` disables every workflow except `fork-release.yml`
+  and the reusable `release-desktop.yml`. Run it after any merge of upstream.
+- **Local test build:** `scripts/fork/update.sh --build` also builds
+  `release/T3-Code-X.Y.Z-wingman.0-arm64.dmg` (unsigned, no update feed, T3 Connect config from
+  `scripts/fork/connect.env`; needs Xcode CLT and
+  `brew install rustup && rustup-init -y && rustup target add aarch64-apple-darwin`). Quit
+  T3 Code, then `scripts/fork/install.sh [dmg]`: it refuses while the app runs, checks the bundle
+  and that its X.Y.Z is not older than the installed app's, backs up the app and
+  `~/.t3/userdata` (+ the Chromium profile) to `~/Applications/T3 Code backups/`, ad-hoc signs,
+  swaps it in and prints the rollback commands. Return to the release builds by installing the
+  latest release DMG.
 
 ## Traps
 
-- **Stable tags only, at or above the installed version.** Never rebase onto `main`, a
-  `-nightly` or a `-preview` tag: the fork shares `~/.t3/userdata` with the official app, and
-  newer DB migrations stop the official app from opening it again.
-- **Commit, rebase and push with `fork_git`**, not `git`: the global husky init puts an old Node
-  on PATH and the `vp staged` pre-commit hook fails under it.
-- **GitHub Actions stay disabled on the fork** (upstream workflows would publish releases).
-- Fork builds are unsigned: macOS asks for the "t3code Safe Storage" Keychain item on first
-  launch (Always Allow; it asks again after each rebuild) and privacy permissions must be
-  granted again. Denying the Keychain prompt makes saved connections unreadable.
-- Fork builds contain no `app-update.yml`, so they never auto-update to the official release;
-  reinstalling the official DMG (or the backup zip) is how you leave the fork.
+- **Merge upstream stable tags only** (`update.sh` refuses anything else). Never upstream
+  `main`, `-nightly` or `-preview`: the fork shares `~/.t3/userdata` with official T3 Code, and
+  DB migrations ahead of a stable release stop official builds from opening it, so nobody could
+  go back.
+- **Versions only go up.** Never merge an older tag, and do not install a fork build whose X.Y.Z
+  is older than the T3 Code already installed (its database may be migrated past it). In semver
+  `0.0.42-wingman.3 < 0.0.42 < 0.0.43-wingman.1`; the updater only moves to a higher version and
+  reads GitHub's "latest" release, so never mark fork releases as pre-releases.
+- **New upstream workflows arrive enabled** with a merge, and the push that brings them may already
+  start them: run `scripts/fork/workflows.sh` (update.sh does) and cancel stray runs.
+- **The bundle id `com.t3tools.t3code` belongs to T3's Apple team**, so fork builds are signed by
+  another team and cannot carry the passkey entitlement (hence no desktop passkeys), and macOS asks
+  for the Keychain item again after switching between official and fork builds.
+- **Commit, merge and push with `fork_git`**, not `git`: the global husky init puts an old Node on
+  PATH and the `vp staged` pre-commit hook fails under it.
 - Never keep an unzipped copy of the app outside `/Applications` (e.g. an extracted backup):
   `t3code://` links (sign-in callback) may open that copy instead.
-- The desktop build needs a stable version: a `-nightly` version renames the app to
-  `T3 Code (Nightly)`, which `install.sh` refuses.
+- A `-nightly` version renames the app to `T3 Code (Nightly)`; fork versions must stay
+  `X.Y.Z-wingman.N`.

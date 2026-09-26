@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Source before running any pnpm command in this fork: `source scripts/fork/env.sh`.
 # Upstream requires Node ^24.13.1 and pnpm 11 (root package.json engines/packageManager).
 NODE24_BIN="$(ls -d "$HOME"/.nvm/versions/node/v24.*/bin 2>/dev/null | sort -V | tail -1)"

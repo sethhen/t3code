@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Install a fork build over "/Applications/T3 Code (Alpha).app", with backups for rollback.
-# Run it after quitting T3 Code; it refuses while the app runs and never kills anything.
+# Install a LOCAL fork test build (scripts/fork/update.sh --build) over
+# "/Applications/T3 Code (Alpha).app", with backups for rollback. Release builds are installed
+# from https://github.com/sethhen/t3code/releases instead (FORK.md). Run it after quitting
+# T3 Code; it refuses while the app runs and never kills anything.
 #
-# Usage: scripts/fork/install.sh [path/to/T3-Code-X.Y.Z-arm64.dmg | path/to/T3 Code (Alpha).app]
-#   default: the newest release/T3-Code-*-arm64.dmg built by scripts/fork/update.sh
+# Usage: scripts/fork/install.sh [path/to/T3-Code-X.Y.Z-wingman.0-arm64.dmg | path/to/T3 Code (Alpha).app]
+#   default: the newest release/T3-Code-*-arm64.dmg
 #
 # Backups go to ~/Applications/T3 Code backups/ (zipped so macOS never registers them as apps):
 #   T3 Code (Alpha) official-<ver>.zip   official bundle, kept forever
@@ -35,9 +37,15 @@ run() {
   "$@"
 }
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
-# version_lt A B: A < B (plain X.Y.Z versions).
-version_lt() {
-  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n 1p)" = "$1" ]
+# Versions are X.Y.Z (official) or X.Y.Z-wingman.N (fork; N = 0 for local builds), so in semver
+# 0.0.42-wingman.3 < 0.0.42 < 0.0.43-wingman.1. The database follows upstream's X.Y.Z, so only
+# the core may not go down: a fork build may replace any build of the same X.Y.Z.
+version_core() { printf '%s' "${1%%[-+]*}"; }
+core_lt() {
+  local a b
+  a="$(version_core "$1")"
+  b="$(version_core "$2")"
+  [ "$a" != "$b" ] && [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | sed -n 1p)" = "$a" ]
 }
 plist_get() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
 kib() { du -sk "$1" 2>/dev/null | awk '{ print $1 }'; }
@@ -58,9 +66,16 @@ app_running() {
   fi
   return 1
 }
-# official = signed by a team or carrying an update feed; fork builds have neither.
+# fork = an X.Y.Z-wingman.N version (release or local build), or an older unsigned fork build
+# without a feed; everything else is an official build.
 bundle_kind() {
   local team
+  case "$(plist_get "$1" CFBundleShortVersionString || true)" in
+    *-wingman.*)
+      echo fork
+      return
+      ;;
+  esac
   team="$(codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
   if [ -f "$1/Contents/Resources/app-update.yml" ] || { [ -n "$team" ] && [ "$team" != "not set" ]; }; then
     echo official
@@ -130,7 +145,7 @@ fi
 step "New build"
 if [ -z "$SOURCE" ]; then
   SOURCE="$(ls -t "$REPO_ROOT"/release/T3-Code-*-arm64.dmg 2>/dev/null | sed -n 1p || true)"
-  [ -n "$SOURCE" ] || die "no release/T3-Code-*-arm64.dmg; build one with scripts/fork/update.sh or pass a path"
+  [ -n "$SOURCE" ] || die "no release/T3-Code-*-arm64.dmg; build one with scripts/fork/update.sh --build or pass a path"
 fi
 [ -e "$SOURCE" ] || die "$SOURCE does not exist"
 SOURCE="$(cd "$(dirname "$SOURCE")" && pwd)/$(basename "$SOURCE")"
@@ -154,11 +169,11 @@ NEW_ID="$(plist_get "$NEW_APP" CFBundleIdentifier || true)"
 NEW_VERSION="$(plist_get "$NEW_APP" CFBundleShortVersionString || true)"
 info "bundle: name='$NEW_NAME' executable='$NEW_EXE' id=$NEW_ID version=$NEW_VERSION"
 [ "$NEW_NAME" = "$APP_NAME" ] && [ "$NEW_EXE" = "$APP_NAME" ] ||
-  die "the build's productName is '$NEW_NAME' (executable '$NEW_EXE'), expected '$APP_NAME'; a -nightly version renames the app, build a stable tag"
+  die "the build's productName is '$NEW_NAME' (executable '$NEW_EXE'), expected '$APP_NAME' (a -nightly version renames the app)"
 [ "$NEW_ID" = "$BUNDLE_ID" ] || die "bundle id is $NEW_ID, expected $BUNDLE_ID"
 [ -n "$NEW_VERSION" ] || die "the build has no CFBundleShortVersionString"
 if [ -f "$NEW_APP/Contents/Resources/app-update.yml" ]; then
-  die "the build contains an update feed (app-update.yml): it would auto-update to the official release. Build it with scripts/fork/update.sh (to roll back to an official bundle, follow FORK.md instead)"
+  die "the build has an update feed (app-update.yml), so it is a release build: install it by opening the DMG (FORK.md). This script is for local test builds (scripts/fork/update.sh --build)"
 fi
 if [ "$(uname -m)" = arm64 ]; then
   ARCHS="$(lipo -archs "$NEW_APP/Contents/MacOS/$NEW_EXE" 2>/dev/null || true)"
@@ -172,8 +187,8 @@ if [ -d "$APP" ]; then
   OLD_VERSION="$(plist_get "$APP" CFBundleShortVersionString || true)"
   OLD_KIND="$(bundle_kind "$APP")"
   info "$APP: $OLD_KIND ${OLD_VERSION:-(no version)}"
-  if [ -n "$OLD_VERSION" ] && version_lt "$NEW_VERSION" "$OLD_VERSION"; then
-    die "the build ($NEW_VERSION) is older than the installed app ($OLD_VERSION); its database may already be migrated past $NEW_VERSION"
+  if [ -n "$OLD_VERSION" ] && core_lt "$NEW_VERSION" "$OLD_VERSION"; then
+    die "the build ($NEW_VERSION) is based on an older T3 Code than the installed app ($OLD_VERSION); its database may already be migrated past $(version_core "$NEW_VERSION")"
   fi
 else
   warn "$APP is not installed; nothing to back up"
@@ -311,7 +326,7 @@ PREVIOUS_MOVED=""
 run rm -rf "$STAGE_DIR"
 STAGE_DIR=""
 INSTALLED_VERSION="$(plist_get "$APP" CFBundleShortVersionString || true)"
-info "installed: $APP ($INSTALLED_VERSION, fork build)"
+info "installed: $APP ($INSTALLED_VERSION, local test build)"
 
 step "Opening $APP_NAME"
 run open "$APP"
@@ -322,18 +337,20 @@ if [ -n "$OFFICIAL_BACKUP" ]; then
   OFFICIAL_VERSION="${OFFICIAL_BACKUP##* official-}"
   OFFICIAL_VERSION="${OFFICIAL_VERSION%.zip}"
 fi
+NEW_CORE="$(version_core "$NEW_VERSION")"
 cat <<EOF
 
 ==> Done
-    First launch of this unsigned build: macOS asks for the "t3code Safe Storage" Keychain item
-    (choose Always Allow; it asks again after each rebuild), and privacy permissions (screen
-    recording, files, ...) must be granted again.
+    First launch of this ad-hoc signed build: macOS asks for the "t3code Safe Storage" Keychain
+    item (Always Allow; it asks again after each rebuild), and privacy permissions (screen
+    recording, files, ...) must be granted again. It has no update feed: to get back on the
+    signed release builds, install https://github.com/sethhen/t3code/releases/latest
 
 Roll back to the official app (quit T3 Code first):
     rm -rf "$APP"
     ditto -x -k "$ROLLBACK_ZIP" /Applications
 EOF
-if [ -n "$OFFICIAL_VERSION" ] && [ "$OFFICIAL_VERSION" != "$NEW_VERSION" ]; then
+if [ -n "$OFFICIAL_VERSION" ] && [ "$OFFICIAL_VERSION" != "$NEW_CORE" ]; then
   OFFICIAL_USERDATA="$BACKUP_ROOT/userdata-<timestamp>-official-$OFFICIAL_VERSION"
   for d in "$BACKUP_ROOT"/userdata-*-official-"$OFFICIAL_VERSION"; do
     if [ -d "$d" ]; then
@@ -342,9 +359,9 @@ if [ -n "$OFFICIAL_VERSION" ] && [ "$OFFICIAL_VERSION" != "$NEW_VERSION" ]; then
     fi
   done
   cat <<EOF
-  This fork ($NEW_VERSION) is newer than that official bundle ($OFFICIAL_VERSION) and may have
-  migrated the database past it. Either install the official $NEW_VERSION DMG instead
-  (https://github.com/pingdotgg/t3code/releases/tag/v$NEW_VERSION, keeps your data), or also
+  This build (T3 Code $NEW_CORE) is newer than that official bundle ($OFFICIAL_VERSION) and may
+  have migrated the database past it. Either install the official $NEW_CORE DMG instead
+  (https://github.com/pingdotgg/t3code/releases/tag/v$NEW_CORE, keeps your data), or also
   restore the userdata backup taken before the upgrade (loses changes made since):
     mv "$USERDATA" "$USERDATA.fork-\$(date +%Y%m%d-%H%M%S)"
     ditto "$OFFICIAL_USERDATA/userdata" "$USERDATA"
