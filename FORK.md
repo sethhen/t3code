@@ -127,10 +127,14 @@ account (prompt cache) and gives each subagent its own. Codex gets OpenAI's live
 through a pool account.
 
 The pool key never goes on a command line (argv shows up in `ps`, traces and resource telemetry):
-flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyHelper` prints
-`<stateDir>/pool/client-key` (0600) with `cat` (`type` on Windows). Codex reads the key from an
-env var. Models stay in their own harness: Claude models only through Claude Code, OpenAI models
-only through Codex (pooled instances drop cross-family custom models and gateway model discovery).
+flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyHelper` prints the
+0600 file `<stateDir>/pool/client-key`. The helper command holds no path: it reads the file named by
+`T3_POOL_KEY_FILE` (`cat "$T3_POOL_KEY_FILE"`, PowerShell `-LiteralPath` on Windows), so neither
+`/bin/sh` nor `cmd.exe` can expand anything in it. Codex reads the key from an env var.
+Models stay in their own harness: T3 never offers a cross-family model through the pool (pooled
+instances drop cross-family custom models, gateway model discovery is off, Codex uses OpenAI's
+catalog), and the Pool section flags any hand-configured one (a custom model, or a Claude model
+alias in the instance env or `~/.claude/settings.json`) as a failing "Model families" check.
 
 **After an upstream merge, a Claude Code update or a CLIProxyAPI bump:**
 
