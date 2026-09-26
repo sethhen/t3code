@@ -12,7 +12,7 @@
  * instead.
  */
 import * as NodeCrypto from "node:crypto";
-import * as NodeFsPromises from "node:fs/promises";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import type {
@@ -78,6 +78,9 @@ export const POOL_USAGE_SOURCE_ID = "cliproxy-t3-pool";
 
 export interface PoolDeps {
   readonly paths: PoolPaths;
+  /** The host's `HostProcessPlatform` and `HostProcessArchitecture`. */
+  readonly platform: string;
+  readonly arch: string;
   /** The instance map as the registry sees it (overlays applied). */
   readonly instanceMap: () => Promise<ProviderInstanceConfigMap>;
   /** Re-runs the registry reconcile so overlay changes reach the instances. */
@@ -121,14 +124,14 @@ const messageOf = (error: unknown) => (error instanceof Error ? error.message : 
 export const scanAuthDir = async (authDir: string): Promise<AuthFileEntry[]> => {
   let names: string[];
   try {
-    names = await NodeFsPromises.readdir(authDir);
+    names = await NodeFSP.readdir(authDir);
   } catch {
     return [];
   }
   const entries: AuthFileEntry[] = [];
   for (const name of names.filter((entry) => entry.endsWith(".json"))) {
     try {
-      const raw = JSON.parse(await NodeFsPromises.readFile(NodePath.join(authDir, name), "utf8"));
+      const raw = JSON.parse(await NodeFSP.readFile(NodePath.join(authDir, name), "utf8"));
       const provider = typeof raw?.type === "string" ? raw.type : "";
       if (!poolProviderOf(provider)) continue;
       entries.push({
@@ -185,7 +188,7 @@ export class PoolController {
   async init() {
     this.state = await loadPoolState(this.deps.paths);
     this.accounts = await scanAuthDir(this.deps.paths.authDir);
-    this.codexCatalogPath = await NodeFsPromises.access(this.deps.paths.codexCatalogPath).then(
+    this.codexCatalogPath = await NodeFSP.access(this.deps.paths.codexCatalogPath).then(
       () => this.deps.paths.codexCatalogPath,
       () => undefined,
     );
@@ -223,7 +226,7 @@ export class PoolController {
     const state = this.state;
     const modeFor = (instanceId: string): PoolRouteMode =>
       state.routes[instanceId] ?? defaultRouteMode(instanceId);
-    const keyHelper = { path: this.deps.paths.clientKeyPath, platform: process.platform };
+    const keyHelper = { path: this.deps.paths.clientKeyPath, platform: this.deps.platform };
     if (state.source === "external") {
       const endpoint =
         state.external.url && state.external.key
@@ -275,11 +278,11 @@ export class PoolController {
   private async writeClientKey(key: string | undefined) {
     if (!key) return;
     const path = this.deps.paths.clientKeyPath;
-    await NodeFsPromises.mkdir(this.deps.paths.root, { recursive: true, mode: 0o700 });
+    await NodeFSP.mkdir(this.deps.paths.root, { recursive: true, mode: 0o700 });
     // Temp + rename: a reader never sees a half-written key.
     const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-    await NodeFsPromises.writeFile(temp, key, { mode: 0o600 });
-    await NodeFsPromises.rename(temp, path);
+    await NodeFSP.writeFile(temp, key, { mode: 0o600 });
+    await NodeFSP.rename(temp, path);
   }
 
   /** Serialised: the change sees the latest state, and memory follows only a successful write. */
@@ -325,12 +328,17 @@ export class PoolController {
         this.startPhase = "downloading";
         const install =
           this.deps.installBinary ??
-          ((signal: AbortSignal) => ensureBinary(this.deps.paths.binDir, { signal }));
+          ((signal: AbortSignal) =>
+            ensureBinary(this.deps.paths.binDir, {
+              platform: this.deps.platform,
+              arch: this.deps.arch,
+              signal,
+            }));
         const binaryPath = await install(abort.signal);
         if (!stillWanted()) throw stopped();
         this.startPhase = "starting";
         if (!this.sidecar) {
-          await killStaleProxy(this.deps.paths);
+          await killStaleProxy(this.deps.paths, this.deps.platform);
           if (!stillWanted()) throw stopped();
           this.sidecar = new Sidecar({
             paths: this.deps.paths,
@@ -420,7 +428,7 @@ export class PoolController {
     );
     if (!account) return;
     const path = this.deps.paths.codexCatalogPath;
-    const age = await NodeFsPromises.stat(path).then(
+    const age = await NodeFSP.stat(path).then(
       (stat) => Date.now() - stat.mtimeMs,
       () => Number.POSITIVE_INFINITY,
     );
@@ -429,7 +437,7 @@ export class PoolController {
     if (!version) throw new Error("couldn't read the Codex CLI version");
     const catalog = await fetchCodexCatalog(this.target, account, version);
     // In place, never renamed: running Codex sessions may be reading it.
-    await NodeFsPromises.writeFile(path, `${JSON.stringify(catalog)}\n`);
+    await NodeFSP.writeFile(path, `${JSON.stringify(catalog)}\n`);
     this.codexCatalogPath = path;
     this.codexCatalogError = undefined;
     await this.applyRouting();

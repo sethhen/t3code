@@ -12,4 +12,5 @@ export { makeClaudeEnvironment } from "../../provider/Drivers/ClaudeHome.ts";
 export { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
 export { buildClaudeCapabilitiesProbeQueryOptions } from "../../provider/Layers/ClaudeProvider.ts";
 export { resolveSpawnCommand } from "@t3tools/shared/shell";
+export { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 export { ExtensionFailure, serverExtension } from "../registry.ts";

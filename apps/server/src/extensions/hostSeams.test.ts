@@ -6,7 +6,7 @@
  * pool no longer routing Claude, which would look like it works and cost
  * every thread its tool search.
  */
-import * as NodeFs from "node:fs";
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
 import { DEFAULT_SERVER_SETTINGS, type ProviderInstanceConfigMap } from "@t3tools/contracts";
@@ -16,7 +16,7 @@ import { deriveProviderInstanceConfigMap } from "../provider/Layers/ProviderInst
 import { registerInstanceOverlay } from "./instanceOverlays.ts";
 
 const repo = NodePath.resolve(import.meta.dirname, "../../../..");
-const source = (path: string) => NodeFs.readFileSync(NodePath.join(repo, path), "utf8");
+const source = (path: string) => NodeFS.readFileSync(NodePath.join(repo, path), "utf8");
 
 /** Upstream file → the expression each seam must still contain (all tagged `t3-ext`). */
 const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]> = [

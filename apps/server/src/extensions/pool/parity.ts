@@ -8,7 +8,7 @@
  * Claude Code release drops `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, which
  * would otherwise silently load every MCP tool schema into every thread.
  */
-import * as NodeFsPromises from "node:fs/promises";
+import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
@@ -71,7 +71,7 @@ export const readClaudeSettingsEnv = async (
     "settings.json",
   );
   try {
-    const parsed: unknown = JSON.parse(await NodeFsPromises.readFile(path, "utf8"));
+    const parsed: unknown = JSON.parse(await NodeFSP.readFile(path, "utf8"));
     return isRecord(parsed) && isRecord(parsed.env) ? parsed.env : {};
   } catch {
     return {};
@@ -95,6 +95,8 @@ export const probeToolSearch = async (probe: ToolSearchProbe): Promise<boolean> 
   const timer = setTimeout(() => abort.abort(), 30_000);
   const { mcpServers: _mcpServers, ...base } = probe.baseOptions;
   const session = claudeQuery({
+    // Never yields: the probe only reads the context breakdown, no prompt reaches the API.
+    // oxlint-disable-next-line require-yield
     prompt: (async function* () {
       await new Promise((resolve) => abort.signal.addEventListener("abort", resolve));
     })(),

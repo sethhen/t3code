@@ -5,10 +5,10 @@
  * server behind a shell script), so these run everywhere without the network.
  */
 import * as NodeChildProcess from "node:child_process";
-import * as NodeFs from "node:fs";
+import * as NodeFS from "node:fs";
 import * as NodeHttp from "node:http";
 import * as NodeNet from "node:net";
-import * as NodeOs from "node:os";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
@@ -20,7 +20,7 @@ import { poolPaths, savePoolState, decodePoolState, type PoolPaths } from "./sta
 import { deriveProviderInstanceConfigMap } from "./t3.ts";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const tempDir = () => NodeFs.mkdtempSync(NodePath.join(NodeOs.tmpdir(), "pool-lc-"));
+const tempDir = () => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "pool-lc-"));
 const alive = (pid: number) => {
   try {
     process.kill(pid, 0);
@@ -44,9 +44,9 @@ const isZombie = (pid: number) => {
 /** A stand-in proxy: answers every request with `{}` on the config's port. */
 const writeFakeProxy = (paths: PoolPaths, executable = true) => {
   const dir = NodePath.join(paths.binDir, "test");
-  NodeFs.mkdirSync(dir, { recursive: true });
+  NodeFS.mkdirSync(dir, { recursive: true });
   const script = NodePath.join(dir, "cli-proxy-api");
-  NodeFs.writeFileSync(
+  NodeFS.writeFileSync(
     script,
     [
       "#!/bin/sh",
@@ -68,10 +68,20 @@ const freePort = () =>
     });
   });
 
+/**
+ * The fake proxy is a shell script, so these run on POSIX hosts, where the pool
+ * behaves the same on every platform (it only branches on win32). Every test
+ * fakes the binary install, so the architecture is never read.
+ */
+const PLATFORM = "linux";
+const ARCH = "x64";
+
 const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
   const calls = { reconcile: 0, install: 0 };
   const deps: PoolDeps = {
     paths,
+    platform: PLATFORM,
+    arch: ARCH,
     instanceMap: async () => deriveProviderInstanceConfigMap(DEFAULT_SERVER_SETTINGS),
     reconcile: async () => {
       calls.reconcile++;
@@ -92,8 +102,8 @@ const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
 };
 
 const writeFakeAccount = (paths: PoolPaths, name = "claude-a@example.com.json") => {
-  NodeFs.mkdirSync(paths.authDir, { recursive: true });
-  NodeFs.writeFileSync(
+  NodeFS.mkdirSync(paths.authDir, { recursive: true });
+  NodeFS.writeFileSync(
     NodePath.join(paths.authDir, name),
     JSON.stringify({ type: "claude", email: "a@example.com" }),
   );
@@ -128,13 +138,13 @@ describe("stale proxy cleanup", () => {
 
   it("leaves a foreign process named in the pid file alone", async () => {
     const paths = poolPaths(tempDir());
-    NodeFs.mkdirSync(paths.root, { recursive: true });
+    NodeFS.mkdirSync(paths.root, { recursive: true });
     const foreign = NodeChildProcess.spawn("sleep", ["30"], { stdio: "ignore" });
     try {
-      NodeFs.writeFileSync(paths.pidPath, String(foreign.pid));
-      await killStaleProxy(paths);
+      NodeFS.writeFileSync(paths.pidPath, String(foreign.pid));
+      await killStaleProxy(paths, PLATFORM);
       assert.isTrue(alive(foreign.pid!), "a process outside the pool's bin dir must survive");
-      assert.isFalse(NodeFs.existsSync(paths.pidPath));
+      assert.isFalse(NodeFS.existsSync(paths.pidPath));
     } finally {
       foreign.kill("SIGKILL");
     }
@@ -157,15 +167,15 @@ describe("sidecar", () => {
     try {
       await sidecar.start();
       assert.strictEqual(sidecar.state.phase, "error");
-      NodeFs.chmodSync(binary, 0o755);
+      NodeFS.chmodSync(binary, 0o755);
       // The failure scheduled a retry; start() must not be stuck on the dead child either.
       for (let i = 0; i < 50 && sidecar.state.phase !== "running"; i++) await sleep(200);
       assert.strictEqual(sidecar.state.phase, "running");
-      assert.strictEqual(NodeFs.readFileSync(paths.pidPath, "utf8").length > 0, true);
+      assert.strictEqual(NodeFS.readFileSync(paths.pidPath, "utf8").length > 0, true);
     } finally {
       await sidecar.stop();
     }
-    assert.isFalse(NodeFs.existsSync(paths.pidPath));
+    assert.isFalse(NodeFS.existsSync(paths.pidPath));
   });
 });
 
@@ -177,7 +187,7 @@ describe("sidecar serialisation", () => {
       const paths = poolPaths(tempDir());
       const binary = writeFakeProxy(paths);
       // The log path is a directory: opening it fails inside the attempt.
-      NodeFs.mkdirSync(paths.logPath, { recursive: true });
+      NodeFS.mkdirSync(paths.logPath, { recursive: true });
       const sidecar = new Sidecar({
         paths,
         binaryPath: binary,
@@ -225,7 +235,7 @@ describe("sidecar serialisation", () => {
       await Promise.all([sidecar.start(), sidecar.start(), sidecar.start()]);
       assert.strictEqual(portCalls, 1);
       assert.strictEqual(sidecar.state.phase, "running");
-      const pid = Number(NodeFs.readFileSync(paths.pidPath, "utf8"));
+      const pid = Number(NodeFS.readFileSync(paths.pidPath, "utf8"));
       await sidecar.stop();
       assert.isFalse(alive(pid) && !isZombie(pid));
 
@@ -246,7 +256,7 @@ describe("sidecar serialisation", () => {
       await late.stop();
       await starting;
       await sleep(500);
-      assert.isFalse(NodeFs.existsSync(paths.pidPath));
+      assert.isFalse(NodeFS.existsSync(paths.pidPath));
       assert.notStrictEqual(late.state.phase, "running");
     },
   );
@@ -271,8 +281,8 @@ describe("controller", () => {
     writeFakeAccount(paths);
     const marker = NodePath.join(paths.root, "spawned");
     const binary = NodePath.join(paths.root, "never-run.sh");
-    NodeFs.mkdirSync(paths.root, { recursive: true });
-    NodeFs.writeFileSync(binary, `#!/bin/sh\ntouch "${marker}"\nsleep 30\n`, { mode: 0o755 });
+    NodeFS.mkdirSync(paths.root, { recursive: true });
+    NodeFS.writeFileSync(binary, `#!/bin/sh\ntouch "${marker}"\nsleep 30\n`, { mode: 0o755 });
     let aborted = false;
     let finishDownload: () => void = () => undefined;
     const { deps } = fakeDeps(paths, {
@@ -293,7 +303,7 @@ describe("controller", () => {
     await shutdown;
     await sleep(500);
     assert.isTrue(aborted);
-    assert.isFalse(NodeFs.existsSync(marker));
+    assert.isFalse(NodeFS.existsSync(marker));
   });
 
   it("rejects account ids the pool never listed", async () => {
@@ -335,12 +345,12 @@ describe("controller", () => {
     await pool.init();
     const ids = Array.from({ length: 12 }, (_, i) => `claudeAgent_extra${i}`);
     await Promise.all(ids.map((id) => pool.setRoute(id, "pool")));
-    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+    const saved = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
       routes: Record<string, string>;
     };
     assert.deepStrictEqual(Object.keys(saved.routes).toSorted(), ids.toSorted());
     assert.deepStrictEqual(
-      NodeFs.readdirSync(paths.root).filter((name) => name.endsWith(".tmp")),
+      NodeFS.readdirSync(paths.root).filter((name) => name.endsWith(".tmp")),
       [],
     );
     await pool.shutdown();
@@ -362,7 +372,7 @@ describe("controller", () => {
         if (status.runtime.state === "running") break;
         await sleep(200);
       }
-      const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as { port: number };
+      const saved = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as { port: number };
       assert.notStrictEqual(saved.port, taken);
       assert.notStrictEqual(saved.port, 8317);
       assert.isAbove(calls.reconcile, 0, "routing must follow the new port");
@@ -388,11 +398,11 @@ describe("controller", () => {
         pool.setSource({ source: "external", externalUrl: url, externalKey: `key-${i}` }),
       ),
     );
-    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+    const saved = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
       external: { key: string };
     };
-    assert.strictEqual(NodeFs.readFileSync(paths.clientKeyPath, "utf8"), saved.external.key);
-    assert.strictEqual((NodeFs.statSync(paths.clientKeyPath).mode & 0o777).toString(8), "600");
+    assert.strictEqual(NodeFS.readFileSync(paths.clientKeyPath, "utf8"), saved.external.key);
+    assert.strictEqual((NodeFS.statSync(paths.clientKeyPath).mode & 0o777).toString(8), "600");
     await pool.shutdown();
   });
 
@@ -440,7 +450,7 @@ describe("controller", () => {
       pool.setSource({ source: "external", externalUrl: "http://new.example.com" }),
       pool.setSource({ source: "external", externalKey: "new" }),
     ]);
-    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+    const saved = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
       external: { url: string; key: string };
     };
     assert.deepStrictEqual(saved.external, { url: "http://new.example.com", key: "new" });
@@ -450,7 +460,7 @@ describe("controller", () => {
   it("flags cross-family models on pooled instances, from T3 and from settings.json", async () => {
     const paths = poolPaths(tempDir());
     const claudeHome = tempDir();
-    NodeFs.writeFileSync(
+    NodeFS.writeFileSync(
       NodePath.join(claudeHome, "settings.json"),
       JSON.stringify({
         env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "gpt-6-astra", ANTHROPIC_MODEL: "claude-opus-5-5" },

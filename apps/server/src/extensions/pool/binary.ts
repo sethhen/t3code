@@ -12,11 +12,11 @@
  * then re-run the pool's parity checks against a real account (FORK.md).
  */
 import * as NodeCrypto from "node:crypto";
-import * as NodeFs from "node:fs";
-import * as NodeFsPromises from "node:fs/promises";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
+import * as NodeStream from "node:stream";
+import * as NodeStreamPromises from "node:stream/promises";
 
 import { runProcess } from "./process.ts";
 
@@ -29,7 +29,7 @@ interface ReleaseAsset {
   readonly sha256: string;
 }
 
-/** Keyed by `${process.platform}-${process.arch}`. */
+/** Keyed by `<platform>-<arch>` (Node's names). */
 export const RELEASE_ASSETS: Readonly<Record<string, ReleaseAsset>> = {
   "darwin-arm64": {
     file: `CLIProxyAPI_${CLIPROXY_VERSION}_darwin_aarch64.tar.gz`,
@@ -64,14 +64,14 @@ export const binaryName = (platform: string) =>
   platform === "win32" ? "cli-proxy-api.exe" : "cli-proxy-api";
 
 const exists = (path: string) =>
-  NodeFsPromises.access(path).then(
+  NodeFSP.access(path).then(
     () => true,
     () => false,
   );
 
 const sha256Of = async (path: string) => {
   const hash = NodeCrypto.createHash("sha256");
-  await pipeline(NodeFs.createReadStream(path), hash);
+  await NodeStreamPromises.pipeline(NodeFS.createReadStream(path), hash);
   return hash.digest("hex");
 };
 
@@ -83,16 +83,16 @@ const sha256Of = async (path: string) => {
 export const ensureBinary = async (
   binDir: string,
   options: {
-    readonly platform?: string;
-    readonly arch?: string;
+    /** The host's `HostProcessPlatform` / `HostProcessArchitecture`. */
+    readonly platform: string;
+    readonly arch: string;
     readonly fetch?: typeof fetch;
     /** Cancels the download (the pool stopped, T3 is quitting). */
     readonly signal?: AbortSignal;
     readonly timeoutMs?: number;
-  } = {},
+  },
 ): Promise<string> => {
-  const platform = options.platform ?? process.platform;
-  const arch = options.arch ?? process.arch;
+  const { platform, arch } = options;
   const asset = releaseAssetFor(platform, arch);
   if (!asset) {
     throw new Error(`The pool doesn't support ${platform} on ${arch} yet.`);
@@ -101,8 +101,8 @@ export const ensureBinary = async (
   const binaryPath = NodePath.join(versionDir, binaryName(platform));
   if (await exists(binaryPath)) return binaryPath;
 
-  await NodeFsPromises.mkdir(binDir, { recursive: true });
-  const staging = await NodeFsPromises.mkdtemp(NodePath.join(binDir, ".download-"));
+  await NodeFSP.mkdir(binDir, { recursive: true });
+  const staging = await NodeFSP.mkdtemp(NodePath.join(binDir, ".download-"));
   try {
     const archive = NodePath.join(staging, asset.file);
     const signal = AbortSignal.any([
@@ -116,9 +116,11 @@ export const ensureBinary = async (
     if (!response.ok || !response.body) {
       throw new Error(`Downloading CLIProxyAPI failed (HTTP ${response.status}).`);
     }
-    await pipeline(
-      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
-      NodeFs.createWriteStream(archive),
+    await NodeStreamPromises.pipeline(
+      NodeStream.Readable.fromWeb(
+        response.body as Parameters<typeof NodeStream.Readable.fromWeb>[0],
+      ),
+      NodeFS.createWriteStream(archive),
       { signal },
     );
     const digest = await sha256Of(archive);
@@ -129,24 +131,24 @@ export const ensureBinary = async (
     }
     // bsdtar (macOS, Windows 10+) reads .zip too; GNU tar on Linux gets .tar.gz only.
     const extracted = NodePath.join(staging, "out");
-    await NodeFsPromises.mkdir(extracted);
+    await NodeFSP.mkdir(extracted);
     await runProcess("tar", ["-xf", archive, "-C", extracted], { timeoutMs: 120_000 });
     const extractedBinary = NodePath.join(extracted, binaryName(platform));
     if (!(await exists(extractedBinary))) {
       throw new Error("The CLIProxyAPI archive did not contain the proxy binary.");
     }
-    if (platform !== "win32") await NodeFsPromises.chmod(extractedBinary, 0o755);
-    await NodeFsPromises.rm(versionDir, { recursive: true, force: true });
-    await NodeFsPromises.mkdir(versionDir, { recursive: true });
-    await NodeFsPromises.rename(extractedBinary, binaryPath);
+    if (platform !== "win32") await NodeFSP.chmod(extractedBinary, 0o755);
+    await NodeFSP.rm(versionDir, { recursive: true, force: true });
+    await NodeFSP.mkdir(versionDir, { recursive: true });
+    await NodeFSP.rename(extractedBinary, binaryPath);
   } finally {
-    await NodeFsPromises.rm(staging, { recursive: true, force: true });
+    await NodeFSP.rm(staging, { recursive: true, force: true });
   }
 
   // Best effort: Windows can't delete an exe a leftover proxy still runs; the next start retries.
-  for (const entry of await NodeFsPromises.readdir(binDir)) {
+  for (const entry of await NodeFSP.readdir(binDir)) {
     if (entry !== CLIPROXY_VERSION && !entry.startsWith(".")) {
-      await NodeFsPromises.rm(NodePath.join(binDir, entry), { recursive: true, force: true }).catch(
+      await NodeFSP.rm(NodePath.join(binDir, entry), { recursive: true, force: true }).catch(
         () => undefined,
       );
     }

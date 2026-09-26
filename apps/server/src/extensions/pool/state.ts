@@ -5,7 +5,7 @@
  * directory, never in the app bundle, so app updates keep sign-ins.
  */
 import * as NodeCrypto from "node:crypto";
-import * as NodeFsPromises from "node:fs/promises";
+import * as NodeFSP from "node:fs/promises";
 import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 
@@ -107,7 +107,7 @@ export const decodePoolState = (raw: unknown, fallbackPort: number): PoolState =
 export const loadPoolState = async (paths: PoolPaths): Promise<PoolState> => {
   let raw: unknown;
   try {
-    raw = JSON.parse(await NodeFsPromises.readFile(paths.statePath, "utf8"));
+    raw = JSON.parse(await NodeFSP.readFile(paths.statePath, "utf8"));
   } catch {
     raw = undefined;
   }
@@ -122,9 +122,9 @@ export const loadPoolState = async (paths: PoolPaths): Promise<PoolState> => {
 };
 
 export const savePoolState = async (paths: PoolPaths, state: PoolState) => {
-  await NodeFsPromises.mkdir(paths.root, { recursive: true, mode: 0o700 });
+  await NodeFSP.mkdir(paths.root, { recursive: true, mode: 0o700 });
   // Unique per write: concurrent saves must never share (and delete) one temp file.
   const temp = `${paths.statePath}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-  await NodeFsPromises.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  await NodeFsPromises.rename(temp, paths.statePath);
+  await NodeFSP.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await NodeFSP.rename(temp, paths.statePath);
 };

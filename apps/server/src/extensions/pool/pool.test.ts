@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - builds a fake release archive on disk for the download path.
 import * as NodeCrypto from "node:crypto";
-import * as NodeFs from "node:fs";
-import * as NodeOs from "node:os";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 
@@ -134,14 +134,14 @@ describe("binary", () => {
   });
 
   it("refuses an archive whose digest doesn't match, installing nothing", async () => {
-    const dir = NodeFs.mkdtempSync(NodePath.join(NodeOs.tmpdir(), "pool-bin-"));
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "pool-bin-"));
     try {
       const staging = NodePath.join(dir, "src");
-      NodeFs.mkdirSync(staging);
-      NodeFs.writeFileSync(NodePath.join(staging, "cli-proxy-api"), "#!/bin/sh\necho fake\n");
+      NodeFS.mkdirSync(staging);
+      NodeFS.writeFileSync(NodePath.join(staging, "cli-proxy-api"), "#!/bin/sh\necho fake\n");
       const archive = NodePath.join(dir, "fake.tar.gz");
       NodeChildProcess.execFileSync("tar", ["-czf", archive, "-C", staging, "cli-proxy-api"]);
-      const bytes = NodeFs.readFileSync(archive);
+      const bytes = NodeFS.readFileSync(archive);
       assert.notStrictEqual(
         NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
         RELEASE_ASSETS["darwin-arm64"]!.sha256,
@@ -155,9 +155,9 @@ describe("binary", () => {
         },
       );
       assert.match(String(failure), /checksum/);
-      assert.deepStrictEqual(NodeFs.readdirSync(binDir), []);
+      assert.deepStrictEqual(NodeFS.readdirSync(binDir), []);
     } finally {
-      NodeFs.rmSync(dir, { recursive: true, force: true });
+      NodeFS.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -26,6 +26,8 @@ import {
   buildClaudeCapabilitiesProbeQueryOptions,
   deriveProviderInstanceConfigMap,
   expandHomePath,
+  HostProcessArchitecture,
+  HostProcessPlatform,
   mergeProviderInstanceEnvironment,
   resolveClaudeSdkExecutablePath,
   resolveSpawnCommand,
@@ -50,12 +52,16 @@ export const PoolLive = Layer.effectDiscard(
     // Optional so the pool degrades instead of failing a layer build if an upstream
     // refactor moves it.
     const usageSources = yield* Effect.serviceOption(UsageLimitSources);
+    const platform = yield* HostProcessPlatform;
+    const arch = yield* HostProcessArchitecture;
 
     const getSettings = () => Effect.runPromise(settings.getSettings);
     const instanceMap = async () => deriveProviderInstanceConfigMap(await getSettings());
 
     const deps: PoolDeps = {
       paths: poolPaths(config.stateDir),
+      platform,
+      arch,
       instanceMap,
       // An empty patch still writes and emits, so the settings watcher (the registry's only
       // reconciler, serial by design) re-derives the instance map with the pool's overlay.

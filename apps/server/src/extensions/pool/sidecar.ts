@@ -8,9 +8,8 @@
  * callback ports).
  */
 import * as NodeChildProcess from "node:child_process";
-import * as NodeFs from "node:fs";
-import * as NodeFsPromises from "node:fs/promises";
-import * as NodePath from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 
 import { renderProxyConfig } from "./config.ts";
 import { runProcess } from "./process.ts";
@@ -46,8 +45,8 @@ const messageOf = (error: unknown) => (error instanceof Error ? error.message : 
 /** Deletes the pid file only while it still names `pid` (a newer proxy may have replaced it). */
 export const removePidFileIf = async (pidPath: string, pid: number | undefined) => {
   if (pid === undefined) return;
-  const current = await NodeFsPromises.readFile(pidPath, "utf8").catch(() => "");
-  if (Number.parseInt(current, 10) === pid) await NodeFsPromises.rm(pidPath, { force: true });
+  const current = await NodeFSP.readFile(pidPath, "utf8").catch(() => "");
+  if (Number.parseInt(current, 10) === pid) await NodeFSP.rm(pidPath, { force: true });
 };
 
 export interface ProcessInfo {
@@ -55,9 +54,9 @@ export interface ProcessInfo {
   readonly commandLine: string;
 }
 
-const processInfo = async (pid: number): Promise<ProcessInfo | undefined> => {
+const processInfo = async (pid: number, platform: string): Promise<ProcessInfo | undefined> => {
   try {
-    if (process.platform === "win32") {
+    if (platform === "win32") {
       const { stdout } = await runProcess(
         "powershell.exe",
         [
@@ -94,7 +93,7 @@ const processInfo = async (pid: number): Promise<ProcessInfo | undefined> => {
 export const isOwnProxy = (
   info: ProcessInfo,
   paths: Pick<PoolPaths, "binDir" | "configPath">,
-  platform: string = process.platform,
+  platform: string,
 ) => {
   const normalize = (value: string) => (platform === "win32" ? value.toLowerCase() : value);
   const separator = platform === "win32" ? "\\" : "/";
@@ -108,16 +107,17 @@ export const isOwnProxy = (
 /** Kills a proxy a previous run left behind, only if the pid file still names this pool's proxy. */
 export const killStaleProxy = async (
   paths: Pick<PoolPaths, "pidPath" | "binDir" | "configPath">,
+  platform: string,
 ) => {
-  const raw = await NodeFsPromises.readFile(paths.pidPath, "utf8").catch(() => undefined);
+  const raw = await NodeFSP.readFile(paths.pidPath, "utf8").catch(() => undefined);
   if (raw === undefined) return;
   const pid = Number.parseInt(raw, 10);
   if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
-    await NodeFsPromises.rm(paths.pidPath, { force: true });
+    await NodeFSP.rm(paths.pidPath, { force: true });
     return;
   }
-  const info = await processInfo(pid);
-  if (info && isOwnProxy(info, paths)) {
+  const info = await processInfo(pid, platform);
+  if (info && isOwnProxy(info, paths, platform)) {
     try {
       process.kill(pid);
     } catch {
@@ -181,9 +181,9 @@ export class Sidecar {
     const { paths } = this.options;
     const port = await this.options.ensurePort();
     if (this.stopping) return;
-    await NodeFsPromises.mkdir(paths.authDir, { recursive: true, mode: 0o700 });
+    await NodeFSP.mkdir(paths.authDir, { recursive: true, mode: 0o700 });
     // In place: the proxy watches this file, and a rename reads as a delete.
-    await NodeFsPromises.writeFile(
+    await NodeFSP.writeFile(
       paths.configPath,
       renderProxyConfig({ ...this.options, port, authDir: paths.authDir }),
       { mode: 0o600 },
@@ -191,7 +191,7 @@ export class Sidecar {
     if (this.stopping || this.child) return;
     this.currentPort = port;
 
-    const log = NodeFs.openSync(paths.logPath, "w");
+    const log = NodeFS.openSync(paths.logPath, "w");
     let child: NodeChildProcess.ChildProcess;
     try {
       child = NodeChildProcess.spawn(this.options.binaryPath, ["-config", paths.configPath], {
@@ -200,7 +200,7 @@ export class Sidecar {
         windowsHide: true,
       });
     } finally {
-      NodeFs.closeSync(log);
+      NodeFS.closeSync(log);
     }
     this.child = child;
 
@@ -226,7 +226,7 @@ export class Sidecar {
 
     // Only for crash cleanup: a failed write must not take down a healthy proxy.
     if (child.pid) {
-      await NodeFsPromises.writeFile(paths.pidPath, String(child.pid)).catch(() => undefined);
+      await NodeFSP.writeFile(paths.pidPath, String(child.pid)).catch(() => undefined);
     }
 
     const deadline = Date.now() + HEALTH_TIMEOUT_MS;
