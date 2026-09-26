@@ -15,6 +15,8 @@ import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { type AgentCli, resolveAgentClis } from "../shared/agents.ts";
+import { deniedServerNames, readClaudeUserSettings } from "../shared/claudeUserSettings.ts";
+import { claudeSetProjectEnabled } from "./claude.ts";
 import { listMcp, mutateMcp } from "./index.ts";
 import { probeClaude, probeCodex } from "./probes.ts";
 import { mcpStore } from "./store.ts";
@@ -366,21 +368,23 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
             assert.isUndefined((yield* storedNamed("seeded"))?.raw);
             connected(yield* rowNamed(project, "seeded"), "claude");
 
-            // Restore: enabling re-creates an entry deleted outside T3 in either app.
+            // Restore: enabling re-creates an entry deleted outside T3 in one app
+            // (deleted from every app it is on in, the store drops it instead).
+            const drifted = (app: "claude" | "codex") =>
+              Effect.map(listMcp({ cwd: project, refresh: true }), (overview) => {
+                const row = overview.servers.find((server) => server.name === "seeded");
+                assert.include(row?.apps[app], { enabled: true, present: false });
+              });
             yield* editClaudeServer(sandbox.claudeJson, "seeded", undefined);
-            yield* fs.writeFileString(sandbox.codexToml, "");
-            const drifted = (yield* listMcp({ cwd: project, refresh: true })).servers.find(
-              (row) => row.name === "seeded",
-            );
-            assert.include(drifted?.apps.claude, { enabled: true, present: false });
-            assert.include(drifted?.apps.codex, { enabled: true, present: false });
-            for (const app of ["claude", "codex"] as const) {
-              yield* expectOk({ action: "setEnabled", id: seededId, app, enabled: true });
-            }
+            yield* drifted("claude");
+            yield* expectOk({ action: "setEnabled", id: seededId, app: "claude", enabled: true });
             assert.deepInclude((yield* readClaudeServers(sandbox.claudeJson)).mcpServers?.seeded, {
               command: "node",
               args: [sandbox.echoServer],
             });
+            yield* fs.writeFileString(sandbox.codexToml, "");
+            yield* drifted("codex");
+            yield* expectOk({ action: "setEnabled", id: seededId, app: "codex", enabled: true });
             const restoredToml = yield* readText(sandbox.codexToml);
             assert.isTrue(codexHas(restoredToml, "seeded"));
             assert.include(restoredToml, "startup_timeout_sec = 20");
@@ -498,27 +502,31 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
               assert.strictEqual(missing.failures[0]?.app, app);
             }
 
-            // Claude's per-project toggle.
-            yield* expectOk({
-              action: "setProjectEnabled",
-              name: "echo3",
-              cwd: project,
-              enabled: false,
-            });
+            // Claude's switch for servers the store does not hold: off denies the
+            // name in settings.json; on lifts that and Claude's per-project toggle.
+            yield* claudeSetProjectEnabled(sandbox.claude, project, "echo3", false);
             // Outside a git checkout Claude keys the project by its resolved path
             // (/private/var on macOS).
             const projects = (yield* readClaudeServers(sandbox.claudeJson)).projects ?? {};
             const projectKey = yield* (yield* FileSystem.FileSystem).realPath(project);
             assert.include(projects[projectKey]?.disabledMcpServers ?? [], "echo3");
+            yield* expectOk({ action: "setClaudeEnabled", name: "echo3", enabled: false });
+            assert.isTrue(
+              deniedServerNames(yield* readClaudeUserSettings(sandbox.claude)).has("echo3"),
+            );
             assert.include((yield* rowNamed(project, "echo3"))?.apps.claude, {
+              enabled: false,
               status: "disabled",
             });
             yield* expectOk({
-              action: "setProjectEnabled",
+              action: "setClaudeEnabled",
               name: "echo3",
-              cwd: project,
               enabled: true,
+              cwd: project,
             });
+            assert.isFalse(
+              deniedServerNames(yield* readClaudeUserSettings(sandbox.claude)).has("echo3"),
+            );
             connected(yield* rowNamed(project, "echo3"), "claude");
 
             // The raw probes other modules build on.
@@ -549,20 +557,24 @@ describe.skipIf(!LIVE)("mcp (live CLIs, sandboxed)", () => {
             assert.isFalse(codexHas(yield* readText(sandbox.codexToml), "echo3"));
             assert.isUndefined(yield* rowNamed(project, "echo3"));
 
-            // A server added outside T3 is adopted by an explicit import.
+            // A server added outside T3 is adopted by the next list, and dropped
+            // once it is removed outside T3 again.
             const toml = yield* fs.readFileString(sandbox.codexToml);
             yield* fs.writeFileString(
               sandbox.codexToml,
               `${toml}\n${codexTable("late", sandbox.echoServer)}`,
             );
-            assert.strictEqual(
-              (yield* expectOk({ action: "import" })).message,
-              "Imported 1 server",
+            // A refreshed list: the cached Codex probe predates the edit.
+            const lateRow = Effect.map(listMcp({ cwd: project, refresh: true }), (overview) =>
+              overview.servers.find((row) => row.name === "late"),
             );
-            const late = yield* rowNamed(project, "late");
+            const late = yield* lateRow;
             assert.isTrue(late?.managed);
             assert.include(late?.apps.claude, { present: false, enabled: false });
             connected(late, "codex");
+            yield* fs.writeFileString(sandbox.codexToml, toml);
+            assert.isUndefined(yield* lateRow);
+            assert.isFalse((yield* mcpStore.read).servers.some((server) => server.name === "late"));
 
             // Let the last list's background context probe finish before the sandbox goes.
             yield* probeClaude(sandbox.claude, project);

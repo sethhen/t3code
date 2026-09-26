@@ -1,8 +1,8 @@
 /**
  * Codex's context cost, estimated locally: Codex has no `/context` report, so
+ * its system prompt (from the model catalog), the AGENTS.md files it loads,
  * MCP tool definitions (from the MCP module's live probe) and the skills list
- * are sized at about four characters per token. Codex's own system prompt and
- * built-in tools are not included.
+ * are sized at about four characters per token. Built-in tools are not counted.
  */
 import type { AppContext, ContextCategory, McpContextCost } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -10,6 +10,8 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 
 import { readJsonFile } from "../mcp/claude.ts";
@@ -87,9 +89,16 @@ export const codexSkillCosts = (response: unknown): CodexSkillCost[] => {
 };
 
 // ---------------------------------------------------------------------------
-// Model and window
+// Model, window and system prompt
 
 const DEFAULT_EFFECTIVE_PERCENT = 95;
+
+/**
+ * The usable window when no catalog names the model (pool setups often leave
+ * `model` unset): every model in Codex's catalog has a 272k window, 95% usable.
+ * `max_context_window` is only the ceiling `model_context_window` may raise it to.
+ */
+const CODEX_DEFAULT_WINDOW = 258_400;
 
 /** The configured model and its context-window override from a `config/read` response. */
 export const codexModelConfig = (response: unknown) => {
@@ -105,36 +114,60 @@ export const codexModelConfig = (response: unknown) => {
   };
 };
 
+/** What a model catalog says about one model. */
+export interface CodexModelFacts {
+  readonly model: string;
+  /** Usable window: Codex keeps a share of the raw window in reserve, 95% unless the catalog says otherwise. */
+  readonly windowTokens?: number;
+  /** The system prompt each thread starts with. */
+  readonly instructionsTokens?: number;
+}
+
+const priorityOf = (entry: Record<string, unknown>) =>
+  typeof entry.priority === "number" ? entry.priority : Number.POSITIVE_INFINITY;
+
 /**
- * The usable window for `model` from a model catalog (`{ models: [...] }`):
- * Codex keeps a share of the raw window in reserve, 95% unless the catalog
- * says otherwise.
+ * `model` from a model catalog (`{ models: [...] }`), or without a model the
+ * catalog's default: its first-priority listed model.
  */
-export const codexWindowFrom = (
+export const codexModelFrom = (
   catalog: unknown,
-  model: string,
+  model: string | undefined,
   contextWindowOverride?: number,
-): number | undefined => {
-  const models = isRecord(catalog) && Array.isArray(catalog.models) ? catalog.models : [];
-  const entry = models.find((candidate) => isRecord(candidate) && candidate.slug === model);
-  if (!isRecord(entry)) return undefined;
+): CodexModelFacts | undefined => {
+  const models = (isRecord(catalog) && Array.isArray(catalog.models) ? catalog.models : []).filter(
+    isRecord,
+  );
+  const entry =
+    model !== undefined
+      ? models.find((candidate) => candidate.slug === model)
+      : models
+          .filter((candidate) => candidate.visibility === "list")
+          .toSorted((a, b) => priorityOf(a) - priorityOf(b))[0];
+  if (!entry || typeof entry.slug !== "string") return undefined;
   const raw =
     contextWindowOverride ??
     (typeof entry.context_window === "number" ? entry.context_window : undefined);
-  if (raw === undefined || raw <= 0) return undefined;
   const percent =
     typeof entry.effective_context_window_percent === "number"
       ? entry.effective_context_window_percent
       : DEFAULT_EFFECTIVE_PERCENT;
-  return Math.floor((raw * percent) / 100);
+  const messages = isRecord(entry.model_messages) ? entry.model_messages : {};
+  const instructions = [messages.instructions_template, entry.base_instructions].find(
+    (text): text is string => typeof text === "string" && text.length > 0,
+  );
+  return {
+    model: entry.slug,
+    ...(raw !== undefined && raw > 0 ? { windowTokens: Math.floor((raw * percent) / 100) } : {}),
+    ...(instructions ? { instructionsTokens: estimateTokens(instructions) } : {}),
+  };
 };
 
 /** The configured catalog first, then Codex's cached model list; files are only read. */
-const codexWindow = Effect.fn("skillsMcp.context.codexWindow")(function* (
+const codexModel = Effect.fn("skillsMcp.context.codexModel")(function* (
   cli: AgentCli,
   config: ReturnType<typeof codexModelConfig>,
 ) {
-  if (!config.model) return undefined;
   const path = yield* Path.Path;
   const catalogs = [
     ...(config.catalogPath
@@ -143,10 +176,61 @@ const codexWindow = Effect.fn("skillsMcp.context.codexWindow")(function* (
     path.join(cli.configDir, "models_cache.json"),
   ];
   for (const file of catalogs) {
-    const window = codexWindowFrom(yield* readJsonFile(file), config.model, config.contextWindow);
-    if (window !== undefined) return window;
+    const facts = codexModelFrom(yield* readJsonFile(file), config.model, config.contextWindow);
+    if (facts !== undefined) return facts;
   }
   return undefined;
+});
+
+// ---------------------------------------------------------------------------
+// AGENTS.md
+
+/** Codex's default `project_doc_max_bytes`. */
+const PROJECT_DOC_MAX_CHARS = 32 * 1024;
+const DOC_NAMES = ["AGENTS.override.md", "AGENTS.md"];
+
+/**
+ * The AGENTS.md files Codex adds to a thread at `cwd`: its home's, then one
+ * per directory from the git root down to `cwd` (`AGENTS.override.md` wins in
+ * a directory), the project ones capped at Codex's 32 KiB default.
+ */
+const codexMemoryFiles = Effect.fn("skillsMcp.context.codexMemoryFiles")(function* (
+  cli: AgentCli,
+  cwd: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const docIn = (dir: string) =>
+    Effect.gen(function* () {
+      for (const name of DOC_NAMES) {
+        const file = path.join(dir, name);
+        const text = yield* fs.readFileString(file).pipe(Effect.option);
+        if (Option.isSome(text) && text.value.trim() !== "")
+          return { path: file, text: text.value };
+      }
+      return undefined;
+    });
+  const dirs: string[] = [];
+  for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+    dirs.unshift(dir);
+    if (yield* fs.exists(path.join(dir, ".git")).pipe(Effect.orElseSucceed(() => false))) break;
+    if (path.dirname(dir) === dir) {
+      dirs.splice(0, dirs.length, path.resolve(cwd));
+      break;
+    }
+  }
+  const files: Array<{ path: string; tokens: number }> = [];
+  const global = yield* docIn(cli.configDir);
+  if (global) files.push({ path: global.path, tokens: estimateTokens(global.text) });
+  let budget = PROJECT_DOC_MAX_CHARS;
+  for (const dir of dirs) {
+    const doc = budget > 0 ? yield* docIn(dir) : undefined;
+    if (!doc) continue;
+    const text = doc.text.slice(0, budget);
+    budget -= text.length;
+    files.push({ path: doc.path, tokens: estimateTokens(text) });
+  }
+  return files;
 });
 
 // ---------------------------------------------------------------------------
@@ -224,39 +308,52 @@ const joinErrors = (errors: ReadonlyArray<string | undefined>) => {
   return present.length > 0 ? present.join("; ") : undefined;
 };
 
-/**
- * Only what the panel can size is counted, so there is no "free space": the
- * rest of Codex's baseline is unknown.
- */
-const CODEX_NOTE = "MCP tools and skills only; excludes Codex's system prompt and built-in tools";
+const CODEX_NOTE = "Estimated here; Codex's built-in tools are not counted";
 
 /** Assembles the estimate; exported for tests. */
 export const codexAppContextFrom = (input: {
   readonly model?: string | undefined;
-  readonly windowTokens?: number | undefined;
+  readonly windowTokens: number;
+  readonly instructionsTokens?: number | undefined;
+  readonly memoryFiles: ReadonlyArray<{ readonly path: string; readonly tokens: number }>;
   readonly statuses: ReadonlyArray<CodexMcpServerStatus>;
   readonly skills: ReadonlyArray<CodexSkillCost>;
   readonly errors: ReadonlyArray<string | undefined>;
 }): AppContext => {
   const mcpServers = codexMcpCosts(input.statuses);
-  const mcpTokens = mcpServers.reduce((total, server) => total + server.loadedTokens, 0);
-  const skillTokens = input.skills.reduce((total, skill) => total + skill.tokens, 0);
-  const baselineTokens = mcpTokens + skillTokens;
-  const categories: ContextCategory[] = [
-    { name: "MCP tools", tokens: mcpTokens, kind: "used" },
-    { name: "Skills", tokens: skillTokens, kind: "used" },
+  const total = (items: ReadonlyArray<{ readonly tokens: number }>) =>
+    items.reduce((sum, item) => sum + item.tokens, 0);
+  const used: ContextCategory[] = [
+    ...(input.instructionsTokens !== undefined
+      ? [{ name: "System prompt", tokens: input.instructionsTokens, kind: "used" as const }]
+      : []),
+    { name: "Memory files", tokens: total(input.memoryFiles), kind: "used" },
+    {
+      name: "MCP tools",
+      tokens: mcpServers.reduce((sum, server) => sum + server.loadedTokens, 0),
+      kind: "used",
+    },
+    { name: "Skills", tokens: total(input.skills), kind: "used" },
   ];
+  const baselineTokens = total(used);
   const error = joinErrors(input.errors);
   return {
     exact: false,
     note: CODEX_NOTE,
     ...(input.model ? { model: input.model } : {}),
-    ...(input.windowTokens !== undefined ? { windowTokens: input.windowTokens } : {}),
+    windowTokens: input.windowTokens,
     baselineTokens,
-    categories,
+    categories: [
+      ...used,
+      {
+        name: "Free space",
+        tokens: Math.max(0, input.windowTokens - baselineTokens),
+        kind: "free",
+      },
+    ],
     mcpServers,
     skills: input.skills,
-    memoryFiles: [],
+    memoryFiles: input.memoryFiles,
     ...(error ? { error } : {}),
   };
 };
@@ -269,12 +366,21 @@ export const codexAppContext = (cli: AgentCli, cwd: string, refresh: boolean) =>
       { concurrency: "unbounded" },
     );
     const config = codexModelConfig(snapshot.config);
-    const windowTokens = yield* codexWindow(cli, config).pipe(
-      Effect.catch(() => Effect.succeed(undefined)),
+    const [facts, memoryFiles] = yield* Effect.all(
+      [
+        codexModel(cli, config).pipe(Effect.catch(() => Effect.succeed(undefined))),
+        codexMemoryFiles(cli, cwd).pipe(Effect.catch(() => Effect.succeed([]))),
+      ],
+      { concurrency: 2 },
     );
+    const override = config.contextWindow
+      ? Math.floor((config.contextWindow * DEFAULT_EFFECTIVE_PERCENT) / 100)
+      : undefined;
     return codexAppContextFrom({
-      model: config.model,
-      windowTokens,
+      model: config.model ?? facts?.model,
+      windowTokens: facts?.windowTokens ?? override ?? CODEX_DEFAULT_WINDOW,
+      instructionsTokens: facts?.instructionsTokens,
+      memoryFiles,
       statuses: snapshot.statuses ?? [],
       skills: skills.skills,
       errors: [snapshot.error, skills.error],

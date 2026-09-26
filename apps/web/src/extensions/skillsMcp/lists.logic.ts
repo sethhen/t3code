@@ -1,27 +1,29 @@
 /**
- * Pure helpers for the three lists: filtering, sorting, status labels, toggle
- * rules, relative time and small skills/plugins formatting.
+ * Pure helpers for the three lists: which rows are the user's and which came
+ * with Claude Code, Codex, T3 or a plugin, what each app switch does, status
+ * labels, and the one-click fixes on MCP rows.
  */
 import type {
   AgentApp,
   AgentAppInfo,
-  DiscoverableSkill,
   McpAppEntry,
-  McpOverview,
   McpScope,
   McpServerRow,
   McpToolInfo,
   PluginRow,
-  SkillRepo,
   SkillRow,
   SkillScope,
 } from "@t3tools/contracts";
 
-import type { Parsed } from "./mcpForm.logic";
-
 export const APP_LABEL: Readonly<Record<AgentApp, string>> = { claude: "Claude", codex: "Codex" };
 
-const defined = <Value>(value: Value | undefined): value is Value => value !== undefined;
+export const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
+
+const compareNames = (left: string, right: string): number =>
+  left.localeCompare(right, undefined, { sensitivity: "base", numeric: true });
+
+const byName = <Row extends { readonly name: string }>(rows: readonly Row[]): Row[] =>
+  [...rows].sort((left, right) => compareNames(left.name, right.name));
 
 function appEntries<Entry>(apps: {
   readonly claude?: Entry | undefined;
@@ -33,80 +35,86 @@ function appEntries<Entry>(apps: {
   return entries;
 }
 
-export const compareNames = (left: string, right: string): number =>
-  left.localeCompare(right, undefined, { sensitivity: "base", numeric: true });
+/** `vercel-plugin@vercel` -> `vercel-plugin`. */
+const pluginName = (id: string): string => id.split("@")[0] || id;
 
 // ---------------------------------------------------------------------------
-// Query matching
+// Sections
 
-export function queryTerms(query: string): string[] {
-  return query.toLowerCase().split(/\s+/).filter(Boolean);
+/**
+ * A list split into what needs a look, what the user installed, what the
+ * open project brings (its `.mcp.json`, `.claude/skills`), and what came with
+ * the apps or a plugin.
+ */
+export interface ListSections<Row> {
+  readonly attention: readonly Row[];
+  readonly yours: readonly Row[];
+  readonly project: readonly Row[];
+  /** Folded away by default. */
+  readonly builtIn: readonly Row[];
 }
 
-/** Every term must appear somewhere in the fields (case-insensitive AND). */
-export function matchesQuery(fields: readonly (string | undefined)[], query: string): boolean {
-  const terms = queryTerms(query);
-  if (terms.length === 0) return true;
-  const haystack = fields.filter(defined).join("\n").toLowerCase();
-  return terms.every((term) => haystack.includes(term));
+// ---------------------------------------------------------------------------
+// App switches
+
+/**
+ * What one app's switch on a row does. `store`: the panel's own store (user
+ * MCP servers, installed skills). `claude`: Claude's `deniedMcpServers`, for
+ * every other Claude server. `native`: the app's own skill setting.
+ */
+export type AppControl =
+  | { readonly kind: "store"; readonly id: string }
+  | { readonly kind: "claude" }
+  | { readonly kind: "native"; readonly path?: string }
+  | { readonly kind: "locked"; readonly reason: string };
+
+const locked = (reason: string): AppControl => ({ kind: "locked", reason });
+
+const inPlugins = (plugin: string) =>
+  `Comes with the ${plugin} plugin. Switch the plugin off in Plugins.`;
+
+const CODEX_ORIGIN: Readonly<Record<McpScope, string>> = {
+  user: "Defined in Codex's config.toml under a name T3 cannot manage.",
+  project: "Defined in this project's Codex config.",
+  local: "Defined in this project's Codex config.",
+  plugin: "Comes with a plugin. Switch the plugin off in Plugins.",
+  connector: "A claude.ai connector.",
+  managed: "Set by admin policy.",
+  builtin: "Built into T3 Code.",
+  unknown: "Defined in another Codex config file.",
+};
+
+/** The switch for one app's cell, or null when the server is not in that app. */
+export function mcpAppSwitch(row: McpServerRow, app: AgentApp): AppControl | null {
+  const entry = row.apps[app];
+  if (!entry) return null;
+  if (row.builtin) return locked("T3 Code's own tools, attached to every thread.");
+  if (row.managed) {
+    if (app === "codex" && row.spec?.type === "sse") return locked("Codex has no SSE transport.");
+    return row.id ? { kind: "store", id: row.id } : locked("This server has no store id.");
+  }
+  if (app === "claude") return { kind: "claude" };
+  if (entry.scope === "plugin" && entry.source) return locked(inPlugins(pluginName(entry.source)));
+  return locked(CODEX_ORIGIN[entry.scope]);
 }
 
-function filterBy<Row>(
-  rows: readonly Row[],
-  query: string,
-  fields: (row: Row) => readonly (string | undefined)[],
-): readonly Row[] {
-  if (queryTerms(query).length === 0) return rows;
-  return rows.filter((row) => matchesQuery(fields(row), query));
+/** The switch for one app's cell, or null when the app does not have the skill. */
+export function skillAppSwitch(row: SkillRow, app: AgentApp): AppControl | null {
+  const entry = row.apps[app];
+  if (row.managed) {
+    if (!entry) return null;
+    return row.id ? { kind: "store", id: row.id } : locked("This skill has no store id.");
+  }
+  if (!entry?.present) return null;
+  if (row.pluginId || entry.scope === "plugin") {
+    return locked(inPlugins(row.pluginId ? pluginName(row.pluginId) : "a"));
+  }
+  if (app === "codex" && !entry.path) return locked("Codex did not report this skill's folder.");
+  return { kind: "native", ...(entry.path ? { path: entry.path } : {}) };
 }
 
 // ---------------------------------------------------------------------------
 // MCP
-
-/** The scope a row is listed under: builtin, else the first app entry's scope. */
-export function primaryScope(row: McpServerRow): McpScope {
-  if (row.builtin) return "builtin";
-  return appEntries(row.apps)[0]?.scope ?? "unknown";
-}
-
-function mcpRank(row: McpServerRow): number {
-  if (row.builtin) return 5;
-  if (row.managed) return 0;
-  switch (primaryScope(row)) {
-    case "user":
-      return 1;
-    case "project":
-    case "local":
-      return 2;
-    case "plugin":
-      return 3;
-    default:
-      return 4;
-  }
-}
-
-/** Managed first, then unmanaged user, project/local, plugin, managed/unknown, builtin. */
-export function sortMcpServers(rows: readonly McpServerRow[]): McpServerRow[] {
-  return [...rows].sort(
-    (left, right) => mcpRank(left) - mcpRank(right) || compareNames(left.name, right.name),
-  );
-}
-
-function mcpFields(row: McpServerRow): (string | undefined)[] {
-  const fields: (string | undefined)[] = [row.name, row.description, row.homepage, ...row.tags];
-  if (row.spec)
-    fields.push(row.spec.type, row.spec.type === "stdio" ? row.spec.command : row.spec.url);
-  if (row.builtin) fields.push("builtin");
-  if (row.managed) fields.push("managed");
-  for (const entry of appEntries(row.apps)) {
-    fields.push(entry.scope, entry.source, ...(entry.tools ?? []).map((tool) => tool.name));
-  }
-  return fields;
-}
-
-export function filterMcpServers(rows: readonly McpServerRow[], query: string) {
-  return filterBy(rows, query, mcpFields);
-}
 
 export type StatusTone = "success" | "destructive" | "warning" | "info" | "muted";
 
@@ -123,7 +131,7 @@ export function mcpStatusLabel(entry: McpAppEntry): StatusLabel {
     case "failed":
       return { label: "Failed", tone: "destructive" };
     case "needs-auth":
-      return { label: "Needs auth", tone: "warning" };
+      return { label: "Needs sign-in", tone: "warning" };
     case "pending":
       return { label: "Connecting", tone: "info" };
     case "not-started":
@@ -133,43 +141,158 @@ export function mcpStatusLabel(entry: McpAppEntry): StatusLabel {
   }
 }
 
-const MCP_SCOPE_ORIGIN: Readonly<Record<McpScope, string>> = {
-  user: "Defined in your user config. Import to manage it here.",
-  project: "Defined in .mcp.json (project)",
-  local: "Defined in Claude's per-project config",
-  plugin: "From a plugin",
-  managed: "Set by admin policy",
-  builtin: "Built into T3",
-  unknown: "Defined in another config file",
-};
+/** Scopes whose servers come with an app, a connector, a plugin or policy. */
+const BUILT_IN_MCP_SCOPES: ReadonlySet<McpScope> = new Set([
+  "plugin",
+  "connector",
+  "managed",
+  "builtin",
+]);
 
 /**
- * Why an app's switch is locked, or null when it can be toggled. For builtin
- * and unmanaged rows this is where the server is defined (they render as a
- * read-only state with this as its tooltip); for managed rows it is the rare
- * transport or store problem.
+ * A user server whose program ships inside the ChatGPT or Codex desktop app
+ * (`node_repl`): the app registers it in both configs itself.
  */
-export function mcpToggleBlock(row: McpServerRow, app: AgentApp): string | null {
-  if (row.builtin) return MCP_SCOPE_ORIGIN.builtin;
-  const entry = row.apps[app];
-  if (!row.managed) {
-    const scope = entry?.scope ?? primaryScope(row);
-    const source = entry?.source;
-    if (scope === "plugin" && source) return `From plugin ${source.split("@")[0]}`;
-    if (scope === "unknown" && source) return `Defined in ${source}`;
-    return MCP_SCOPE_ORIGIN[scope];
-  }
-  if (app === "codex" && row.spec?.type === "sse") return "Codex has no SSE transport.";
-  if (!row.id) return "This server has no store id.";
-  return null;
+const DESKTOP_APP_COMMAND = /[\\/](?:ChatGPT|Codex)\.app[\\/]/;
+
+const fromDesktopApp = (row: McpServerRow) =>
+  row.spec?.type === "stdio" && DESKTOP_APP_COMMAND.test(row.spec.command);
+
+/** Came with Claude Code, Codex, T3, claude.ai or a plugin, rather than added by the user. */
+function isBuiltInMcp(row: McpServerRow): boolean {
+  if (row.builtin || fromDesktopApp(row)) return true;
+  const present = appEntries(row.apps).filter((entry) => entry.present);
+  return present.length > 0 && present.every((entry) => BUILT_IN_MCP_SCOPES.has(entry.scope));
 }
 
-/** Unmanaged servers in the user scope of either app: what `import` would adopt. */
-export function countImportable(rows: readonly McpServerRow[]): number {
-  return rows.filter(
-    (row) =>
-      !row.managed && !row.builtin && appEntries(row.apps).some((entry) => entry.scope === "user"),
-  ).length;
+/** Defined by the open project (`.mcp.json`, Claude's per-project servers). */
+function isProjectMcp(row: McpServerRow): boolean {
+  const present = appEntries(row.apps).filter((entry) => entry.present);
+  return (
+    present.length > 0 &&
+    present.every((entry) => entry.scope === "project" || entry.scope === "local")
+  );
+}
+
+/** A short "where from" label for rows that are not plain user servers. */
+export function mcpOrigin(row: McpServerRow): string | null {
+  if (row.builtin) return "T3";
+  if (fromDesktopApp(row)) return "ChatGPT app";
+  const entry = appEntries(row.apps).find((candidate) => candidate.present);
+  switch (entry?.scope) {
+    case "connector":
+      return "claude.ai";
+    case "plugin":
+      return entry.source ? pluginName(entry.source) : "plugin";
+    case "managed":
+      return "policy";
+    default:
+      return null;
+  }
+}
+
+export interface AttentionIssue {
+  readonly app: AgentApp;
+  readonly tone: "destructive" | "warning";
+  readonly label: string;
+  readonly message?: string;
+}
+
+/**
+ * Enabled app entries that failed, need sign-in or carry an error (for
+ * example a managed server missing from the app's config). Entries that are
+ * off are never problems.
+ */
+export function mcpIssues(row: McpServerRow): AttentionIssue[] {
+  const issues: AttentionIssue[] = [];
+  for (const app of APPS) {
+    const entry = row.apps[app];
+    if (!entry?.enabled || entry.status === "disabled") continue;
+    const message = entry.error ? { message: entry.error } : {};
+    if (entry.status === "failed")
+      issues.push({ app, tone: "destructive", label: "Failed", ...message });
+    else if (entry.status === "needs-auth")
+      issues.push({ app, tone: "warning", label: "Needs sign-in", ...message });
+    else if (entry.error) issues.push({ app, tone: "destructive", label: "Error", ...message });
+  }
+  return issues;
+}
+
+/** The row's single dot: the worst problem, else the best live state of an app it is on in. */
+export function mcpRowTone(row: McpServerRow): StatusTone {
+  const issues = mcpIssues(row);
+  if (issues.some((issue) => issue.tone === "destructive")) return "destructive";
+  if (issues.length > 0) return "warning";
+  const tones = new Set(
+    appEntries(row.apps)
+      .filter((entry) => entry.present)
+      .map((entry) => mcpStatusLabel(entry).tone),
+  );
+  if (tones.has("success")) return "success";
+  if (tones.has("info")) return "info";
+  return "muted";
+}
+
+/** The one-click fix shown on the row itself. */
+export interface McpPrimaryAction {
+  readonly kind: "restore" | "login" | "reconnect";
+  readonly label: string;
+  readonly apps: readonly AgentApp[];
+}
+
+/** Apps a managed server is switched on for whose config has lost the entry. */
+function mcpDriftApps(row: McpServerRow): AgentApp[] {
+  if (!row.managed || row.builtin || !row.id) return [];
+  return APPS.filter((app) => {
+    const entry = row.apps[app];
+    return entry?.enabled === true && !entry.present && mcpAppSwitch(row, app)?.kind === "store";
+  });
+}
+
+/**
+ * Restore beats everything (nothing else works while the entry is missing),
+ * then sign-in beats reconnect: a server waiting on OAuth will not connect
+ * until the user logs in.
+ */
+export function mcpPrimaryAction(row: McpServerRow): McpPrimaryAction | null {
+  if (row.builtin) return null;
+  const drift = mcpDriftApps(row);
+  if (drift.length > 0) return { kind: "restore", label: "Restore", apps: drift };
+  const issues = mcpIssues(row).filter(
+    (issue) => issue.label !== "Error" && row.apps[issue.app]?.present,
+  );
+  const needsAuth = issues
+    .filter((issue) => row.apps[issue.app]?.status === "needs-auth")
+    .map((issue) => issue.app);
+  if (needsAuth.length > 0) return { kind: "login", label: "Sign in", apps: needsAuth };
+  const apps = issues.map((issue) => issue.app);
+  return apps.length > 0 ? { kind: "reconnect", label: "Reconnect", apps } : null;
+}
+
+function severity(row: McpServerRow): number {
+  const issues = mcpIssues(row);
+  if (issues.some((issue) => issue.tone === "destructive")) return 0;
+  return issues.length > 0 ? 1 : 2;
+}
+
+/**
+ * The user's and the project's servers with a problem first (failures before
+ * sign-in). Built-in servers keep their problems to themselves: a claude.ai
+ * connector nobody signed in to is not the user's to fix.
+ */
+export function sectionMcpServers(rows: readonly McpServerRow[]): ListSections<McpServerRow> {
+  const own = byName(rows.filter((row) => !isBuiltInMcp(row)));
+  const fine = own.filter((row) => severity(row) === 2);
+  return {
+    attention: own
+      .filter((row) => severity(row) < 2)
+      .sort((left, right) => severity(left) - severity(right)),
+    yours: fine.filter((row) => !isProjectMcp(row)),
+    project: fine.filter(isProjectMcp),
+    builtIn: byName(rows.filter(isBuiltInMcp)).sort(
+      (left, right) => Number(right.builtin) - Number(left.builtin),
+    ),
+  };
 }
 
 export interface ToolGroup {
@@ -179,11 +302,11 @@ export interface ToolGroup {
 
 /** One group when both apps list the same tool names, otherwise one group per app. */
 export function groupTools(row: McpServerRow): ToolGroup[] {
-  const groups: ToolGroup[] = [];
   const claude = row.apps.claude?.tools;
   const codex = row.apps.codex?.tools;
   if (claude && codex && sameNames(claude, codex))
     return [{ apps: ["claude", "codex"], tools: claude }];
+  const groups: ToolGroup[] = [];
   if (claude) groups.push({ apps: ["claude"], tools: claude });
   if (codex) groups.push({ apps: ["codex"], tools: codex });
   return groups;
@@ -210,534 +333,80 @@ function sameNames(left: readonly McpToolInfo[], right: readonly McpToolInfo[]):
   return right.every((tool) => names.has(tool.name));
 }
 
-export const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
-
-export interface AttentionIssue {
-  readonly app: AgentApp;
-  readonly tone: "destructive" | "warning";
-  readonly label: string;
-  readonly message?: string;
-}
-
-/**
- * Enabled app entries that failed, need auth or carry an error (for example a
- * managed server missing from the app's config). Entries that are off (Codex
- * for SSE, project-disabled) are not problems.
- */
-export function mcpIssues(row: McpServerRow): AttentionIssue[] {
-  const issues: AttentionIssue[] = [];
-  for (const app of APPS) {
-    const entry = row.apps[app];
-    if (!entry?.enabled || entry.status === "disabled") continue;
-    const message = entry.error ? { message: entry.error } : {};
-    if (entry.status === "failed")
-      issues.push({ app, tone: "destructive", label: "Failed", ...message });
-    else if (entry.status === "needs-auth")
-      issues.push({ app, tone: "warning", label: "Needs auth", ...message });
-    else if (entry.error) issues.push({ app, tone: "destructive", label: "Error", ...message });
-  }
-  return issues;
-}
-
-export function countAttention(rows: readonly McpServerRow[]): number {
-  return rows.filter((row) => mcpIssues(row).length > 0).length;
-}
-
-/** The row's single dot: the worst problem, else the best live state of a present app. */
-export function mcpRowTone(row: McpServerRow): StatusTone {
-  const issues = mcpIssues(row);
-  if (issues.some((issue) => issue.tone === "destructive")) return "destructive";
-  if (issues.length > 0) return "warning";
-  const tones = new Set(
-    appEntries(row.apps)
-      .filter((entry) => entry.present)
-      .map((entry) => mcpStatusLabel(entry).tone),
-  );
-  if (tones.has("success")) return "success";
-  if (tones.has("info")) return "info";
-  return "muted";
-}
-
-/** Distinct tool names across both apps. */
-export function mcpToolCount(row: McpServerRow): number {
-  const names = new Set<string>();
-  for (const entry of appEntries(row.apps))
-    for (const tool of entry.tools ?? []) names.add(tool.name);
-  return names.size;
-}
-
-/** The one-click fix shown on the row itself. */
-export interface McpPrimaryAction {
-  readonly kind: "restore" | "login" | "reconnect";
-  readonly label: string;
-  readonly apps: readonly AgentApp[];
-}
-
-/** Apps a managed server is switched on for whose config has lost the entry. */
-export function mcpDriftApps(row: McpServerRow): AgentApp[] {
-  if (!row.managed || row.builtin || !row.id) return [];
-  return APPS.filter((app) => {
-    const entry = row.apps[app];
-    return entry?.enabled === true && !entry.present && mcpToggleBlock(row, app) === null;
-  });
-}
-
-/**
- * Restore beats everything (nothing else works while the entry is missing),
- * then sign-in beats reconnect: a server waiting on OAuth will not connect
- * until the user logs in.
- */
-export function mcpPrimaryAction(row: McpServerRow): McpPrimaryAction | null {
-  if (row.builtin) return null;
-  const drift = mcpDriftApps(row);
-  if (drift.length > 0) return { kind: "restore", label: "Restore", apps: drift };
-  const issues = mcpIssues(row).filter(
-    (issue) => issue.label !== "Error" && row.apps[issue.app]?.present,
-  );
-  const needsAuth = issues
-    .filter((issue) => row.apps[issue.app]?.status === "needs-auth")
-    .map((issue) => issue.app);
-  if (needsAuth.length > 0) return { kind: "login", label: "Log in", apps: needsAuth };
-  const apps = issues.map((issue) => issue.app);
-  return apps.length > 0 ? { kind: "reconnect", label: "Reconnect", apps } : null;
-}
-
-export interface RowSection<Row> {
-  readonly id: string;
-  readonly label: string;
-  readonly rows: readonly Row[];
-}
-
-const nonEmpty = <Row>(sections: RowSection<Row>[]) =>
-  sections.filter((section) => section.rows.length > 0);
-
-function severity(row: McpServerRow): number {
-  const issues = mcpIssues(row);
-  if (issues.some((issue) => issue.tone === "destructive")) return 0;
-  return issues.length > 0 ? 1 : 2;
-}
-
-/** Problems first (failures before auth), then managed, then everything else. */
-export function sectionMcpServers(rows: readonly McpServerRow[]): RowSection<McpServerRow>[] {
-  const sorted = sortMcpServers(rows);
-  const attention = sorted
-    .filter((row) => severity(row) < 2)
-    .sort((left, right) => severity(left) - severity(right));
-  const rest = sorted.filter((row) => severity(row) === 2);
-  return nonEmpty([
-    { id: "attention", label: "Needs attention", rows: attention },
-    { id: "managed", label: "Managed", rows: rest.filter((row) => row.managed) },
-    { id: "other", label: "Not managed", rows: rest.filter((row) => !row.managed) },
-  ]);
-}
-
-/** One filter choice; `group` titles its block in the filter menu. */
-export interface Facet {
-  readonly id: string;
-  readonly label: string;
-  readonly count: number;
-  readonly group: string;
-}
-
-export const ALL_FACET = "all";
-
-function countFacets<Row>(
-  rows: readonly Row[],
-  group: string,
-  keys: (row: Row) => readonly { readonly id: string; readonly label: string }[],
-): Facet[] {
-  const facets = new Map<string, { label: string; count: number }>();
-  for (const row of rows) {
-    for (const { id, label } of keys(row)) {
-      const facet = facets.get(id);
-      if (facet) facet.count += 1;
-      else facets.set(id, { label, count: 1 });
-    }
-  }
-  return [...facets.entries()]
-    .map(([id, facet]) => ({ id, group, ...facet }))
-    .sort((left, right) => compareNames(left.label, right.label));
-}
-
-const MCP_SCOPE_FACET: Readonly<Record<McpScope, string>> = {
-  user: "User config",
-  project: "Project .mcp.json",
-  local: "Claude per-project",
-  plugin: "Plugins",
-  managed: "Policy",
-  builtin: "Built in",
-  unknown: "Other files",
-};
-
-/** Status, tag (managed servers carry tags) and origin filters, with counts over all rows. */
-export function mcpFacets(rows: readonly McpServerRow[]): Facet[] {
-  const status = countFacets(rows, "Show", (row) => [
-    ...(mcpIssues(row).length > 0 ? [{ id: "attention", label: "Needs attention" }] : []),
-    row.managed ? { id: "managed", label: "Managed" } : { id: "unmanaged", label: "Not managed" },
-  ]);
-  const order = ["attention", "managed", "unmanaged"];
-  status.sort((left, right) => order.indexOf(left.id) - order.indexOf(right.id));
-  const tags = countFacets(rows, "Tags", (row) =>
-    row.tags.map((tag) => ({ id: `tag:${tag}`, label: tag })),
-  );
-  const origins = countFacets(
-    rows.filter((row) => !row.managed),
-    "Origin",
-    (row) => {
-      const scope = primaryScope(row);
-      return [{ id: `scope:${scope}`, label: MCP_SCOPE_FACET[scope] }];
-    },
-  );
-  return [...status, ...tags, ...(origins.length > 1 ? origins : [])];
-}
-
-export function mcpFacetMatches(row: McpServerRow, facet: string): boolean {
-  if (facet === ALL_FACET) return true;
-  if (facet === "attention") return mcpIssues(row).length > 0;
-  if (facet === "managed") return row.managed;
-  if (facet === "unmanaged") return !row.managed;
-  if (facet.startsWith("tag:")) return row.tags.includes(facet.slice(4));
-  if (facet.startsWith("scope:")) return !row.managed && primaryScope(row) === facet.slice(6);
-  return true;
-}
-
-/** The selected facet, or "all" once it no longer exists (e.g. the last problem got fixed). */
-export function resolveFacet(facets: readonly Facet[], selected: string): string {
-  return selected === ALL_FACET || facets.some((facet) => facet.id === selected)
-    ? selected
-    : ALL_FACET;
-}
-
-/** The oldest live-probe time, since that is what the statuses reflect. */
-export function mcpCheckedAt(overview: McpOverview): string {
-  const probes = [overview.liveProbe.claude.checkedAt, overview.liveProbe.codex.checkedAt]
-    .filter(defined)
-    .filter((value) => Number.isFinite(Date.parse(value)));
-  if (probes.length === 0) return overview.checkedAt;
-  return probes.reduce((oldest, value) =>
-    Date.parse(value) < Date.parse(oldest) ? value : oldest,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Apps
 
-export function appInfo(apps: readonly AgentAppInfo[], app: AgentApp): AgentAppInfo | undefined {
-  return apps.find((info) => info.app === app);
-}
-
 /** Null when the app answered (or was not reported at all). */
 export function appUnavailableReason(apps: readonly AgentAppInfo[], app: AgentApp): string | null {
-  const info = appInfo(apps, app);
+  const info = apps.find((candidate) => candidate.app === app);
   if (!info || info.available) return null;
   return `${APP_LABEL[app]} is unavailable${info.error ? `: ${info.error}` : "."}`;
 }
 
 // ---------------------------------------------------------------------------
-// Relative time
-
-export function formatRelativeTime(iso: string, now: number): string | null {
-  const time = Date.parse(iso);
-  if (!Number.isFinite(time)) return null;
-  const seconds = Math.max(0, Math.round((now - time) / 1000));
-  if (seconds < 5) return "just now";
-  if (seconds < 60) return `${seconds} s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} h ago`;
-  return `${Math.floor(hours / 24)} d ago`;
-}
-
-// ---------------------------------------------------------------------------
 // Skills
 
-/** Managed first, then by name. */
-export function sortSkills(rows: readonly SkillRow[]): SkillRow[] {
-  return [...rows].sort(
-    (left, right) =>
-      Number(right.managed) - Number(left.managed) || compareNames(left.name, right.name),
-  );
+/** Scopes whose skills ship with an app, sync from claude.ai, or come with a plugin. */
+const BUILT_IN_SKILL_SCOPES: ReadonlySet<SkillScope> = new Set(["system", "synced", "plugin"]);
+
+function isBuiltInSkill(row: SkillRow): boolean {
+  if (row.managed) return false;
+  const present = appEntries(row.apps).filter((entry) => entry.present);
+  return present.length > 0 && present.every((entry) => BUILT_IN_SKILL_SCOPES.has(entry.scope));
 }
 
-export interface SkillSourceLabel {
-  readonly kind: "github" | "zip" | "local" | "plugin";
-  readonly label: string;
-  readonly href?: string;
-}
-
-export function skillSourceLabel(row: SkillRow): SkillSourceLabel | null {
-  const source = row.source;
-  if (source?.type === "github") {
-    const repoUrl = `https://github.com/${source.owner}/${source.repo}`;
-    const path = source.path?.replace(/^\/+|\/+$/g, "") ?? "";
-    const href =
-      path || source.branch ? `${repoUrl}/tree/${source.branch ?? "HEAD"}/${path}` : repoUrl;
-    return {
-      kind: "github",
-      label: `${source.owner}/${source.repo}`,
-      href: href.replace(/\/$/, ""),
-    };
+/** A short "where from" label for skills that are not plain user skills. */
+export function skillOrigin(row: SkillRow): string | null {
+  if (row.pluginId) return pluginName(row.pluginId);
+  switch (appEntries(row.apps).find((entry) => entry.present)?.scope) {
+    case "system":
+      return "built in";
+    case "synced":
+      return "claude.ai";
+    case "plugin":
+      return "plugin";
+    default:
+      return null;
   }
-  if (source?.type === "zip") return { kind: "zip", label: source.fileName };
-  if (source?.type === "local") return { kind: "local", label: source.path };
-  if (row.pluginId) return { kind: "plugin", label: row.pluginId };
-  return null;
 }
 
-function skillFields(row: SkillRow): (string | undefined)[] {
-  const source = skillSourceLabel(row);
-  return [
-    row.name,
-    row.description,
-    row.pluginId,
-    source?.label,
-    row.managed ? "managed" : undefined,
-    row.updateAvailable ? "update" : undefined,
-    ...appEntries(row.apps).map((entry) => entry.scope),
-  ];
-}
+const isProjectSkill = (row: SkillRow) =>
+  !row.managed &&
+  appEntries(row.apps).some((entry) => entry.present) &&
+  appEntries(row.apps).every((entry) => !entry.present || entry.scope === "project");
 
-export function filterSkills(rows: readonly SkillRow[], query: string) {
-  return filterBy(rows, query, skillFields);
-}
-
-const SKILL_SCOPE_SOURCE: Readonly<Record<SkillScope, string>> = {
-  user: "Skills folder",
-  project: "This project",
-  plugin: "Plugins",
-  system: "Built in",
-  synced: "Synced",
-};
-
-/** Where a skill comes from, as a filter key: a repo, uploads, a plugin, or its folder. */
-export function skillOrigin(row: SkillRow): { readonly id: string; readonly label: string } {
-  const source = row.source;
-  if (source?.type === "github") {
-    const label = `${source.owner}/${source.repo}`;
-    return { id: `source:github:${label.toLowerCase()}`, label };
-  }
-  if (source?.type === "zip") return { id: "source:zip", label: "Uploaded .zip" };
-  if (source?.type === "local") return { id: "source:local", label: "Local folders" };
-  if (row.pluginId) return { id: `source:plugin:${row.pluginId}`, label: row.pluginId };
-  const scope = appEntries(row.apps)[0]?.scope ?? "user";
-  return { id: `source:${scope}`, label: SKILL_SCOPE_SOURCE[scope] };
-}
-
-export function skillFacets(rows: readonly SkillRow[]): Facet[] {
-  const status = countFacets(rows, "Show", (row) => [
-    ...(row.updateAvailable ? [{ id: "updates", label: "Update available" }] : []),
-    row.managed ? { id: "managed", label: "Managed" } : { id: "unmanaged", label: "Not managed" },
-  ]);
-  const order = ["updates", "managed", "unmanaged"];
-  status.sort((left, right) => order.indexOf(left.id) - order.indexOf(right.id));
-  const sources = countFacets(rows, "Source", (row) => [skillOrigin(row)]);
-  return [...status, ...(sources.length > 1 ? sources : [])];
-}
-
-export function skillFacetMatches(row: SkillRow, facet: string): boolean {
-  if (facet === ALL_FACET) return true;
-  if (facet === "updates") return row.updateAvailable === true;
-  if (facet === "managed") return row.managed;
-  if (facet === "unmanaged") return !row.managed;
-  if (facet.startsWith("source:")) return skillOrigin(row).id === facet;
-  return true;
-}
-
-/** Updates first, then managed, then the rest (plugins, built-ins, unmanaged folders). */
-export function sectionSkills(rows: readonly SkillRow[]): RowSection<SkillRow>[] {
-  const sorted = sortSkills(rows);
-  const updates = sorted.filter((row) => row.updateAvailable);
-  const rest = sorted.filter((row) => !row.updateAvailable);
-  return nonEmpty([
-    { id: "updates", label: "Update available", rows: updates },
-    { id: "managed", label: "Managed", rows: rest.filter((row) => row.managed) },
-    { id: "other", label: "Not managed", rows: rest.filter((row) => !row.managed) },
-  ]);
-}
-
-/** Why a skill's per-app switch is locked, or null when it can be toggled. */
-export function skillToggleBlock(row: SkillRow, app: AgentApp): string | null {
-  const entry = row.apps[app];
-  if (row.pluginId || entry?.scope === "plugin") {
-    return `Comes from ${row.pluginId ? `plugin ${row.pluginId}` : "a plugin"}; manage it in Plugins.`;
-  }
-  if (!row.managed) {
-    switch (entry?.scope) {
-      case "system":
-        return `Built into ${APP_LABEL[app]}.`;
-      case "project":
-        return "Lives in this project's folder; edit it there.";
-      case "synced":
-        return `Synced by ${APP_LABEL[app]}; manage it there.`;
-      default:
-        return entry?.adoptable
-          ? "Not managed yet. Adopt it to manage it here."
-          : `In ${APP_LABEL[app]}'s skills folder; edit it there.`;
-    }
-  }
-  if (!row.id) return "This skill has no store id.";
-  return null;
-}
-
-/** The folder `adopt` moves into the store, when the server says it would accept one. */
-export function skillAdoptPath(row: SkillRow): string | undefined {
-  if (row.managed || row.pluginId) return undefined;
-  return appEntries(row.apps).find((entry) => entry.adoptable === true && entry.path)?.path;
-}
-
-const REPO_PART = /^[A-Za-z0-9_.-]+$/;
-const BRANCH = /^[A-Za-z0-9_./-]+$/;
-
-/** Accepts `owner/repo`, `owner/repo@branch` and github.com URLs (with `/tree/<branch>`). */
-export function parseRepoInput(text: string): Parsed<SkillRepo> {
-  let value = text.trim();
-  if (value === "") return { ok: false, error: "Enter a repository." };
-  let branch: string | undefined;
-  const url = /^(?:https?:\/\/)?(?:www\.)?github\.com\/(.+)$/i.exec(value);
-  if (url?.[1] !== undefined) {
-    const [owner = "", rawRepo = "", tree, ...rest] = url[1].replace(/[?#].*$/, "").split("/");
-    const repo = rawRepo.replace(/\.git$/i, "");
-    if (tree === "tree" && rest.length > 0) branch = rest.join("/").replace(/\/+$/, "");
-    value = `${owner}/${repo}`;
-  } else {
-    const at = value.lastIndexOf("@");
-    if (at > 0) {
-      branch = value.slice(at + 1);
-      value = value.slice(0, at);
-    }
-  }
-  const parts = value.replace(/\/+$/, "").split("/");
-  const [owner, repo] = parts;
-  if (parts.length !== 2 || !owner || !repo || !REPO_PART.test(owner) || !REPO_PART.test(repo)) {
-    return { ok: false, error: "Use owner/repo or a GitHub URL." };
-  }
-  if (branch !== undefined && (branch === "" || !BRANCH.test(branch))) {
-    return { ok: false, error: "That branch name is not valid." };
-  }
-  return { ok: true, value: { owner, repo, ...(branch ? { branch } : {}) } };
-}
-
-export const repoKey = (repo: { readonly owner: string; readonly repo: string }): string =>
-  `${repo.owner}/${repo.repo}`;
-
-export interface RepoGroup {
-  readonly key: string;
-  readonly repo: SkillRepo;
-  /** Saved in the repo list (so it can be removed), as opposed to only discovered. */
-  readonly saved: boolean;
-  readonly skills: readonly DiscoverableSkill[];
-}
-
-/** Groups discovered skills by repo; saved repos without skills still get a group. */
-export function groupDiscoverable(
-  skills: readonly DiscoverableSkill[],
-  repos: readonly SkillRepo[],
-): RepoGroup[] {
-  const groups = new Map<
-    string,
-    { repo: SkillRepo; saved: boolean; skills: DiscoverableSkill[] }
-  >();
-  for (const repo of repos)
-    groups.set(repoKey(repo).toLowerCase(), { repo, saved: true, skills: [] });
-  for (const skill of skills) {
-    const key = repoKey(skill).toLowerCase();
-    let group = groups.get(key);
-    if (!group) {
-      group = {
-        repo: { owner: skill.owner, repo: skill.repo, branch: skill.branch },
-        saved: false,
-        skills: [],
-      };
-      groups.set(key, group);
-    }
-    group.skills.push(skill);
-  }
-  return [...groups.values()]
-    .map((group) => ({
-      key: repoKey(group.repo),
-      repo: group.repo,
-      saved: group.saved,
-      skills: group.skills.sort((left, right) => compareNames(left.name, right.name)),
-    }))
-    .sort((left, right) => compareNames(left.key, right.key));
-}
-
-export function filterDiscoverable(groups: readonly RepoGroup[], query: string): RepoGroup[] {
-  if (queryTerms(query).length === 0) return [...groups];
-  return groups
-    .map((group) => ({
-      ...group,
-      skills: group.skills.filter((skill) =>
-        matchesQuery([group.key, skill.name, skill.description, skill.path], query),
-      ),
-    }))
-    .filter((group) => group.skills.length > 0 || matchesQuery([group.key], query));
-}
-
-/** 999, 1.2k, 3.4M. */
-export function formatInstalls(count: number): string {
-  if (!Number.isFinite(count) || count < 1000) return String(Math.max(0, Math.round(count || 0)));
-  const short = (value: number) => value.toFixed(1).replace(/\.0$/, "");
-  const thousands = count / 1000;
-  if (Number(thousands.toFixed(1)) < 1000) return `${short(thousands)}k`;
-  return `${short(count / 1_000_000)}M`;
-}
-
-/** Base64 without blowing the argument limit on big files. */
-export function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
-  }
-  return btoa(binary);
+export function sectionSkills(rows: readonly SkillRow[]): ListSections<SkillRow> {
+  const own = byName(rows.filter((row) => !isBuiltInSkill(row)));
+  return {
+    attention: [],
+    yours: own.filter((row) => !isProjectSkill(row)),
+    project: own.filter(isProjectSkill),
+    builtIn: byName(rows.filter(isBuiltInSkill)),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Plugins
 
-/** Installed plugins per app, then the installable ones per app; each by name. */
-export function sectionPlugins(
-  installed: readonly PluginRow[],
-  available: readonly PluginRow[],
-): RowSection<PluginRow>[] {
-  const byApp = (rows: readonly PluginRow[], app: AgentApp) =>
-    rows
-      .filter((row) => row.app === app)
-      .sort((left, right) => compareNames(left.name, right.name));
-  return nonEmpty([
-    ...APPS.map((app) => ({
-      id: `installed:${app}`,
-      label: APP_LABEL[app],
-      rows: byApp(installed, app),
-    })),
-    ...APPS.map((app) => ({
-      id: `available:${app}`,
-      label: `Available for ${APP_LABEL[app]}`,
-      rows: byApp(available, app),
-    })),
-  ]);
+/** Codex's own marketplaces: their plugins come with the Codex app. */
+const BUILT_IN_MARKETPLACES: ReadonlySet<string> = new Set([
+  "openai-bundled",
+  "openai-primary-runtime",
+]);
+
+function isBuiltInPlugin(row: PluginRow): boolean {
+  return row.app === "codex" && BUILT_IN_MARKETPLACES.has(row.marketplace ?? "");
 }
 
-export function filterPlugins(rows: readonly PluginRow[], query: string) {
-  return filterBy(rows, query, (row) => [
-    row.name,
-    row.id,
-    row.marketplace,
-    row.description,
-    row.app,
-    ...row.contributes.skills,
-    ...row.contributes.mcpServers,
-    ...row.contributes.commands,
-    ...row.contributes.agents,
-  ]);
-}
-
-export interface ContributionChip {
-  readonly kind: "skills" | "mcpServers" | "commands" | "agents";
-  readonly label: string;
-  readonly names: readonly string[];
+/** Installed plugins, Claude's then Codex's, each by name. */
+export function sectionPlugins(rows: readonly PluginRow[]): ListSections<PluginRow> {
+  const ordered = APPS.flatMap((app) => byName(rows.filter((row) => row.app === app)));
+  return {
+    attention: [],
+    yours: ordered.filter((row) => !isBuiltInPlugin(row)),
+    project: [],
+    builtIn: ordered.filter(isBuiltInPlugin),
+  };
 }
 
 const CONTRIBUTION_NOUNS = {
@@ -747,13 +416,13 @@ const CONTRIBUTION_NOUNS = {
   agents: ["agent", "agents"],
 } as const;
 
-/** "3 skills", "1 MCP server": one chip per non-empty contribution kind. */
-export function contributionChips(row: PluginRow): ContributionChip[] {
+/** "26 skills · 1 MCP server" for what a plugin brings; empty when it reports nothing. */
+export function contributionSummary(row: PluginRow): string {
   return (Object.keys(CONTRIBUTION_NOUNS) as (keyof typeof CONTRIBUTION_NOUNS)[])
-    .map((kind) => {
-      const names = row.contributes[kind];
+    .flatMap((kind) => {
+      const count = row.contributes[kind].length;
       const [one, many] = CONTRIBUTION_NOUNS[kind];
-      return { kind, names, label: `${names.length} ${names.length === 1 ? one : many}` };
+      return count > 0 ? [`${count} ${count === 1 ? one : many}`] : [];
     })
-    .filter((chip) => chip.names.length > 0);
+    .join(" · ");
 }

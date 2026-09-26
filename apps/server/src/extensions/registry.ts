@@ -55,8 +55,23 @@ const compileMethod = (spec: ExtensionMethodSpec, handler: AnyHandler) => ({
   handler,
 });
 
-export const makeExtensionRegistry = Effect.gen(function* () {
-  const extensions = yield* makeServerExtensions;
+/**
+ * The wire is JSON, and its check rejects an `undefined` anywhere in a result,
+ * which `Schema.optional` fields let a handler return. Encoded output drops
+ * those keys instead of failing the whole call.
+ */
+const withoutUndefined = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(withoutUndefined);
+  if (value === null || typeof value !== "object") return value;
+  const kept: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (inner !== undefined) kept[key] = withoutUndefined(inner);
+  }
+  return kept;
+};
+
+/** Dispatch over `extensions`; exported for tests, the server uses `makeExtensionRegistry`. */
+export const compileExtensions = (extensions: ReadonlyArray<ServerExtension>) => {
   const methods = new Map<string, ReturnType<typeof compileMethod>>();
   for (const extension of extensions) {
     for (const [name, spec] of Object.entries(extension.spec.methods)) {
@@ -78,13 +93,16 @@ export const makeExtensionRegistry = Effect.gen(function* () {
         method.handler(input).pipe(Effect.mapError((failure) => fail(failure.message))),
       ),
       Effect.flatMap((output) =>
-        method
-          .encodeOutput(output)
-          .pipe(Effect.mapError((error) => fail(`Invalid output: ${error.message}`))),
+        method.encodeOutput(output).pipe(
+          Effect.map(withoutUndefined),
+          Effect.mapError((error) => fail(`Invalid output: ${error.message}`)),
+        ),
       ),
       Effect.catchDefect((defect) => Effect.fail(fail(Cause.pretty(Cause.die(defect))))),
     );
   };
 
   return { dispatch } as const;
-});
+};
+
+export const makeExtensionRegistry = Effect.map(makeServerExtensions, compileExtensions);

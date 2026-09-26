@@ -41,6 +41,7 @@ import {
   undeploy,
   writeStoreSkill,
 } from "./deploy.ts";
+import { setAppEnabled } from "./native.ts";
 import { validGithubName, withRepoCheckout } from "./remote.ts";
 import {
   type ManagedSkill,
@@ -769,7 +770,7 @@ const removeRepo = (input: Mutation<"removeRepo">) =>
  */
 export const mutate = Effect.fn("skillsMcp.skills.mutate")(
   function* (input: SkillsMutation) {
-    const { paths } = yield* resolveSkillsPaths;
+    const { paths, clis } = yield* resolveSkillsPaths;
     switch (input.action) {
       case "install":
         return yield* install(paths, input);
@@ -777,6 +778,8 @@ export const mutate = Effect.fn("skillsMcp.skills.mutate")(
         return yield* installZip(paths, input);
       case "setEnabled":
         return yield* setEnabled(paths, input);
+      case "setAppEnabled":
+        return yield* setAppEnabled(clis, input);
       case "uninstall":
         return yield* uninstall(paths, input);
       case "checkUpdates":

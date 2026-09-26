@@ -17,6 +17,7 @@ import * as Result from "effect/Result";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
 import { type AgentCli, withCodexClient } from "../shared/agents.ts";
+import { readClaudeUserSettings, skillsOff } from "../shared/claudeUserSettings.ts";
 import { gatedRead } from "../mcp/probes.ts";
 import { ExtensionFailure, discoverClaudeSkills } from "../shared/t3.ts";
 import { isSymlink, readSkillInfo } from "./archive.ts";
@@ -135,12 +136,21 @@ export const scanClaude = Effect.fn("skillsMcp.skills.scanClaude")(function* (
   // T3's discovery rejects frontmatter Claude Code itself accepts (e.g. an
   // unquoted ": " inside `description`; Claude 2.1.282 still loads and counts
   // those skills in /context), so every folder with a SKILL.md is listed.
+  // Discovery applies `skillOverrides` itself; these folder scans read the
+  // user settings, where the panel's switch writes.
   const loaded = new Set(skills.map((skill) => skill.dir));
-  const lenient = [
+  const off = skillsOff(yield* readClaudeUserSettings(cli));
+  const scanned = [
     ...(yield* scanFolder("claude", paths.appDirs.claude, "user", true, new Set(["synced"]))),
     ...(yield* scanFolder("claude", path.join(cwd, ".claude", "skills"), "project", false)),
   ].filter((skill) => !loaded.has(skill.dir));
-  return [...skills, ...lenient, ...(yield* scanSynced("claude", paths.appDirs.claude))];
+  const synced = yield* scanSynced("claude", paths.appDirs.claude);
+  return [
+    ...skills,
+    ...[...scanned, ...synced].map((skill) =>
+      off.has(skill.name) ? { ...skill, enabled: false } : skill,
+    ),
+  ];
 });
 
 const PLUGIN_SKILL =

@@ -94,7 +94,7 @@ describe("buildRows", () => {
       apps: {
         claude: {
           config: [config("claude", "proj", { scope: "project", spec: undefined })],
-          live: [{ name: "remote", scope: "managed", source: "claude.ai", status: "needs-auth" }],
+          live: [{ name: "remote", scope: "connector", source: "claude.ai", status: "needs-auth" }],
         },
         codex: {
           config: [],
@@ -107,7 +107,7 @@ describe("buildRows", () => {
       [
         ["plugin:plug", undefined, undefined, "failed"],
         ["project:proj", undefined, false, undefined],
-        ["managed:remote", undefined, false, undefined],
+        ["connector:remote", undefined, false, undefined],
       ],
     );
     assert.strictEqual(rows[2]?.apps.claude?.source, "claude.ai");
@@ -237,6 +237,56 @@ describe("buildRows", () => {
       rows.map((row) => row.name),
       ["t3-code", "alpha", "zeta"],
     );
+  });
+});
+
+describe("buildRows with Claude's deniedMcpServers", () => {
+  it("keeps a denied server Claude no longer reports, switched off", () => {
+    // Denied servers drop out of Claude's live status (claude 2.1.283).
+    const rows = buildRows({
+      store: [],
+      apps: { claude: { config: [], live: [] }, codex: EMPTY },
+      claudeDenied: new Set(["claude.ai Gmail", "plugin:vercel:vercel"]),
+    });
+    assert.deepStrictEqual(
+      rows.map((row) => [row.key, row.apps.claude?.scope, row.apps.claude?.source]),
+      [
+        ["connector:claude.ai Gmail", "connector", "claude.ai"],
+        ["plugin:plugin:vercel:vercel", "plugin", "vercel"],
+      ],
+    );
+    for (const row of rows) {
+      assert.include(row.apps.claude, { present: true, enabled: false, status: "disabled" });
+    }
+  });
+
+  it("reports a denied server Claude still runs instead of showing it off", () => {
+    const [row] = buildRows({
+      store: [],
+      apps: {
+        claude: {
+          config: [],
+          live: [{ name: "claude.ai Gmail", scope: "connector", status: "needs-auth" }],
+        },
+        codex: EMPTY,
+      },
+      claudeDenied: new Set(["claude.ai Gmail"]),
+    });
+    assert.include(row?.apps.claude, { enabled: true, status: "needs-auth" });
+    assert.match(row?.apps.claude?.error ?? "", /still loads it/);
+  });
+
+  it("switches off a denied server that is still configured, in Claude only", () => {
+    const [row] = buildRows({
+      store: [],
+      apps: {
+        claude: { config: [config("claude", "xcode", { scope: "project" })], live: [] },
+        codex: { config: [config("codex", "xcode")], live: undefined },
+      },
+      claudeDenied: new Set(["xcode"]),
+    });
+    assert.include(row?.apps.claude, { scope: "project", enabled: false, status: "disabled" });
+    assert.include(row?.apps.codex, { enabled: true });
   });
 });
 

@@ -121,12 +121,12 @@ describe("claudeLiveServer", () => {
     );
   });
 
-  it("maps claude.ai and enterprise servers to managed, anything else to unknown", () => {
+  it("maps claude.ai servers to connectors, enterprise ones to managed, anything else to unknown", () => {
     const of = (scope: string | undefined, status: string) =>
       claudeLiveServer({ name: "s", status, scope, error: "boom" });
     assert.deepStrictEqual(of("claudeai", "needs-auth"), {
       name: "s",
-      scope: "managed",
+      scope: "connector",
       source: "claude.ai",
       status: "needs-auth",
       error: "boom",

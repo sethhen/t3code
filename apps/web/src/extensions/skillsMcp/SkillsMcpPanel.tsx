@@ -1,19 +1,26 @@
 /**
  * Skills & MCP: the MCP servers, skills and plugins Claude Code and Codex
- * load, with what they cost in context and how often they are used.
+ * load, each with a switch per app, and what a new thread starts with.
  */
-import { type ContextOverview, SkillsMcpExtension, type UsageReport } from "@t3tools/contracts";
+import {
+  type ContextOverview,
+  type McpOverview,
+  type PluginsOverview,
+  SkillsMcpExtension,
+  type SkillsOverview,
+} from "@t3tools/contracts";
 import { useCallback, useMemo, useState } from "react";
 
+import { Button } from "~/components/ui/button";
+import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { Toggle, ToggleGroup } from "~/components/ui/toggle-group";
 import { cn } from "~/lib/utils";
 
 import { useExtensionClient } from "../client";
 import type { RightPanelExtensionProps } from "../registry";
-import { ContextStrip } from "./ContextSummary";
-import { type SortMode, contextSummaries, needsUsage } from "./context.logic";
-import type { ListTabProps, ListView, ListViewActions, UsageDays } from "./listControls";
-import { useMcpLogin } from "./login";
+import { ContextFooter } from "./ContextSummary";
+import { contextSummaries } from "./context.logic";
+import { consumeLoginRefresh, useMcpLogin } from "./login";
 import { McpTab } from "./McpTab";
 import { PluginsTab } from "./PluginsTab";
 import { useOverviewLoader } from "./shared";
@@ -32,73 +39,59 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
   const login = useMcpLogin(props);
   const client = useExtensionClient(SkillsMcpExtension, environmentId);
   const [tab, setTab] = useState<Tab>("mcp");
-
-  const [sort, setSort] = useState<SortMode>("status");
-  const [unusedOnly, setUnusedOnly] = useState(false);
-  const [days, setDays] = useState<UsageDays>(7);
-  const [showUsageChoice, setShowUsage] = useState(false);
-  const wantUsage = showUsageChoice || needsUsage(sort, unusedOnly);
-  const view = useMemo<ListView>(
-    () => ({ sort, unusedOnly, days, showUsage: wantUsage }),
-    [sort, unusedOnly, days, wantUsage],
-  );
-  const viewActions = useMemo<ListViewActions>(
-    () => ({ setSort, setUnusedOnly, setDays, setShowUsage }),
-    [],
-  );
-
   const scopeKey = `${environmentId ?? ""}|${cwd ?? ""}`;
+  const cwdInput = cwd ? { cwd } : {};
 
-  // Context cost is measured with the lists (it drives the strip and the row chips).
+  const mcp = useOverviewLoader<McpOverview>({
+    name: "mcp",
+    active: visible && tab === "mcp",
+    key: scopeKey,
+    fetch: (refresh) => {
+      // A login finished in a terminal outside the panel: skip the cached probe.
+      const fresh = consumeLoginRefresh() || refresh;
+      return client.call("mcp.list", { ...cwdInput, ...(fresh ? { refresh: true } : {}) });
+    },
+  });
+  const skills = useOverviewLoader<SkillsOverview>({
+    name: "skills",
+    active: visible && tab === "skills",
+    key: scopeKey,
+    fetch: () => client.call("skills.list", cwdInput),
+  });
+  const plugins = useOverviewLoader<PluginsOverview>({
+    name: "plugins",
+    active: visible && tab === "plugins",
+    key: scopeKey,
+    fetch: () => client.call("plugins.list", cwdInput),
+  });
   const context = useOverviewLoader<ContextOverview>({
     name: "context",
     active: visible,
     key: scopeKey,
     staleMs: 60_000,
     fetch: (refresh) =>
-      client.call("context.get", {
-        ...(cwd ? { cwd } : {}),
-        ...(refresh ? { refresh: true } : {}),
-      }),
-  });
-  // Usage scans session logs, so it only loads once a sort, filter or chip needs it.
-  const usage = useOverviewLoader<UsageReport>({
-    name: "usage",
-    active: visible && wantUsage && tab !== "plugins",
-    key: `${environmentId ?? ""}|${days}`,
-    staleMs: 300_000,
-    fetch: (refresh) => client.call("usage.get", { days, ...(refresh ? { refresh: true } : {}) }),
+      client.call("context.get", { ...cwdInput, ...(refresh ? { refresh: true } : {}) }),
   });
 
+  const lists = { mcp, skills, plugins };
+  const current = lists[tab];
   const summaries = useMemo(() => contextSummaries(context.data), [context.data]);
-  const reloadContext = context.reload;
-  const reloadUsage = usage.reload;
-  const usageLoaded = usage.data !== null;
-  // After a mutation: re-measure in the background; the last numbers stay up meanwhile.
-  const onChanged = useCallback(() => {
-    void reloadContext(false);
-    if (usageLoaded) void reloadUsage(false);
-  }, [reloadContext, reloadUsage, usageLoaded]);
-  const onRefreshContext = useCallback(() => void reloadContext(true), [reloadContext]);
 
-  const listProps = (active: boolean): ListTabProps => ({
-    client,
-    scopeKey,
-    cwd,
-    active,
-    view,
-    viewActions,
-    context: context.data,
-    usage: usage.data,
-    usageLoading: usage.loading,
-    usageError: usage.error,
-    onChanged,
-    onRefreshContext,
-  });
+  // After a switch: re-measure in the background; the last numbers stay up meanwhile.
+  const reloadContext = context.reload;
+  const onChanged = useCallback(() => void reloadContext(true), [reloadContext]);
+  // A plugin brings skills and MCP servers, so those lists are stale too.
+  const reloadMcp = mcp.reload;
+  const reloadSkills = skills.reload;
+  const onPluginChanged = useCallback(() => {
+    void reloadContext(true);
+    void reloadMcp(false);
+    void reloadSkills(false);
+  }, [reloadContext, reloadMcp, reloadSkills]);
 
   return (
     <div className="@container/panel flex h-full min-h-0 flex-col">
-      <div className="flex items-center border-b px-2 py-1.5">
+      <div className="flex items-center gap-1 border-b px-2 py-1.5">
         <ToggleGroup
           aria-label="Show"
           value={[tab]}
@@ -113,24 +106,37 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
             </Toggle>
           ))}
         </ToggleGroup>
+        <span className="flex-1" />
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          aria-label="Refresh"
+          onClick={() => {
+            void current.reload(true);
+            void context.reload(true);
+          }}
+        >
+          <RefreshIcon refreshing={current.loading || context.loading} />
+        </Button>
       </div>
-      <ContextStrip summaries={summaries} loading={context.loading} error={context.error} />
-      {/* Tabs stay mounted so switching keeps their search, filters and loaded data. */}
+      {/* Tabs stay mounted so switching keeps their expanded rows. */}
       <div className={cn("min-h-0 flex-1 flex-col", tab === "mcp" ? "flex" : "hidden")}>
-        <McpTab {...listProps(visible && tab === "mcp")} onLogin={login} />
-      </div>
-      <div className={cn("min-h-0 flex-1 flex-col", tab === "skills" ? "flex" : "hidden")}>
-        <SkillsTab {...listProps(visible && tab === "skills")} />
-      </div>
-      <div className={cn("min-h-0 flex-1 flex-col", tab === "plugins" ? "flex" : "hidden")}>
-        <PluginsTab
+        <McpTab
           client={client}
-          scopeKey={scopeKey}
           cwd={cwd}
-          active={visible && tab === "plugins"}
+          list={mcp}
+          context={context.data}
           onChanged={onChanged}
+          onLogin={login}
         />
       </div>
+      <div className={cn("min-h-0 flex-1 flex-col", tab === "skills" ? "flex" : "hidden")}>
+        <SkillsTab client={client} list={skills} onChanged={onChanged} />
+      </div>
+      <div className={cn("min-h-0 flex-1 flex-col", tab === "plugins" ? "flex" : "hidden")}>
+        <PluginsTab client={client} list={plugins} onChanged={onPluginChanged} />
+      </div>
+      <ContextFooter summaries={summaries} loading={context.loading} error={context.error} />
     </div>
   );
 }

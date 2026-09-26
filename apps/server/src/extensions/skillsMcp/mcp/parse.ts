@@ -173,7 +173,12 @@ const CLAUDE_STATUSES: Readonly<Record<string, McpLiveStatus>> = {
  */
 const CLAUDE_PLUGIN_SERVER = /^plugin:([^:]+):./;
 
-const claudeScope = (status: ClaudeServerStatus): { scope: McpScope; source?: string } => {
+/** Where Claude says a server comes from; exported for rows Claude no longer reports (denied). */
+export const claudeScope = (status: {
+  readonly name: string;
+  readonly scope?: string | undefined;
+  readonly source?: string | undefined;
+}): { scope: McpScope; source?: string } => {
   const plugin = CLAUDE_PLUGIN_SERVER.exec(status.name)?.[1];
   if (status.source === "plugin" || (status.source === undefined && plugin)) {
     return plugin ? { scope: "plugin", source: plugin } : { scope: "plugin" };
@@ -186,7 +191,7 @@ const claudeScope = (status: ClaudeServerStatus): { scope: McpScope; source?: st
     case "managed":
       return { scope: status.scope };
     case "claudeai":
-      return { scope: "managed", source: "claude.ai" };
+      return { scope: "connector", source: "claude.ai" };
     case "enterprise":
       return { scope: "managed", source: "enterprise" };
     default:

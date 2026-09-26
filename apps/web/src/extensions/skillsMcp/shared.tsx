@@ -5,27 +5,9 @@
  */
 import type { AgentApp, AgentAppInfo, MutationResult, SkillsMcpMethods } from "@t3tools/contracts";
 import { AlertCircleIcon, RefreshCwIcon } from "lucide-react";
-import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { type ReactNode, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
-import {
-  AlertDialog,
-  AlertDialogClose,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogPopup,
-  AlertDialogTitle,
-} from "~/components/ui/alert-dialog";
-import { Checkbox } from "~/components/ui/checkbox";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "~/components/ui/empty";
 import { Spinner } from "~/components/ui/spinner";
 import { Switch } from "~/components/ui/switch";
@@ -34,13 +16,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 
 import type { ExtensionCallOutcome, ExtensionClient } from "../client";
-import {
-  APP_LABEL,
-  APPS,
-  appUnavailableReason,
-  formatRelativeTime,
-  type StatusTone,
-} from "./lists.logic";
+import { APP_LABEL, APPS, appUnavailableReason, type StatusTone } from "./lists.logic";
 export { type OverviewState, useOverviewLoader } from "./overviewStore";
 
 export type SkillsMcpClient = ExtensionClient<SkillsMcpMethods>;
@@ -60,21 +36,6 @@ export function visibleApps(
       apps?.some((info) => info.app === app && info.available) ||
       rows.some((row) => row.apps[app]?.present),
   );
-}
-
-/** Dialog state; the key remounts the dialog so each opening starts fresh. */
-export interface Opened<Value> {
-  readonly key: number;
-  readonly open: boolean;
-  readonly value: Value;
-}
-
-export function reopen<Value>(previous: Opened<Value> | null, value: Value): Opened<Value> {
-  return { key: (previous?.key ?? 0) + 1, open: true, value };
-}
-
-export function closed<Value>(previous: Opened<Value> | null): Opened<Value> | null {
-  return previous ? { ...previous, open: false } : null;
 }
 
 /**
@@ -265,7 +226,7 @@ function failureLines(result: MutationResult): string {
  * Toasts the outcome of a mutation. Returns true only when the call went
  * through with no per-app failures.
  */
-export function reportMutation(outcome: Outcome<MutationResult>, labels: MutationLabels): boolean {
+function reportMutation(outcome: Outcome<MutationResult>, labels: MutationLabels): boolean {
   if (!outcome.ok) {
     toastManager.add({ type: "error", title: labels.failure, description: outcome.message });
     return false;
@@ -330,6 +291,7 @@ export function WithReason({ reason, children }: { reason: string | null; childr
   );
 }
 
+/** One app's switch; the list's column header names the app. */
 export function AppSwitch(props: {
   app: AgentApp;
   checked: boolean;
@@ -338,14 +300,11 @@ export function AppSwitch(props: {
   busy: boolean;
   onCheckedChange: (checked: boolean) => void;
   subject: string;
-  /** Hide the visible app name (the list has a column header instead). */
-  compact?: boolean;
 }) {
   const label = `${props.checked ? "Disable" : "Enable"} ${props.subject} for ${APP_LABEL[props.app]}`;
   return (
     <WithReason reason={props.blockedReason}>
-      <label className="inline-flex items-center gap-1 text-[.7rem] text-muted-foreground">
-        {props.compact ? null : <span>{APP_LABEL[props.app]}</span>}
+      <label className="inline-flex items-center">
         <Switch
           aria-label={label}
           size="sm"
@@ -355,93 +314,6 @@ export function AppSwitch(props: {
         />
       </label>
     </WithReason>
-  );
-}
-
-/** Read-only on/off for rows T3 does not manage; the tooltip says where the entry lives. */
-export function AppState(props: { app: AgentApp; enabled: boolean; origin: string | null }) {
-  return (
-    <WithReason reason={props.origin}>
-      <span
-        aria-label={`${APP_LABEL[props.app]} ${props.enabled ? "on" : "off"}`}
-        className="inline-flex items-center gap-1 text-[.65rem] text-muted-foreground"
-      >
-        <StatusDot tone={props.enabled ? "success" : "muted"} />
-        {props.enabled ? "on" : "off"}
-      </span>
-    </WithReason>
-  );
-}
-
-/** Claude/Codex checkboxes for install/adopt/add flows. */
-export function AppCheckboxes(props: {
-  value: { readonly claude: boolean; readonly codex: boolean };
-  onChange: (next: { claude: boolean; codex: boolean }) => void;
-  apps?: readonly AgentAppInfo[];
-  /** Per-app reason the box is locked (e.g. Codex has no SSE). */
-  blocked?: Partial<Record<AgentApp, string | null>>;
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-3">
-      {APPS.map((app) => {
-        const reason =
-          props.blocked?.[app] ?? (props.apps ? appUnavailableReason(props.apps, app) : null);
-        return (
-          <WithReason key={app} reason={reason}>
-            <label
-              className={cn(
-                "inline-flex items-center gap-1.5 text-xs",
-                reason ? "text-muted-foreground" : "text-foreground",
-              )}
-            >
-              <Checkbox
-                checked={props.value[app] && !reason}
-                disabled={reason !== null}
-                onCheckedChange={(checked) =>
-                  props.onChange({ ...props.value, [app]: checked === true })
-                }
-              />
-              {APP_LABEL[app]}
-            </label>
-          </WithReason>
-        );
-      })}
-    </div>
-  );
-}
-
-export function ConfirmDialog(props: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  title: string;
-  description: ReactNode;
-  confirmLabel: string;
-  onConfirm: () => void;
-}) {
-  return (
-    <AlertDialog open={props.open} onOpenChange={props.onOpenChange}>
-      <AlertDialogPopup>
-        <AlertDialogHeader>
-          <AlertDialogTitle>{props.title}</AlertDialogTitle>
-          <AlertDialogDescription>{props.description}</AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogClose render={<Button variant="outline" size="sm" />}>
-            Cancel
-          </AlertDialogClose>
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={() => {
-              props.onOpenChange(false);
-              props.onConfirm();
-            }}
-          >
-            {props.confirmLabel}
-          </Button>
-        </AlertDialogFooter>
-      </AlertDialogPopup>
-    </AlertDialog>
   );
 }
 
@@ -512,25 +384,6 @@ export function EmptyState(props: {
       </EmptyHeader>
       {props.children}
     </Empty>
-  );
-}
-
-/** "checked 12 s ago", re-rendered every 5 s only while visible. */
-export function CheckedAgo({ iso, visible }: { iso: string | null; visible: boolean }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!visible || iso === null) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 5_000);
-    return () => window.clearInterval(timer);
-  }, [visible, iso]);
-  if (iso === null) return null;
-  const relative = formatRelativeTime(iso, now);
-  if (relative === null) return null;
-  return (
-    <span className="shrink-0 whitespace-nowrap text-[.7rem] text-muted-foreground tabular-nums">
-      checked {relative}
-    </span>
   );
 }
 

@@ -7,7 +7,7 @@ import {
   codexModelConfig,
   codexSkillCosts,
   codexToolTokens,
-  codexWindowFrom,
+  codexModelFrom,
   estimateTokens,
 } from "./codexContext.ts";
 
@@ -138,48 +138,82 @@ describe("codex model window", () => {
   });
 
   it("keeps Codex's reserve: 95% unless the catalog says otherwise", () => {
-    assert.strictEqual(codexWindowFrom(catalog, "model-a"), 190_000);
-    assert.strictEqual(codexWindowFrom(catalog, "model-b"), 90_000);
-    assert.strictEqual(codexWindowFrom(catalog, "model-a", 100_000), 95_000);
-    assert.strictEqual(codexWindowFrom(catalog, "unknown"), undefined);
-    assert.strictEqual(codexWindowFrom({}, "model-a"), undefined);
+    const window = (model: string, override?: number) =>
+      codexModelFrom(catalog, model, override)?.windowTokens;
+    assert.strictEqual(window("model-a"), 190_000);
+    assert.strictEqual(window("model-b"), 90_000);
+    assert.strictEqual(window("model-a", 100_000), 95_000);
+    assert.strictEqual(codexModelFrom(catalog, "unknown"), undefined);
+    assert.strictEqual(codexModelFrom({}, "model-a"), undefined);
+  });
+
+  it("sizes the system prompt, and without a model uses the catalog's default", () => {
+    const prompts = {
+      models: [
+        { slug: "later", priority: 2, visibility: "list", base_instructions: "x".repeat(40) },
+        {
+          slug: "first",
+          priority: 1,
+          visibility: "list",
+          context_window: 272_000,
+          model_messages: { instructions_template: "y".repeat(400) },
+        },
+        { slug: "hidden", priority: 0, visibility: "hide" },
+      ],
+    };
+    assert.deepStrictEqual(codexModelFrom(prompts, undefined), {
+      model: "first",
+      windowTokens: 258_400,
+      instructionsTokens: 100,
+    });
+    assert.deepStrictEqual(codexModelFrom(prompts, "later"), {
+      model: "later",
+      instructionsTokens: 10,
+    });
   });
 });
 
 describe("codexAppContextFrom", () => {
-  it("adds MCP tools and skills into an estimated baseline, with no free space", () => {
+  it("adds the system prompt, AGENTS.md, MCP tools and skills into an estimated baseline", () => {
     const statuses = [server("docs", { mcp__docs__search: tool("search", "Search", SCHEMA) })];
     const skills = [{ name: "alpha", tokens: 30 }];
+    const memoryFiles = [{ path: "/repo/AGENTS.md", tokens: 200 }];
     const context = codexAppContextFrom({
       model: "model-a",
-      windowTokens: 1_000,
+      windowTokens: 10_000,
+      instructionsTokens: 500,
+      memoryFiles,
       statuses,
       skills,
       errors: [undefined],
     });
     const mcpTokens = codexToolTokens("mcp__docs__search", statuses[0]!.tools.mcp__docs__search!);
+    const baseline = 500 + 200 + mcpTokens + 30;
     assert.strictEqual(context.exact, false);
-    assert.match(context.note ?? "", /MCP tools and skills only/);
     assert.strictEqual(context.model, "model-a");
-    assert.strictEqual(context.windowTokens, 1_000);
-    assert.strictEqual(context.baselineTokens, mcpTokens + 30);
+    assert.strictEqual(context.windowTokens, 10_000);
+    assert.strictEqual(context.baselineTokens, baseline);
     assert.deepStrictEqual(context.categories, [
+      { name: "System prompt", tokens: 500, kind: "used" },
+      { name: "Memory files", tokens: 200, kind: "used" },
       { name: "MCP tools", tokens: mcpTokens, kind: "used" },
       { name: "Skills", tokens: 30, kind: "used" },
+      { name: "Free space", tokens: 10_000 - baseline, kind: "free" },
     ]);
+    assert.deepStrictEqual(context.memoryFiles, memoryFiles);
     assert.deepStrictEqual(context.skills, skills);
     assert.strictEqual(context.error, undefined);
   });
 
-  it("joins the errors and omits an unknown window", () => {
+  it("joins the errors", () => {
     const context = codexAppContextFrom({
+      windowTokens: 258_400,
+      memoryFiles: [],
       statuses: [],
       skills: [],
       errors: ["MCP status failed", undefined, "Skills: timed out"],
     });
-    assert.strictEqual(context.windowTokens, undefined);
     assert.strictEqual(context.baselineTokens, 0);
-    assert.strictEqual(context.categories.length, 2);
     assert.strictEqual(context.error, "MCP status failed; Skills: timed out");
   });
 });

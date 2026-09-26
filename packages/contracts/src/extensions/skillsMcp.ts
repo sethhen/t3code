@@ -4,13 +4,16 @@
  *
  * Reads come from the agents themselves (Claude Agent SDK `mcpServerStatus()`,
  * Codex app-server `mcpServerStatus/list` and `skills/list`) plus the config
- * files they own. Writes go through each agent's own CLI or app-server so the
- * fork never hand-edits `~/.claude.json` or `~/.codex/config.toml`.
+ * files they own. Writes go through each agent's own CLI or app-server, except
+ * the two switches Claude only has as settings (`deniedMcpServers`,
+ * `skillOverrides` in its user `settings.json`); nothing hand-edits
+ * `~/.claude.json` or `~/.codex/config.toml`.
  *
- * Management follows CC Switch's model: the fork keeps one store of
- * user-scoped servers and skills with a per-app enabled flag, and projects it
- * into each app. Disabling a server for an app removes it from that app's live
- * config while the store keeps its definition, so it can be re-enabled.
+ * User-scope MCP servers follow CC Switch's model: the fork keeps them in one
+ * store with a per-app enabled flag and projects it into each app. Disabling a
+ * server for an app removes it from that app's live config while the store
+ * keeps its definition, so it can be re-enabled. Everything else is switched
+ * with the app's own setting.
  */
 import * as Schema from "effect/Schema";
 
@@ -98,13 +101,15 @@ export type McpLiveStatus = typeof McpLiveStatus.Type;
 /**
  * Where the definition lives. `user` is the only scope the store manages;
  * `project`/`local` are Claude's per-directory scopes, `plugin` comes from an
- * installed plugin, `managed` from admin policy, `builtin` is T3's own server.
+ * installed plugin, `connector` is a claude.ai connector, `managed` comes from
+ * admin policy, `builtin` is T3's own server.
  */
 export const McpScope = Schema.Literals([
   "user",
   "project",
   "local",
   "plugin",
+  "connector",
   "managed",
   "builtin",
   "unknown",
@@ -195,12 +200,17 @@ export const McpMutation = Schema.Union([
   Schema.Struct({ action: Schema.Literal("delete"), id: Schema.String }),
   /** Adopt every user-scope server found in either app into the store (never writes app config). */
   Schema.Struct({ action: Schema.Literal("import") }),
-  /** Claude only: enable/disable a server for one project directory (Claude's own per-project toggle). */
+  /**
+   * Claude only, for servers the store does not hold (claude.ai connectors,
+   * plugin, project and local servers): off adds the name to Claude's
+   * `deniedMcpServers`, so it stays off in every project; on removes it and
+   * clears Claude's per-project toggle for `cwd`.
+   */
   Schema.Struct({
-    action: Schema.Literal("setProjectEnabled"),
+    action: Schema.Literal("setClaudeEnabled"),
     name: Schema.String,
-    cwd: Schema.String,
     enabled: Schema.Boolean,
+    cwd: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     action: Schema.Literal("reconnect"),
@@ -349,6 +359,18 @@ export const SkillsMutation = Schema.Union([
     app: AgentApp,
     enabled: Schema.Boolean,
   }),
+  /**
+   * A skill the store does not manage, switched with the app's own setting:
+   * Claude's `skillOverrides` (by name), Codex's `skills/config/write` (by the
+   * skill folder `path`).
+   */
+  Schema.Struct({
+    action: Schema.Literal("setAppEnabled"),
+    app: AgentApp,
+    name: Schema.String,
+    path: Schema.optional(Schema.String),
+    enabled: Schema.Boolean,
+  }),
   /** Backs the skill up first; restore with `restoreBackup`. */
   Schema.Struct({ action: Schema.Literal("uninstall"), id: Schema.String }),
   Schema.Struct({ action: Schema.Literal("checkUpdates") }),
@@ -442,7 +464,7 @@ export type McpContextCost = typeof McpContextCost.Type;
 export const AppContext = Schema.Struct({
   /** True only when measured with the provider's token counter; local estimates (both apps today) are false. */
   exact: Schema.Boolean,
-  /** What an estimate covers, e.g. Codex: "MCP tools and skills only". */
+  /** What an estimate leaves out, e.g. Codex: its built-in tools. */
   note: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
   windowTokens: Schema.optional(Schema.Number),

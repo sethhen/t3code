@@ -1,23 +1,26 @@
 /**
  * `mcp.list` / `mcp.mutate` / `mcp.presets`: one panel over Claude Code's and
- * Codex's MCP servers. The store (`store.ts`) holds the user-scope servers the
- * panel manages with a desired per-app flag; each app's own config stays the
- * source of truth for what loads, and every write goes through the app's own
- * CLI or app-server. One app failing never hides the other: list errors land in
- * `liveProbe`, mutation errors come back as `failures`.
+ * Codex's MCP servers. The store (`store.ts`) holds every user-scope server
+ * with a desired per-app flag (lists keep it in step with the apps' configs);
+ * each app's own config stays the source of truth for what loads, and every
+ * write goes through the app's own CLI or app-server. Claude's other servers
+ * (claude.ai connectors, plugin and project servers) are switched with its
+ * `deniedMcpServers` setting. One app failing never hides the other: list
+ * errors land in `liveProbe`, mutation errors come back as `failures`.
  */
 import * as NodeCrypto from "node:crypto";
 import * as NodeOS from "node:os";
 
-import type {
-  AgentApp,
-  AgentAppInfo,
-  LiveProbeState,
-  McpMutation,
-  McpOverview,
-  McpPreset,
-  McpServerSpec,
-  MutationResult,
+import {
+  AGENT_APPS,
+  type AgentApp,
+  type AgentAppInfo,
+  type LiveProbeState,
+  type McpMutation,
+  type McpOverview,
+  type McpPreset,
+  type McpServerSpec,
+  type MutationResult,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -26,6 +29,12 @@ import * as Semaphore from "effect/Semaphore";
 
 import type { SkillsMcpServices } from "../index.ts";
 import { type AgentCli, agentAppInfo, resolveAgentClis } from "../shared/agents.ts";
+import {
+  deniedServerNames,
+  readClaudeUserSettings,
+  updateClaudeUserSettings,
+  withDeniedServer,
+} from "../shared/claudeUserSettings.ts";
 import { ExtensionFailure, ServerSettingsService } from "../shared/t3.ts";
 import { BUILTIN_SERVER_NAME, type BuiltinAccess, builtinRow } from "./builtin.ts";
 import {
@@ -171,6 +180,44 @@ export const adoptUserServers = (
   return { servers: [...existing, ...added], added: added.length };
 };
 
+/** Each app's config as read by a list; undefined for an app whose config was not read. */
+export type ListedConfigs = Readonly<Record<AgentApp, ReadonlyArray<ConfigServer> | undefined>>;
+
+/**
+ * A stored server that every app it is switched on in no longer has. The
+ * panel's own writes are verified, so it was removed with the app's own CLI
+ * and the store lets it go. A server switched off everywhere is kept: it is
+ * absent from both configs on purpose.
+ */
+const removedEverywhere = (server: StoredMcpServer, configs: ListedConfigs) => {
+  const on = AGENT_APPS.filter((app) => server.apps[app]);
+  return (
+    on.length > 0 &&
+    on.every((app) =>
+      configs[app]?.every((found) => found.name !== server.name || !isUserScope(found)),
+    )
+  );
+};
+
+/**
+ * The store a list leaves behind: user servers either app has that it lacks
+ * are adopted, so every one of them can be switched here, and servers removed
+ * elsewhere are dropped.
+ */
+export const reconcileUserServers = (
+  existing: ReadonlyArray<StoredMcpServer>,
+  configs: ListedConfigs,
+  newId: () => string,
+): { readonly servers: ReadonlyArray<StoredMcpServer>; readonly changed: boolean } => {
+  const kept = existing.filter((server) => !removedEverywhere(server, configs));
+  const { servers, added } = adoptUserServers(
+    kept,
+    { claude: configs.claude ?? [], codex: configs.codex ?? [] },
+    newId,
+  );
+  return { servers, changed: added > 0 || kept.length < existing.length };
+};
+
 const importInto = (current: McpStore, configs: Record<AgentApp, ReadonlyArray<ConfigServer>>) =>
   Effect.map(nowIso, (importedAt) => {
     const { servers, added } = adoptUserServers(current.servers, configs, () =>
@@ -185,8 +232,10 @@ const importInto = (current: McpStore, configs: Record<AgentApp, ReadonlyArray<C
 interface AppListing {
   readonly snapshot: AppSnapshot;
   readonly probe: LiveProbeState;
-  /** Whether the app's config was read, so an auto-import sees everything. */
+  /** Whether the app's config was read, so the store is reconciled against all of it. */
   readonly configRead: boolean;
+  /** Claude only: names its `deniedMcpServers` switches off. */
+  readonly denied?: ReadonlySet<string>;
 }
 
 const unavailableListing = (info: AgentAppInfo): AppListing => ({
@@ -195,17 +244,29 @@ const unavailableListing = (info: AgentAppInfo): AppListing => ({
   configRead: false,
 });
 
+/**
+ * Bumped by every write. A list reconciles the store only when no write ran
+ * since it read the configs, so it never adopts a server a write just deleted
+ * or drops one a write just added.
+ */
+let writeGeneration = 0;
+
 const listClaude = Effect.fn("skillsMcp.mcp.listClaude")(function* (
   cli: AgentCli,
   cwd: string,
   refresh: boolean,
 ) {
-  const [config, probe] = yield* Effect.all(
-    [readClaudeConfig(cli, cwd), probeClaudeStatuses(cli, cwd, { refresh })],
-    { concurrency: 2 },
+  const [config, probe, settings] = yield* Effect.all(
+    [
+      readClaudeConfig(cli, cwd),
+      probeClaudeStatuses(cli, cwd, { refresh }),
+      readClaudeUserSettings(cli),
+    ],
+    { concurrency: 3 },
   );
   return {
     snapshot: { config, live: probe.error ? undefined : probe.statuses.map(claudeLiveServer) },
+    denied: deniedServerNames(settings),
     probe: {
       ok: !probe.error,
       ...(probe.error ? { error: probe.error } : {}),
@@ -260,6 +321,7 @@ const listMcpEffect = Effect.fn("skillsMcp.mcp.list")(function* (input: {
 }) {
   const cwd = homeCwd(input.cwd);
   const refresh = input.refresh ?? false;
+  const generation = writeGeneration;
   const { claude, codex } = yield* resolveAgentClis;
   const [claudeInfo, codexInfo] = yield* Effect.all([agentAppInfo(claude), agentAppInfo(codex)], {
     concurrency: 2,
@@ -276,26 +338,31 @@ const listMcpEffect = Effect.fn("skillsMcp.mcp.list")(function* (input: {
     { concurrency: 2 },
   );
 
-  // The first list adopts the apps' user servers, once every available app's
-  // config was read (a failed read retries on the next list).
+  // Reconciled once every available app's config was read (a failed read
+  // retries on the next list); an unavailable app keeps its servers.
   const available = [
     { info: claudeInfo, listing: claudeListing },
     { info: codexInfo, listing: codexListing },
   ].filter((app) => app.info.available);
-  const canImport = available.length > 0 && available.every((app) => app.listing.configRead);
+  const canReconcile = available.length > 0 && available.every((app) => app.listing.configRead);
+  const configs: ListedConfigs = {
+    claude: claudeInfo.available ? claudeListing.snapshot.config : undefined,
+    codex: codexInfo.available ? codexListing.snapshot.config : undefined,
+  };
+  const newId = () => NodeCrypto.randomUUID();
   const current = yield* mcpStore.read;
   const store =
-    current.importedAt === undefined && canImport
-      ? yield* mcpStore.update((latest) =>
-          latest.importedAt !== undefined
-            ? Effect.succeed([latest, latest] as const)
-            : Effect.map(
-                importInto(latest, {
-                  claude: claudeListing.snapshot.config,
-                  codex: codexListing.snapshot.config,
-                }),
-                ([, next]) => [next, next] as const,
-              ),
+    canReconcile && reconcileUserServers(current.servers, configs, newId).changed
+      ? yield* mutationLock.withPermit(
+          mcpStore.update((latest) =>
+            Effect.gen(function* () {
+              if (generation !== writeGeneration) return [latest, latest] as const;
+              const { servers, changed } = reconcileUserServers(latest.servers, configs, newId);
+              if (!changed) return [latest, latest] as const;
+              const next = { ...latest, importedAt: yield* nowIso, servers };
+              return [next, next] as const;
+            }),
+          ),
         )
       : current;
 
@@ -304,6 +371,7 @@ const listMcpEffect = Effect.fn("skillsMcp.mcp.list")(function* (input: {
     servers: buildRows({
       store: store.servers,
       apps: { claude: claudeListing.snapshot, codex: codexListing.snapshot },
+      claudeDenied: claudeListing.denied,
       builtin: builtinRow(yield* builtinAccess),
     }),
     liveProbe: { claude: claudeListing.probe, codex: codexListing.probe },
@@ -597,11 +665,17 @@ const disableClaude = Effect.fn("skillsMcp.mcp.disableClaude")(function* (
   yield* claudeRemoveUser(cli, server.name);
 });
 
-/** Re-adds the stashed entry (else one built from the spec); an existing entry is kept. */
+/**
+ * Re-adds the stashed entry (else one built from the spec); an existing entry
+ * is kept. A `deniedMcpServers` entry for the name would keep it off, so it goes.
+ */
 const enableClaude = Effect.fn("skillsMcp.mcp.enableClaude")(function* (
   cli: AgentCli,
   server: StoredMcpServer,
 ) {
+  yield* updateClaudeUserSettings(cli, (settings) =>
+    withDeniedServer(settings, server.name, false),
+  );
   if (yield* readClaudeUserEntry(cli, server.name)) return;
   yield* claudeAddUser(
     cli,
@@ -658,6 +732,38 @@ const setEnabled = Effect.fn("skillsMcp.mcp.setEnabled")(function* (
   return {
     failures,
     message: `${input.enabled ? "Enabled" : "Disabled"} ${server.name} in ${APP_LABELS[input.app]}`,
+  } satisfies MutationResult;
+});
+
+/**
+ * Claude's switch for a server the store does not hold: `deniedMcpServers`
+ * keeps it off in every project. Switching on also clears Claude's own
+ * per-project toggle for `cwd`, the only off switch Claude offers in `/mcp`.
+ */
+const setClaudeEnabled = Effect.fn("skillsMcp.mcp.setClaudeEnabled")(function* (
+  clis: Clis,
+  input: Extract<McpMutation, { readonly action: "setClaudeEnabled" }>,
+) {
+  if (input.name === BUILTIN_SERVER_NAME) {
+    return yield* new ExtensionFailure({
+      message: `${BUILTIN_SERVER_NAME} is T3 Code's own server`,
+    });
+  }
+  const failures = yield* forApp(clis, "claude", input.enabled, (cli) =>
+    Effect.gen(function* () {
+      yield* updateClaudeUserSettings(cli, (settings) =>
+        withDeniedServer(settings, input.name, !input.enabled),
+      );
+      if (!input.enabled || input.cwd === undefined) return;
+      const config = yield* readClaudeConfig(cli, input.cwd);
+      if (config.some((server) => server.name === input.name && server.disabled)) {
+        yield* claudeSetProjectEnabled(cli, input.cwd, input.name, true);
+      }
+    }),
+  );
+  return {
+    failures,
+    message: `${input.enabled ? "Enabled" : "Disabled"} ${input.name} in ${APP_LABELS.claude}`,
   } satisfies MutationResult;
 });
 
@@ -777,7 +883,12 @@ const reconnect = Effect.fn("skillsMcp.mcp.reconnect")(function* (
  */
 const exclusiveWrite = <A, E, R>(apps: ReadonlyArray<AgentApp>, effect: Effect.Effect<A, E, R>) =>
   mutationLock
-    .withPermit(withAgentWrite(apps, effect))
+    .withPermit(
+      Effect.suspend(() => {
+        writeGeneration += 1;
+        return withAgentWrite(apps, effect);
+      }),
+    )
     .pipe(Effect.ensuring(invalidateAgentProbes));
 
 const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpMutation) {
@@ -791,18 +902,8 @@ const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpM
       return yield* exclusiveWrite(["claude", "codex"], deleteServer(clis, input.id));
     case "import":
       return yield* exclusiveWrite([], importServers(clis));
-    case "setProjectEnabled":
-      return yield* exclusiveWrite(
-        ["claude"],
-        forApp(clis, "claude", true, (cli) =>
-          claudeSetProjectEnabled(cli, input.cwd, input.name, input.enabled),
-        ).pipe(
-          Effect.map((failures): MutationResult => ({
-            failures,
-            message: `${input.enabled ? "Enabled" : "Disabled"} ${input.name} for this project`,
-          })),
-        ),
-      );
+    case "setClaudeEnabled":
+      return yield* exclusiveWrite(["claude"], setClaudeEnabled(clis, input));
     case "reconnect":
       return yield* reconnect(clis, input);
   }

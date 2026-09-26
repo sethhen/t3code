@@ -10,7 +10,7 @@ import {
   type McpServerRow,
 } from "@t3tools/contracts";
 
-import type { ConfigServer, LiveServer } from "./parse.ts";
+import { claudeScope, type ConfigServer, type LiveServer } from "./parse.ts";
 import type { StoredMcpServer } from "./store.ts";
 
 export interface AppSnapshot {
@@ -108,6 +108,28 @@ const managedEntry = (
   };
 };
 
+/**
+ * Claude's entry for a name its `deniedMcpServers` lists. Claude drops denied
+ * servers from its live status, so a name it no longer reports anywhere (a
+ * claude.ai connector, a plugin's server) keeps an "off" entry: without it the
+ * server could never be switched back on.
+ */
+const deniedEntry = (name: string, observed: McpAppEntry | undefined): McpAppEntry => {
+  if (observed) return { ...observed, enabled: false, status: "disabled" };
+  const { scope, source } = claudeScope({
+    name,
+    scope: name.startsWith("claude.ai ") ? "claudeai" : undefined,
+  });
+  return {
+    present: true,
+    enabled: false,
+    scope,
+    ...(source ? { source } : {}),
+    status: "disabled",
+    editable: false,
+  };
+};
+
 const byNameThenKey = (a: McpServerRow, b: McpServerRow) =>
   Number(b.builtin) - Number(a.builtin) ||
   a.name.localeCompare(b.name) ||
@@ -116,6 +138,8 @@ const byNameThenKey = (a: McpServerRow, b: McpServerRow) =>
 export interface BuildRowsInput {
   readonly store: ReadonlyArray<StoredMcpServer>;
   readonly apps: Readonly<Record<AgentApp, AppSnapshot>>;
+  /** Names in Claude's `deniedMcpServers`: off in Claude everywhere. */
+  readonly claudeDenied?: ReadonlySet<string> | undefined;
   readonly builtin?: McpServerRow | undefined;
 }
 
@@ -127,11 +151,21 @@ export interface BuildRowsInput {
 export const buildRows = (input: BuildRowsInput): ReadonlyArray<McpServerRow> => {
   const views = { claude: viewOf(input.apps.claude), codex: viewOf(input.apps.codex) };
   const rows: McpServerRow[] = input.builtin ? [input.builtin] : [];
+  const denied = input.claudeDenied ?? new Set<string>();
+  const claudeEntry = (name: string, entry: McpAppEntry | undefined) => {
+    if (!denied.has(name)) return entry;
+    // Claude still running a denied server means the deny did not take: say so, never "off".
+    const live = views.claude.live?.get(name)?.status;
+    if (entry && live && live !== "disabled" && live !== "unknown") {
+      return { ...entry, error: "Claude Code still loads it despite deniedMcpServers" };
+    }
+    return deniedEntry(name, entry);
+  };
 
   const managedNames = new Set<string>();
   for (const server of input.store) {
     managedNames.add(server.name);
-    const claude = managedEntry("claude", views.claude, server);
+    const claude = claudeEntry(server.name, managedEntry("claude", views.claude, server));
     const codex = managedEntry("codex", views.codex, server);
     rows.push({
       key: server.id,
@@ -147,14 +181,14 @@ export const buildRows = (input: BuildRowsInput): ReadonlyArray<McpServerRow> =>
     });
   }
 
-  const names = new Set<string>();
+  const names = new Set<string>(denied);
   for (const app of AGENT_APPS) {
     for (const name of views[app].config.keys()) names.add(name);
     for (const name of views[app].live?.keys() ?? []) names.add(name);
   }
   for (const name of names) {
     if (managedNames.has(name)) continue;
-    const claude = observedEntry(views.claude, name);
+    const claude = claudeEntry(name, observedEntry(views.claude, name));
     const codex = observedEntry(views.codex, name);
     const spec = views.claude.config.get(name)?.spec ?? views.codex.config.get(name)?.spec;
     rows.push({

@@ -1,7 +1,7 @@
 import type { AgentApp } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
-import { adoptUserServers, codexWriteHeld } from "./index.ts";
+import { adoptUserServers, codexWriteHeld, reconcileUserServers } from "./index.ts";
 import type { ConfigServer } from "./parse.ts";
 import { makeMcpPresets } from "./presets.ts";
 import { specFromClaude, specFromCodex } from "./spec.ts";
@@ -39,6 +39,67 @@ const adopt = (
     { claude: configs.claude ?? [], codex: configs.codex ?? [] },
     sequentialIds(),
   );
+
+describe("reconcileUserServers", () => {
+  const node = { type: "stdio", command: "node" } as const;
+  const stored = (name: string, apps: StoredMcpServer["apps"]): StoredMcpServer => ({
+    id: `stored-${name}`,
+    name,
+    spec: node,
+    apps,
+    tags: [],
+  });
+
+  it("adopts a user server added after the first list", () => {
+    const { servers, changed } = reconcileUserServers(
+      [stored("old", { claude: true, codex: true })],
+      {
+        claude: [claude("old", node), claude("mixpanel", node)],
+        codex: [codex("old", { command: "node" })],
+      },
+      sequentialIds(),
+    );
+    assert.isTrue(changed);
+    assert.deepStrictEqual(
+      servers.map((server) => [server.name, server.apps]),
+      [
+        ["old", { claude: true, codex: true }],
+        ["mixpanel", { claude: true, codex: false }],
+      ],
+    );
+  });
+
+  it("drops a server removed with the CLI from every app it was on in", () => {
+    const { servers, changed } = reconcileUserServers(
+      [
+        stored("gone", { claude: true, codex: true }),
+        stored("half", { claude: true, codex: true }),
+      ],
+      { claude: [claude("half", node)], codex: [] },
+      sequentialIds(),
+    );
+    assert.isTrue(changed);
+    // `half` lost only its Codex entry: it stays, so the panel can restore it.
+    assert.deepStrictEqual(
+      servers.map((server) => server.name),
+      ["half"],
+    );
+  });
+
+  it("keeps servers switched off everywhere and those in an app it could not read", () => {
+    const existing = [
+      stored("off", { claude: false, codex: false }),
+      stored("codexOnly", { claude: false, codex: true }),
+    ];
+    const { servers, changed } = reconcileUserServers(
+      existing,
+      { claude: [], codex: undefined },
+      sequentialIds(),
+    );
+    assert.isFalse(changed);
+    assert.deepStrictEqual(servers, existing);
+  });
+});
 
 describe("adoptUserServers", () => {
   it("adopts user servers from either app, one entry per name", () => {
