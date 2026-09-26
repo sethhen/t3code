@@ -47,7 +47,8 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
-  restart into the new version.
+  restart into the new version. Keep Settings → **Update track** on **Stable** (the default):
+  on Nightly the app ignores fork releases.
 - **Going back:** close any Skills & MCP tab first (official T3 Code shows it as a blank tab), then
   install official T3 Code from https://github.com/pingdotgg/t3code/releases, at least the
   fork's X.Y.Z.
@@ -107,5 +108,7 @@ merge and push with `fork_git` (see Traps).
   PATH and the `vp staged` pre-commit hook fails under it.
 - Never keep an unzipped copy of the app outside `/Applications` (e.g. an extracted backup):
   `t3code://` links (sign-in callback) may open that copy instead.
+- **Never rename or recreate `fork-release.yml`.** The version's `.N` is the workflow's run number,
+  which restarts at 1 for a new workflow; installed copies would then never see a newer version.
 - A `-nightly` version renames the app to `T3 Code (Nightly)`; fork versions must stay
   `X.Y.Z-wingman.N`.
