@@ -1,20 +1,25 @@
 /**
  * Pool: Claude and Codex through a CLIProxyAPI account pool, at the top of
- * Settings → Providers for the environment the page shows. Where the pool
- * runs, its accounts, which provider instances use it, and whether pooled
- * sessions still behave like native ones.
+ * Settings → Providers for the environment the page shows.
+ *
+ * Problems first, everything else one line: the header carries the state and
+ * the rare actions; accounts are the only always-open part (local pools only);
+ * routing and native parity collapse to a sentence each and only appear once
+ * the pool serves something. A failing or warning check is shown inline
+ * without a click.
  */
 import {
+  type EnvironmentId,
   type PoolCheck,
   type PoolCheckState,
   PoolExtension,
+  type PoolModelIssue,
   type PoolRoute,
   type PoolRouteMode,
   type PoolStatus,
 } from "@t3tools/contracts";
 import {
   CheckIcon,
-  CircleAlertIcon,
   CircleDashedIcon,
   CircleXIcon,
   EllipsisIcon,
@@ -24,12 +29,10 @@ import {
 } from "lucide-react";
 import { type ReactNode, useCallback, useId, useState } from "react";
 
-import { Alert, AlertTitle } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
-import { RefreshIcon } from "~/components/ui/refresh-icon";
 import {
   Select,
   SelectItem,
@@ -38,7 +41,6 @@ import {
   SelectValue,
 } from "~/components/ui/select";
 import { Spinner } from "~/components/ui/spinner";
-import { Toggle, ToggleGroup } from "~/components/ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 
@@ -47,23 +49,31 @@ import type { ProviderSettingsExtensionProps } from "../providerSettings";
 import { PoolAccounts } from "./PoolAccounts";
 import { PoolLoginDialog, usePoolLogin } from "./PoolLogin";
 import {
-  localSourceLabel,
+  isParityVisible,
+  isRoutingVisible,
+  modelIssueHint,
   normalizeExternalUrl,
-  parityFailures,
+  parityHeadline,
+  parityProblems,
+  parityProblemText,
   poolHeaderStatus,
   poolProviderDriver,
   routeWaitingReason,
+  routingSummary,
   statusPollDelay,
+  withoutCustomModel,
   type HeaderStatus,
 } from "./pool.logic";
 import {
+  buildProviderInstanceUpdatePatch,
   getRelativeTimeState,
   PROVIDER_STATUS_STYLES,
   ProviderInstanceIcon,
   SettingsRow,
   SettingsSection,
+  useEnvironmentSettings,
   useRelativeTimeTick,
-  useServerConfigs,
+  useUpdateEnvironmentSettings,
 } from "./t3";
 import {
   type PoolActions,
@@ -75,6 +85,9 @@ import {
 
 const EXTERNAL_EXPLAINER =
   "Connect to a pool server someone else runs. Sign-ins and quotas live on that server.";
+
+const ROUTING_EXPLAINER =
+  "Pool: sessions go through the pool's accounts. Direct: the provider signs in the way it would without the pool. Switching restarts that provider's running sessions.";
 
 const ROUTE_OPTIONS = [
   { value: "pool", label: "Pool" },
@@ -93,15 +106,17 @@ export function PoolSettings({
   const login = usePoolLogin(client, onAdded);
   usePolling(refresh, pool.unsupported ? null : statusPollDelay(login.pending));
   const actions = usePoolActions(pool.apply);
-  const os = useServerConfigs().get(environmentId)?.environment.platform.os;
+  // The external form, opened from the menu before any server is connected.
+  const [externalFormOpen, setExternalFormOpen] = useState(false);
+  const [routingOpen, setRoutingOpen] = useState(false);
 
   if (pool.unsupported) return null;
   const { status } = pool;
-  const failures = status ? parityFailures(status.checks) : [];
   const runtimeState = status?.runtime.state;
+  const routingVisible = status ? isRoutingVisible(status) : false;
 
   const runCheck = () =>
-    void actions.run("check", () => client.call("check", {}), "Could not re-check parity");
+    void actions.run("check", () => client.call("check", {}), "Could not run the checks");
   const runRestart = () =>
     void actions.run("restart", () => client.call("restart", {}), "Could not restart the pool");
 
@@ -115,10 +130,9 @@ export function PoolSettings({
               <HeaderStatusLabel
                 header={
                   pool.error
-                    ? { label: "Could not refresh", tone: "warning" }
+                    ? { label: "Could not refresh", tone: "warning", detail: pool.error }
                     : poolHeaderStatus(status)
                 }
-                detail={pool.error}
               />
               <Menu>
                 <MenuTrigger
@@ -135,15 +149,23 @@ export function PoolSettings({
                 >
                   <EllipsisIcon className="size-3.5" />
                 </MenuTrigger>
-                <MenuPopup align="end" className="min-w-40">
+                <MenuPopup align="end" className="min-w-44">
+                  {status.source === "local" ? (
+                    <MenuItem onClick={() => setExternalFormOpen(true)}>
+                      Use an external pool…
+                    </MenuItem>
+                  ) : null}
                   {status.source === "local" ? (
                     <MenuItem disabled={actions.isBusy("restart")} onClick={runRestart}>
                       Restart pool
                     </MenuItem>
                   ) : null}
                   <MenuItem disabled={actions.isBusy("check")} onClick={runCheck}>
-                    Re-check parity
+                    Run checks
                   </MenuItem>
+                  {routingVisible ? (
+                    <MenuItem onClick={() => setRoutingOpen(true)}>Routing…</MenuItem>
+                  ) : null}
                 </MenuPopup>
               </Menu>
             </div>
@@ -166,49 +188,50 @@ export function PoolSettings({
           )
         ) : (
           <>
-            <SourceRow
-              status={status}
-              client={client}
-              actions={actions}
-              readOnly={readOnly}
-              localLabel={localSourceLabel(os)}
-              environmentLabel={environmentLabel}
-            />
-            <PoolAccounts
-              status={status}
-              receivedAt={pool.receivedAt}
-              client={client}
-              actions={actions}
-              readOnly={readOnly || login.pending}
-              onAdd={(provider) => void login.start(provider)}
-            />
-            <RoutingRow
-              routes={status.routes}
-              client={client}
-              actions={actions}
-              readOnly={readOnly}
-              environmentLabel={environmentLabel}
-            />
-            <ParityRow
-              checks={status.checks}
-              checkedAt={status.checkedAt ?? null}
-              checking={actions.isBusy("check")}
-              readOnly={readOnly}
-              onCheck={runCheck}
-            />
+            {status.source === "external" || externalFormOpen ? (
+              <ExternalRow
+                key={status.source}
+                status={status}
+                client={client}
+                actions={actions}
+                readOnly={readOnly}
+                onClose={() => setExternalFormOpen(false)}
+              />
+            ) : null}
+            {status.source === "local" ? (
+              <PoolAccounts
+                status={status}
+                receivedAt={pool.receivedAt}
+                client={client}
+                actions={actions}
+                readOnly={readOnly || login.pending}
+                onAdd={(provider) => void login.start(provider)}
+              />
+            ) : null}
+            {routingVisible ? (
+              <RoutingRow
+                routes={status.routes}
+                open={routingOpen}
+                onToggle={() => setRoutingOpen((open) => !open)}
+                client={client}
+                actions={actions}
+                readOnly={readOnly}
+                environmentLabel={environmentLabel}
+              />
+            ) : null}
+            {isParityVisible(status) ? (
+              <ParityRow
+                checks={status.checks}
+                checkedAt={status.checkedAt ?? null}
+                checking={actions.isBusy("check")}
+                modelIssues={status.modelIssues ?? []}
+                environmentId={environmentId}
+                readOnly={readOnly}
+              />
+            ) : null}
           </>
         )}
       </SettingsSection>
-      {failures.length > 0 ? (
-        <Alert variant="error" controlAlignment="first-line">
-          <CircleAlertIcon />
-          {failures.map((failure) => (
-            <AlertTitle key={failure} className="break-words">
-              {failure}
-            </AlertTitle>
-          ))}
-        </Alert>
-      ) : null}
       <PoolLoginDialog
         login={login.login}
         preparing={runtimeState === "downloading" || runtimeState === "starting"}
@@ -219,15 +242,8 @@ export function PoolSettings({
   );
 }
 
-/** Dot and words; long error messages truncate with the full text on hover. */
-function HeaderStatusLabel({
-  header,
-  detail,
-}: {
-  readonly header: HeaderStatus;
-  readonly detail: string | null;
-}) {
-  const full = detail ?? (header.tone === "error" ? header.label : null);
+/** Dot and words; the longer reason (e.g. why the pool can't start) on hover. */
+function HeaderStatusLabel({ header }: { readonly header: HeaderStatus }) {
   const label = (
     <span
       className={cn(
@@ -242,12 +258,12 @@ function HeaderStatusLabel({
       <span className="max-w-72 truncate">{header.label}</span>
     </span>
   );
-  if (!full) return label;
+  if (!header.detail) return label;
   return (
     <Tooltip>
       <TooltipTrigger render={<span className="inline-flex min-w-0" />}>{label}</TooltipTrigger>
       <TooltipPopup side="top" className="max-w-80 break-words">
-        {full}
+        {header.detail}
       </TooltipPopup>
     </Tooltip>
   );
@@ -273,45 +289,39 @@ function InfoTip({ label, children }: { readonly label: string; readonly childre
 }
 
 // ---------------------------------------------------------------------------
-// Source
+// External pool
 
-function SourceRow({
+/**
+ * Connected: one line with Change and Disconnect. Not yet connected (opened
+ * from the menu), or changing: the URL and key form.
+ */
+function ExternalRow({
   status,
   client,
   actions,
   readOnly,
-  localLabel,
-  environmentLabel,
+  onClose,
 }: {
   readonly status: PoolStatus;
   readonly client: PoolClient;
   readonly actions: PoolActions;
   readonly readOnly: boolean;
-  readonly localLabel: string;
-  readonly environmentLabel: string;
+  readonly onClose: () => void;
 }) {
-  // Choosing External only opens the form; the source changes when it connects.
-  const [externalDraft, setExternalDraft] = useState(false);
+  const connected = status.source === "external";
+  const [editing, setEditing] = useState(!connected);
   const [connectError, setConnectError] = useState<string | null>(null);
-  const intent = actions.intent("source");
-  const view =
-    intent === "local" || intent === "external"
-      ? intent
-      : externalDraft
-        ? "external"
-        : status.source;
+  const busy = actions.isBusy("source");
+  const { external } = status;
 
-  const switchToLocal = () => {
-    setExternalDraft(false);
-    setConnectError(null);
-    if (status.source === "local") return;
-    void actions.run(
-      "source",
-      () => client.call("setSource", { source: "local" }),
-      "Could not change the pool source",
-      "local",
-    );
-  };
+  const disconnect = () =>
+    void actions
+      .run(
+        "source",
+        () => client.call("setSource", { source: "local" }),
+        "Could not disconnect from the pool server",
+      )
+      .then(onClose);
 
   const connect = async (externalUrl: string, externalKey: string) => {
     setConnectError(null);
@@ -330,45 +340,66 @@ function SourceRow({
       setConnectError(outcome.message);
       return false;
     }
-    setExternalDraft(false);
+    setEditing(false);
+    onClose();
     return true;
   };
 
+  const cancel = () => {
+    setConnectError(null);
+    if (connected) setEditing(false);
+    else onClose();
+  };
+
+  if (connected && !editing) {
+    const unreachable = external.reachable === false;
+    return (
+      <SettingsRow
+        title={
+          <span className="break-all">
+            {unreachable ? "Can't reach " : "Connected to "}
+            <span className="font-mono text-[0.8125rem]">{external.url}</span>
+          </span>
+        }
+        description={
+          unreachable ? (
+            <span className="text-destructive-foreground">
+              {external.message?.trim() || "The pool server did not answer."}
+            </span>
+          ) : (
+            "Sign-ins and quotas live on that server."
+          )
+        }
+        control={
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={readOnly || busy}
+              onClick={() => setEditing(true)}
+            >
+              Change
+            </Button>
+            <Button size="sm" variant="ghost" disabled={readOnly || busy} onClick={disconnect}>
+              {busy ? <Spinner className="size-3.5" /> : null}
+              Disconnect
+            </Button>
+          </div>
+        }
+      />
+    );
+  }
+
   return (
-    <SettingsRow
-      title="Source"
-      description={
-        view === "external"
-          ? EXTERNAL_EXPLAINER
-          : `The pool runs on ${environmentLabel}, with the accounts you add below.`
-      }
-      control={
-        <ToggleGroup
-          aria-label="Pool source"
-          variant="segmented"
-          disabled={readOnly || actions.isBusy("source")}
-          value={[view]}
-          onValueChange={(next) => {
-            const value = next[0];
-            if (value === "local") switchToLocal();
-            else if (value === "external") setExternalDraft(true);
-          }}
-        >
-          <Toggle value="local">{localLabel}</Toggle>
-          <Toggle value="external">External pool</Toggle>
-        </ToggleGroup>
-      }
-    >
-      {view === "external" ? (
-        <ExternalSourceForm
-          key={status.external.url}
-          status={status}
-          readOnly={readOnly}
-          connecting={actions.isBusy("source")}
-          error={connectError}
-          onConnect={connect}
-        />
-      ) : null}
+    <SettingsRow title="External pool" description={EXTERNAL_EXPLAINER}>
+      <ExternalSourceForm
+        status={status}
+        readOnly={readOnly}
+        connecting={busy}
+        error={connectError}
+        onConnect={connect}
+        onCancel={cancel}
+      />
     </SettingsRow>
   );
 }
@@ -379,12 +410,14 @@ function ExternalSourceForm({
   connecting,
   error,
   onConnect,
+  onCancel,
 }: {
   readonly status: PoolStatus;
   readonly readOnly: boolean;
   readonly connecting: boolean;
   readonly error: string | null;
   readonly onConnect: (url: string, key: string) => Promise<boolean>;
+  readonly onCancel: () => void;
 }) {
   const id = useId();
   const { external } = status;
@@ -400,15 +433,6 @@ function ExternalSourceForm({
     if (!canSubmit || normalized === null) return;
     if (await onConnect(normalized, key.trim())) setKey("");
   };
-
-  const reachability =
-    connected && external.reachable === false ? (
-      <p className="text-xs text-destructive-foreground">
-        {external.message?.trim() || "The pool server did not answer."}
-      </p>
-    ) : connected && external.reachable && external.message?.trim() ? (
-      <p className="text-xs text-muted-foreground">{external.message}</p>
-    ) : null;
 
   return (
     <div className="space-y-2 pt-3 pb-2">
@@ -444,16 +468,20 @@ function ExternalSourceForm({
             onChange={(event) => setKey(event.target.value)}
           />
         </div>
-        <Button type="submit" size="sm" disabled={!canSubmit}>
-          {connecting ? <Spinner className="size-3.5" /> : null}
-          {connected ? "Save" : "Connect"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button type="button" size="sm" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button type="submit" size="sm" disabled={!canSubmit}>
+            {connecting ? <Spinner className="size-3.5" /> : null}
+            {connected ? "Save" : "Connect"}
+          </Button>
+        </div>
       </form>
       {urlInvalid ? (
         <p className="text-xs text-destructive-foreground">Enter an http or https address.</p>
       ) : null}
       {error ? <p className="text-xs break-words text-destructive-foreground">{error}</p> : null}
-      {reachability}
     </div>
   );
 }
@@ -463,12 +491,16 @@ function ExternalSourceForm({
 
 function RoutingRow({
   routes,
+  open,
+  onToggle,
   client,
   actions,
   readOnly,
   environmentLabel,
 }: {
   readonly routes: readonly PoolRoute[];
+  readonly open: boolean;
+  readonly onToggle: () => void;
   readonly client: PoolClient;
   readonly actions: PoolActions;
   readonly readOnly: boolean;
@@ -484,71 +516,75 @@ function RoutingRow({
 
   return (
     <SettingsRow
-      title={
-        <span className="inline-flex items-center gap-1.5">
-          Routing
-          <InfoTip label="About routing">
-            Pool sends a provider's sessions through the pool; Direct uses its own sign-in.
-            Switching restarts that provider's running sessions.
-          </InfoTip>
-        </span>
+      title="Routing"
+      description={routingSummary(routes)}
+      control={
+        <Button size="xs" variant="ghost-muted" aria-expanded={open} onClick={onToggle}>
+          {open ? "Done" : "Change"}
+        </Button>
       }
-      description="Which providers use the pool."
     >
-      <div className="space-y-1 pt-2 pb-2">
-        {routes.length === 0 ? (
-          <p className="text-xs text-muted-foreground">
-            No Claude or Codex provider is set up on {environmentLabel}.
-          </p>
-        ) : (
-          routes.map((route) => {
-            const key = `route:${route.instanceId}`;
-            const intent = actions.intent(key);
-            const mode = intent === "pool" || intent === "direct" ? intent : route.mode;
-            const reason = intent === undefined ? routeWaitingReason(route) : null;
-            return (
-              <div key={route.instanceId} className="flex min-h-8 min-w-0 items-center gap-2">
-                <ProviderInstanceIcon
-                  driverKind={poolProviderDriver(route.provider)}
-                  displayName={route.displayName}
-                  className="size-4"
-                  iconClassName="size-3.5 text-foreground/80"
-                />
-                <span className="shrink-0 text-sm text-foreground">{route.displayName}</span>
-                {reason ? (
-                  <span className="min-w-0 truncate text-xs text-muted-foreground">{reason}</span>
-                ) : null}
-                <div className="ms-auto shrink-0">
-                  <Select
-                    items={ROUTE_OPTIONS}
-                    value={mode}
-                    disabled={readOnly || actions.isBusy(key)}
-                    onValueChange={(next) => {
-                      if (next === null || next === mode) return;
-                      setRoute(route, next);
-                    }}
-                  >
-                    <SelectTrigger
-                      size="xs"
-                      className="w-24 min-w-0"
-                      aria-label={`${route.displayName} routing`}
-                    >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectPopup align="end" alignItemWithTrigger={false}>
-                      {ROUTE_OPTIONS.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          {option.label}
-                        </SelectItem>
-                      ))}
-                    </SelectPopup>
-                  </Select>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
+      {open ? (
+        <div className="space-y-2 pt-2 pb-2">
+          <p className="text-xs text-muted-foreground">{ROUTING_EXPLAINER}</p>
+          {routes.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No Claude or Codex provider is set up on {environmentLabel}.
+            </p>
+          ) : (
+            <div className="space-y-1">
+              {routes.map((route) => {
+                const key = `route:${route.instanceId}`;
+                const intent = actions.intent(key);
+                const mode = intent === "pool" || intent === "direct" ? intent : route.mode;
+                const reason = intent === undefined ? routeWaitingReason(route) : null;
+                return (
+                  <div key={route.instanceId} className="flex min-h-8 min-w-0 items-center gap-2">
+                    <ProviderInstanceIcon
+                      driverKind={poolProviderDriver(route.provider)}
+                      displayName={route.displayName}
+                      className="size-4"
+                      iconClassName="size-3.5 text-foreground/80"
+                    />
+                    <span className="shrink-0 text-sm text-foreground">{route.displayName}</span>
+                    {reason ? (
+                      <span className="min-w-0 truncate text-xs text-muted-foreground">
+                        {reason}
+                      </span>
+                    ) : null}
+                    <div className="ms-auto shrink-0">
+                      <Select
+                        items={ROUTE_OPTIONS}
+                        value={mode}
+                        disabled={readOnly || actions.isBusy(key)}
+                        onValueChange={(next) => {
+                          if (next === null || next === mode) return;
+                          setRoute(route, next);
+                        }}
+                      >
+                        <SelectTrigger
+                          size="xs"
+                          className="w-24 min-w-0"
+                          aria-label={`${route.displayName} routing`}
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectPopup align="end" alignItemWithTrigger={false}>
+                          {ROUTE_OPTIONS.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectPopup>
+                      </Select>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      ) : null}
     </SettingsRow>
   );
 }
@@ -572,107 +608,185 @@ function ParityRow({
   checks,
   checkedAt,
   checking,
+  modelIssues,
+  environmentId,
   readOnly,
-  onCheck,
 }: {
   readonly checks: readonly PoolCheck[];
   readonly checkedAt: string | null;
   readonly checking: boolean;
+  readonly modelIssues: readonly PoolModelIssue[];
+  readonly environmentId: EnvironmentId;
   readonly readOnly: boolean;
-  readonly onCheck: () => void;
 }) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const problems = parityProblems(checks);
+
+  const summary = checking ? (
+    <span className="inline-flex items-center gap-1.5">
+      <Spinner className="size-3" /> Checking…
+    </span>
+  ) : problems.length > 0 ? (
+    <span className="flex flex-col gap-1">
+      {problems.map((check) =>
+        check.id === "modelFamilies" && modelIssues.length > 0 ? (
+          modelIssues.map((issue) => (
+            <ModelIssueLine
+              key={`${issue.instanceId}:${issue.where}:${issue.setting ?? issue.slug}`}
+              issue={issue}
+              environmentId={environmentId}
+              readOnly={readOnly}
+            />
+          ))
+        ) : (
+          <ParityLine key={check.id} check={check} text={parityProblemText(check)} />
+        ),
+      )}
+    </span>
+  ) : parityHeadline(checks) === "passed" ? (
+    <span>
+      All checks passed · <CheckedAgo iso={checkedAt} />
+    </span>
+  ) : (
+    "Not checked yet"
+  );
+
   return (
     <SettingsRow
       title={
         <span className="inline-flex items-center gap-1.5">
           Native parity
           <InfoTip label="About native parity">
-            What keeps a pooled session as fast and capable as a direct one. Hover a check for
-            details.
+            Checks that a pooled session is as fast and capable as a direct one: tool search, the
+            1-hour cache, the advisor, one account per session.
           </InfoTip>
         </span>
       }
-      description={
-        // Nothing routed yet (e.g. a new install with no accounts): one quiet line, not a row of blanks.
-        checks.length > 0 && checks.some((check) => check.state !== "unknown") ? (
-          <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            {checks.map((check) => (
-              <ParityCheck key={check.id} check={check} />
-            ))}
-          </span>
-        ) : (
-          "Checked once Claude or Codex goes through the pool."
-        )
-      }
+      description={summary}
       control={
-        readOnly ? (
-          <span className="text-xs text-muted-foreground">
-            <LastChecked iso={checkedAt} />
-          </span>
-        ) : (
-          <Button
-            size="sm"
-            variant="ghost-muted"
-            disabled={checking}
-            aria-busy={checking}
-            onClick={onCheck}
-          >
-            <RefreshIcon refreshing={checking} />
-            <span className="sr-only">Re-check parity</span>
-            <span aria-hidden className="hidden sm:inline">
-              {checking ? "Checking" : checkedAt ? <LastChecked iso={checkedAt} /> : "Check now"}
-            </span>
-          </Button>
-        )
+        <Button
+          size="xs"
+          variant="ghost-muted"
+          aria-expanded={detailsOpen}
+          onClick={() => setDetailsOpen((open) => !open)}
+        >
+          {detailsOpen ? "Hide details" : "Details"}
+        </Button>
       }
-    />
+    >
+      {detailsOpen ? (
+        <div className="space-y-1 pt-2 pb-2">
+          {checks.map((check) => (
+            <ParityLine
+              key={check.id}
+              check={check}
+              text={check.detail?.trim() ? `${check.label}: ${check.detail.trim()}` : check.label}
+            />
+          ))}
+          <p className="pt-1 text-xs text-muted-foreground">
+            <CheckedAgo iso={checkedAt} capitalized />
+          </p>
+        </div>
+      ) : null}
+    </SettingsRow>
   );
 }
 
-function ParityCheck({ check }: { readonly check: PoolCheck }) {
+/**
+ * A model of the other family on a pooled instance. T3's own custom model can
+ * be removed here (the same settings write the provider card makes); aliases in
+ * the user's files only say where to edit them, since the pool never writes those.
+ */
+function ModelIssueLine({
+  issue,
+  environmentId,
+  readOnly,
+}: {
+  readonly issue: PoolModelIssue;
+  readonly environmentId: EnvironmentId;
+  readonly readOnly: boolean;
+}) {
+  const settings = useEnvironmentSettings(environmentId);
+  const updateSettings = useUpdateEnvironmentSettings(environmentId);
+  const edit = withoutCustomModel(settings, issue);
+  const hint = modelIssueHint(issue);
+  return (
+    <span className="flex flex-wrap items-start gap-x-2 gap-y-1 text-xs">
+      <span className="flex min-w-0 flex-1 items-start gap-1.5">
+        <CircleXIcon aria-hidden className="mt-px size-3.5 shrink-0 text-destructive" />
+        <span className="sr-only">Failing: </span>
+        <span className="min-w-0 break-words text-destructive-foreground">{issue.message}</span>
+      </span>
+      {edit ? (
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={readOnly}
+          onClick={() =>
+            void updateSettings(
+              buildProviderInstanceUpdatePatch({
+                settings,
+                instanceId: edit.instanceId,
+                instance: edit.instance,
+                driver: edit.driver,
+                isDefault: edit.isDefault,
+              }),
+            )
+          }
+        >
+          Remove
+        </Button>
+      ) : hint ? (
+        <span className="text-muted-foreground">{hint}</span>
+      ) : null}
+    </span>
+  );
+}
+
+function ParityLine({ check, text }: { readonly check: PoolCheck; readonly text: string }) {
   const presentation = CHECK_PRESENTATION[check.state];
   const Icon = presentation.icon;
-  const detail = check.detail?.trim();
-  const content = (
-    <>
-      <Icon aria-hidden className={cn("size-3.5 shrink-0", presentation.className)} />
-      <span className="sr-only">{presentation.srLabel}: </span>
-      <span className={check.state === "fail" ? "text-destructive-foreground" : undefined}>
-        {check.label}
-      </span>
-    </>
-  );
-  if (!detail) return <span className="inline-flex items-center gap-1">{content}</span>;
   return (
-    <Tooltip>
-      <TooltipTrigger
-        render={
-          <span
-            tabIndex={0}
-            className="inline-flex cursor-default items-center gap-1 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          />
-        }
+    <span className="flex items-start gap-1.5 text-xs">
+      <Icon aria-hidden className={cn("mt-px size-3.5 shrink-0", presentation.className)} />
+      <span className="sr-only">{presentation.srLabel}: </span>
+      <span
+        className={cn(
+          "min-w-0 break-words",
+          check.state === "fail"
+            ? "text-destructive-foreground"
+            : check.state === "warn"
+              ? "text-warning-foreground"
+              : "text-muted-foreground",
+        )}
       >
-        {content}
-      </TooltipTrigger>
-      <TooltipPopup side="top" className="max-w-72">
-        {detail}
-      </TooltipPopup>
-    </Tooltip>
+        {text}
+      </span>
+    </span>
   );
 }
 
-/** "Checked 2m ago", ticking like the provider list's own refresh label. */
-function LastChecked({ iso }: { readonly iso: string | null }) {
+/** "checked 2m ago", ticking like the provider list's own refresh label. */
+function CheckedAgo({
+  iso,
+  capitalized = false,
+}: {
+  readonly iso: string | null;
+  readonly capitalized?: boolean;
+}) {
   useRelativeTimeTick();
+  const verb = capitalized ? "Checked" : "checked";
   const relative = getRelativeTimeState(iso);
-  if (relative.status === "missing") return <>Not checked yet</>;
-  if (relative.status === "invalid") return <>Checked unavailable</>;
+  if (relative.status === "missing")
+    return <>{capitalized ? "Not checked yet" : "not checked yet"}</>;
+  if (relative.status === "invalid") return <>{verb} at an unknown time</>;
   return relative.suffix ? (
     <>
-      Checked <span className="font-mono tabular-nums">{relative.value}</span> {relative.suffix}
+      {verb} <span className="tabular-nums">{relative.value}</span> {relative.suffix}
     </>
   ) : (
-    <>Checked {relative.value}</>
+    <>
+      {verb} {relative.value}
+    </>
   );
 }

@@ -70,10 +70,6 @@ export function PoolAccounts({
   const removing = confirm?.account ?? null;
   const closeConfirm = () => setConfirm((current) => current && { ...current, open: false });
 
-  if (status.source === "external") {
-    return <SettingsRow title="Accounts" description="Accounts are managed on the pool server." />;
-  }
-
   const accounts = orderAccounts(status.accounts);
   const accountsError = status.accountsError?.trim() ? (
     <span className="text-warning-foreground">{status.accountsError}</span>

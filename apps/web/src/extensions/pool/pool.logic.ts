@@ -3,13 +3,17 @@
  * presentation, parity checks, the external URL draft and failure triage.
  */
 import {
-  type ExecutionEnvironmentPlatformOs,
+  defaultInstanceIdForDriver,
   type PoolAccount,
+  type PoolModelIssue,
   type PoolCheck,
   type PoolProvider,
   type PoolRoute,
   type PoolStatus,
   ProviderDriverKind,
+  type ProviderInstanceConfig,
+  ProviderInstanceId,
+  type ServerSettings,
 } from "@t3tools/contracts";
 
 /** Dot tones, keyed like the provider cards' `PROVIDER_STATUS_STYLES`. */
@@ -42,16 +46,11 @@ export function accountCountLabel(count: number): string {
   return `${count} ${count === 1 ? "account" : "accounts"}`;
 }
 
-/** The "this server" source option, named for the machine the environment runs on. */
-export function localSourceLabel(os: ExecutionEnvironmentPlatformOs | undefined): string {
-  if (os === "darwin") return "This Mac";
-  if (os === "windows") return "This PC";
-  return "This machine";
-}
-
 export interface HeaderStatus {
   readonly label: string;
   readonly tone: PoolTone;
+  /** Longer text for the tooltip (e.g. why the pool can't start). */
+  readonly detail?: string;
 }
 
 /** The section header's one-line state: the local runtime, or the external server's reachability. */
@@ -67,16 +66,84 @@ export function poolHeaderStatus(status: PoolStatus): HeaderStatus {
   const { runtime } = status;
   switch (runtime.state) {
     case "idle":
-      return { label: "Not started", tone: "disabled" };
+      return { label: "Not set up", tone: "disabled" };
     case "downloading":
       return { label: "Downloading…", tone: "disabled" };
     case "starting":
       return { label: "Starting…", tone: "disabled" };
     case "running":
       return { label: `Running · ${accountCountLabel(status.accounts.length)}`, tone: "ready" };
-    case "error":
-      return { label: runtime.message?.trim() || "Pool stopped", tone: "error" };
+    case "error": {
+      const detail = runtime.message?.trim();
+      return { label: "Can't start the pool", tone: "error", ...(detail ? { detail } : {}) };
+    }
   }
+}
+
+/** "A", "A and B", "A, B and C". */
+export function joinNames(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? "";
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+
+/** Routing is only worth showing once the pool can serve something: an account, or a connected server. */
+export function isRoutingVisible(status: PoolStatus): boolean {
+  return status.source === "external"
+    ? status.external.url.trim() !== ""
+    : status.accounts.length > 0;
+}
+
+/**
+ * Routing in one line, e.g. "Claude and Codex use the pool",
+ * "Codex uses the pool · Claude is direct", "Claude is waiting for a Claude account".
+ */
+export function routingSummary(routes: readonly PoolRoute[]): string {
+  if (routes.length === 0) return "No Claude or Codex provider is set up";
+  // Claude before Codex, whatever order the instances come in.
+  routes = POOL_PROVIDERS.flatMap((provider) =>
+    routes.filter((route) => route.provider === provider),
+  );
+  const using = routes.filter((route) => route.mode === "pool" && route.active);
+  const waiting = routes.filter((route) => route.mode === "pool" && !route.active);
+  const direct = routes.filter((route) => route.mode === "direct");
+  const names = (list: readonly PoolRoute[]) => joinNames(list.map((route) => route.displayName));
+  const parts: string[] = [];
+  if (using.length > 0)
+    parts.push(`${names(using)} ${using.length === 1 ? "uses" : "use"} the pool`);
+  for (const route of waiting) {
+    const reason = routeWaitingReason(route) ?? "";
+    parts.push(`${route.displayName} is ${reason.charAt(0).toLowerCase()}${reason.slice(1)}`);
+  }
+  if (direct.length > 0)
+    parts.push(`${names(direct)} ${direct.length === 1 ? "is" : "are"} direct`);
+  return parts.join(" · ");
+}
+
+/** Parity is only meaningful once some provider actually goes through the pool. */
+export function isParityVisible(status: PoolStatus): boolean {
+  return status.routes.some((route) => route.active);
+}
+
+/** Checks that need attention (failing or warning), failures first. */
+export function parityProblems(checks: readonly PoolCheck[]): PoolCheck[] {
+  return [
+    ...checks.filter((check) => check.state === "fail"),
+    ...checks.filter((check) => check.state === "warn"),
+  ];
+}
+
+/** The collapsed parity line when nothing needs attention. */
+export function parityHeadline(checks: readonly PoolCheck[]): "passed" | "unchecked" {
+  return checks.some((check) => check.state === "ok") ? "passed" : "unchecked";
+}
+
+/** One problem as a sentence: "Tool search: Claude is loading every tool schema…". */
+export function parityProblemText(check: PoolCheck): string {
+  const detail = check.detail?.trim();
+  if (detail) return `${check.label}: ${detail}`;
+  return check.state === "fail"
+    ? `${check.label} is off in pooled sessions.`
+    : `${check.label} needs attention.`;
 }
 
 /** The label a row, menu or dialog uses for an account: its email, else its kind. */
@@ -117,16 +184,6 @@ export function routeWaitingReason(route: PoolRoute): string | null {
   return route.reason?.trim() || `Waiting for a ${POOL_ACCOUNT_KIND[route.provider]}`;
 }
 
-/** Failing parity checks, one line each, for the callout under the section. */
-export function parityFailures(checks: readonly PoolCheck[]): string[] {
-  return checks
-    .filter((check) => check.state === "fail")
-    .map((check) => {
-      const detail = check.detail?.trim();
-      return detail ? `${check.label}: ${detail}` : `${check.label} is off in pooled sessions.`;
-    });
-}
-
 /**
  * The external server URL as typed, made absolute. A bare host gets `http://`
  * (pool servers usually sit on a LAN or tailnet); anything but http(s) is refused.
@@ -158,4 +215,64 @@ export function isPoolUnsupported(message: string): boolean {
 /** Status poll cadence: quicker while a sign-in is waiting on the browser. */
 export function statusPollDelay(loginPending: boolean): number {
   return loginPending ? 1_500 : 5_000;
+}
+
+/** The slug of a `customModels` entry (a bare string or `{ slug }`). */
+function customModelSlug(model: unknown): string {
+  if (typeof model === "string") return model;
+  if (typeof model === "object" && model !== null && "slug" in model) {
+    return String((model as { slug: unknown }).slug);
+  }
+  return "";
+}
+
+export interface InstanceEdit {
+  readonly instanceId: ProviderInstanceId;
+  readonly instance: ProviderInstanceConfig;
+  readonly driver: ProviderDriverKind;
+  readonly isDefault: boolean;
+}
+
+/**
+ * The pooled instance with one foreign custom model removed, in the shape the
+ * Providers page writes (`buildProviderInstanceUpdatePatch`). The envelope is the
+ * explicit instance, or for a default slot the one synthesized from its legacy
+ * settings, exactly as the page builds its rows. Null when there is nothing to remove.
+ */
+export function withoutCustomModel(
+  settings: Pick<ServerSettings, "providers" | "providerInstances">,
+  issue: PoolModelIssue,
+): InstanceEdit | null {
+  if (issue.where !== "customModels") return null;
+  const instanceId = ProviderInstanceId.make(issue.instanceId);
+  const driver = poolProviderDriver(issue.provider);
+  const isDefault = instanceId === defaultInstanceIdForDriver(driver);
+  let instance: ProviderInstanceConfig | undefined = settings.providerInstances[instanceId];
+  if (instance === undefined && isDefault) {
+    const legacy = (settings.providers as Record<string, Record<string, unknown> | undefined>)[
+      driver
+    ];
+    if (legacy !== undefined) {
+      const { enabled, ...config } = legacy;
+      instance = { driver, ...(typeof enabled === "boolean" ? { enabled } : {}), config };
+    }
+  }
+  if (instance === undefined) return null;
+  const config = (instance.config ?? {}) as Record<string, unknown>;
+  const models = Array.isArray(config.customModels) ? config.customModels : [];
+  const kept = models.filter((model: unknown) => customModelSlug(model) !== issue.slug);
+  if (kept.length === models.length) return null;
+  return {
+    instanceId,
+    instance: { ...instance, config: { ...config, customModels: kept } },
+    driver,
+    isDefault,
+  };
+}
+
+/** Where to fix an alias the pool can't edit (it never writes the user's own files). */
+export function modelIssueHint(issue: PoolModelIssue): string | null {
+  if (issue.where === "claudeSettings") return "Edit ~/.claude/settings.json";
+  if (issue.where === "instanceEnv") return `Edit ${issue.displayName}'s environment below`;
+  return null;
 }

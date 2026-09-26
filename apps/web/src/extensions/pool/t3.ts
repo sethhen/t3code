@@ -14,5 +14,6 @@ export {
 export { LimitWindows } from "~/components/usage/UsageLimits";
 export { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 export { readLocalApi } from "~/localApi";
-export { useServerConfigs } from "~/state/entities";
 export { getRelativeTimeState } from "~/timestampFormat";
+export { useEnvironmentSettings, useUpdateEnvironmentSettings } from "~/hooks/useSettings";
+export { buildProviderInstanceUpdatePatch } from "~/components/settings/SettingsPanels.logic";

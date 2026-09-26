@@ -1,17 +1,31 @@
-import type { PoolAccount, PoolCheck, PoolRoute, PoolStatus } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type PoolAccount,
+  type PoolCheck,
+  type PoolModelIssue,
+  type PoolRoute,
+  type PoolStatus,
+} from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
   accountLabel,
   accountNotice,
+  isParityVisible,
   isPoolUnsupported,
-  localSourceLabel,
+  isRoutingVisible,
+  joinNames,
+  modelIssueHint,
   normalizeExternalUrl,
   orderAccounts,
-  parityFailures,
+  parityHeadline,
+  parityProblems,
+  parityProblemText,
   poolHeaderStatus,
   routeWaitingReason,
+  routingSummary,
   statusPollDelay,
+  withoutCustomModel,
 } from "./pool.logic";
 
 function account(overrides: Partial<PoolAccount> = {}): PoolAccount {
@@ -46,7 +60,7 @@ describe("poolHeaderStatus", () => {
     const labels = (["idle", "downloading", "starting", "error"] as const).map(
       (state) => poolHeaderStatus(status({ runtime: { state, version: "6.0.0" } })).label,
     );
-    assert.deepEqual(labels, ["Not started", "Downloading…", "Starting…", "Pool stopped"]);
+    assert.deepEqual(labels, ["Not set up", "Downloading…", "Starting…", "Can't start the pool"]);
   });
 
   it("counts accounts while running, with the singular for one", () => {
@@ -60,12 +74,12 @@ describe("poolHeaderStatus", () => {
     );
   });
 
-  it("shows the runtime's own error message in the error tone", () => {
+  it("says it can't start, with the runtime's own reason for the tooltip", () => {
     assert.deepEqual(
       poolHeaderStatus(
-        status({ runtime: { state: "error", version: "6.0.0", message: "Port 8317 is in use" } }),
+        status({ runtime: { state: "error", version: "6.0.0", message: "Port 18417 is in use" } }),
       ),
-      { label: "Port 8317 is in use", tone: "error" },
+      { label: "Can't start the pool", tone: "error", detail: "Port 18417 is in use" },
     );
   });
 
@@ -137,18 +151,90 @@ describe("routeWaitingReason", () => {
   });
 });
 
-describe("parityFailures", () => {
-  it("lists only failing checks, with their detail when there is one", () => {
-    const checks: PoolCheck[] = [
-      { id: "tools", label: "Tool search", state: "ok" },
-      { id: "cache", label: "1h cache", state: "fail", detail: "Prompts are cached for 5 minutes" },
-      { id: "advisor", label: "Advisor", state: "warn", detail: "Not measured yet" },
-      { id: "sticky", label: "Sticky sessions", state: "fail" },
-    ];
-    assert.deepEqual(parityFailures(checks), [
-      "1h cache: Prompts are cached for 5 minutes",
+describe("routing summary", () => {
+  const claude = route();
+  const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+
+  it("says who uses the pool, who waits and who is direct, in one line", () => {
+    assert.equal(routingSummary([claude, codex]), "Claude and Codex use the pool");
+    assert.equal(routingSummary([codex, claude]), "Claude and Codex use the pool");
+    assert.equal(
+      routingSummary([codex, { ...claude, mode: "direct", active: false }]),
+      "Codex uses the pool · Claude is direct",
+    );
+    assert.equal(
+      routingSummary([{ ...claude, active: false }]),
+      "Claude is waiting for a Claude account",
+    );
+    assert.equal(
+      routingSummary([
+        claude,
+        { ...codex, active: false },
+        route({
+          instanceId: "claudeAgent_work",
+          displayName: "Claude (Work)",
+          mode: "direct",
+          active: false,
+        }),
+      ]),
+      "Claude uses the pool · Codex is waiting for a ChatGPT account · Claude (Work) is direct",
+    );
+    assert.equal(routingSummary([]), "No Claude or Codex provider is set up");
+  });
+
+  it("joins names the way a sentence would", () => {
+    assert.equal(joinNames(["A"]), "A");
+    assert.equal(joinNames(["A", "B"]), "A and B");
+    assert.equal(joinNames(["A", "B", "C"]), "A, B and C");
+  });
+
+  it("appears once the pool can serve something", () => {
+    assert.isFalse(isRoutingVisible(status()));
+    assert.isTrue(isRoutingVisible(status({ accounts: [account()] })));
+    assert.isTrue(
+      isRoutingVisible(
+        status({ source: "external", external: { url: "http://pool:8317", hasKey: true } }),
+      ),
+    );
+  });
+});
+
+describe("native parity", () => {
+  const ok: PoolCheck = { id: "tools", label: "Tool search", state: "ok" };
+  const unknown: PoolCheck = { id: "codex", label: "Codex", state: "unknown" };
+  const warn: PoolCheck = {
+    id: "codex",
+    label: "Codex",
+    state: "warn",
+    detail: "Built-in catalog",
+  };
+  const fail: PoolCheck = { id: "proxy", label: "Pool", state: "fail", detail: "Not running" };
+
+  it("shows problems first (failures, then warnings) and nothing else", () => {
+    assert.deepEqual(parityProblems([ok, warn, unknown, fail]), [fail, warn]);
+    assert.deepEqual(parityProblems([ok, unknown]), []);
+  });
+
+  it("says all passed when something passed and nothing needs attention", () => {
+    assert.equal(parityHeadline([ok, unknown]), "passed");
+    assert.equal(parityHeadline([unknown]), "unchecked");
+  });
+
+  it("writes each problem as a sentence", () => {
+    assert.equal(parityProblemText(fail), "Pool: Not running");
+    assert.equal(
+      parityProblemText({ id: "sticky", label: "Sticky sessions", state: "fail" }),
       "Sticky sessions is off in pooled sessions.",
-    ]);
+    );
+    assert.equal(
+      parityProblemText({ id: "x", label: "Codex", state: "warn" }),
+      "Codex needs attention.",
+    );
+  });
+
+  it("appears only once a provider goes through the pool", () => {
+    assert.isFalse(isParityVisible(status({ routes: [route({ active: false })] })));
+    assert.isTrue(isParityVisible(status({ routes: [route()] })));
   });
 });
 
@@ -183,14 +269,72 @@ describe("environment triage", () => {
     assert.isFalse(isPoolUnsupported("Unknown extension method skillsMcp.context.get"));
   });
 
-  it("names the local option after the machine's OS", () => {
-    assert.equal(localSourceLabel("darwin"), "This Mac");
-    assert.equal(localSourceLabel("windows"), "This PC");
-    assert.equal(localSourceLabel("linux"), "This machine");
-    assert.equal(localSourceLabel(undefined), "This machine");
-  });
-
   it("polls faster only while a sign-in is pending", () => {
     assert.isBelow(statusPollDelay(true), statusPollDelay(false));
+  });
+});
+
+describe("model families", () => {
+  const issue: PoolModelIssue = {
+    instanceId: "claudeAgent",
+    displayName: "Claude",
+    provider: "claude",
+    slug: "gpt-6-astra",
+    where: "customModels",
+    message: "Claude has a GPT model (gpt-6-astra) in its custom models; …",
+  };
+
+  it("removes T3's own foreign custom model from the default slot's legacy settings", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          customModels: ["gpt-6-astra", { slug: "claude-x" }],
+        },
+      },
+    } as typeof DEFAULT_SERVER_SETTINGS;
+    const edit = withoutCustomModel(settings, issue);
+    assert.isNotNull(edit);
+    assert.isTrue(edit?.isDefault);
+    assert.deepEqual((edit!.instance.config as { customModels: unknown }).customModels, [
+      { slug: "claude-x" },
+    ]);
+  });
+
+  it("edits an explicit instance, and offers nothing for aliases or absent models", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          config: { customModels: [{ slug: "gpt-6-astra" }] },
+        },
+      },
+    } as unknown as typeof DEFAULT_SERVER_SETTINGS;
+    const edit = withoutCustomModel(settings, { ...issue, instanceId: "claudeAgent_work" });
+    assert.isFalse(edit?.isDefault);
+    assert.deepEqual((edit!.instance.config as { customModels: unknown }).customModels, []);
+    assert.isNull(
+      withoutCustomModel(settings, {
+        ...issue,
+        where: "claudeSettings",
+        setting: "ANTHROPIC_MODEL",
+      }),
+    );
+    assert.isNull(withoutCustomModel(DEFAULT_SERVER_SETTINGS, issue));
+  });
+
+  it("says where to edit an alias the pool never writes", () => {
+    assert.equal(
+      modelIssueHint({ ...issue, where: "claudeSettings", setting: "ANTHROPIC_MODEL" }),
+      "Edit ~/.claude/settings.json",
+    );
+    assert.equal(
+      modelIssueHint({ ...issue, where: "instanceEnv" }),
+      "Edit Claude's environment below",
+    );
+    assert.isNull(modelIssueHint(issue));
   });
 });
