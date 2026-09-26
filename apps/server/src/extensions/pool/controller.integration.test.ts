@@ -81,6 +81,7 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
           baseOptions,
         };
       },
+      claudeConfigDir: async () => stateDir,
       codexVersion: async () => undefined,
       log: () => undefined,
     };

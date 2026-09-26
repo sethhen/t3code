@@ -103,6 +103,12 @@ export const PoolLive = Layer.effectDiscard(
           ...(configDir ? { configDir } : {}),
         };
       },
+      claudeConfigDir: async (instanceId) => {
+        const instance = (await instanceMap())[ProviderInstanceId.make(instanceId)];
+        const homePath = text(configRecord(instance?.config).homePath);
+        if (homePath) return NodePath.resolve(expandHomePath(homePath));
+        return mergeProviderInstanceEnvironment(instance?.environment).CLAUDE_CONFIG_DIR;
+      },
       codexVersion: async () => {
         const instance = (await instanceMap())[ProviderInstanceId.make("codex")];
         const env = mergeProviderInstanceEnvironment(instance?.environment);

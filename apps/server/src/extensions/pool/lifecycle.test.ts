@@ -6,6 +6,7 @@
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFs from "node:fs";
+import * as NodeHttp from "node:http";
 import * as NodeNet from "node:net";
 import * as NodeOs from "node:os";
 import * as NodePath from "node:path";
@@ -26,6 +27,17 @@ const alive = (pid: number) => {
     return true;
   } catch {
     return false;
+  }
+};
+
+/** A killed child of this process stays a zombie until reaped; it no longer runs. */
+const isZombie = (pid: number) => {
+  try {
+    return /Z/.test(
+      NodeChildProcess.execFileSync("ps", ["-o", "stat=", "-p", String(pid)]).toString(),
+    );
+  } catch {
+    return true;
   }
 };
 
@@ -71,6 +83,7 @@ const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
     claudeProbe: async () => {
       throw new Error("no probe in unit tests");
     },
+    claudeConfigDir: async () => undefined,
     codexVersion: async () => undefined,
     log: () => undefined,
     ...over,
@@ -154,6 +167,89 @@ describe("sidecar", () => {
     }
     assert.isFalse(NodeFs.existsSync(paths.pidPath));
   });
+});
+
+describe("sidecar serialisation", () => {
+  it(
+    "never rejects from a failed attempt (it may run from a timer)",
+    { timeout: 15_000 },
+    async () => {
+      const paths = poolPaths(tempDir());
+      const binary = writeFakeProxy(paths);
+      // The log path is a directory: opening it fails inside the attempt.
+      NodeFs.mkdirSync(paths.logPath, { recursive: true });
+      const sidecar = new Sidecar({
+        paths,
+        binaryPath: binary,
+        clientKey: "k",
+        managementKey: "m",
+        ensurePort: freePort,
+        onChange: () => undefined,
+      });
+      let unhandled: unknown;
+      const onUnhandled = (reason: unknown) => {
+        unhandled = reason;
+      };
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        await sidecar.start();
+        assert.strictEqual(sidecar.state.phase, "error");
+        await sleep(1_500); // the scheduled retry runs (and fails) too
+        assert.isUndefined(unhandled);
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+        await sidecar.stop();
+      }
+    },
+  );
+
+  it(
+    "shares one attempt between concurrent starts and drains it on stop",
+    { timeout: 30_000 },
+    async () => {
+      const paths = poolPaths(tempDir());
+      const binary = writeFakeProxy(paths);
+      let portCalls = 0;
+      const sidecar = new Sidecar({
+        paths,
+        binaryPath: binary,
+        clientKey: "k",
+        managementKey: "m",
+        ensurePort: async () => {
+          portCalls++;
+          await sleep(200);
+          return freePort();
+        },
+        onChange: () => undefined,
+      });
+      await Promise.all([sidecar.start(), sidecar.start(), sidecar.start()]);
+      assert.strictEqual(portCalls, 1);
+      assert.strictEqual(sidecar.state.phase, "running");
+      const pid = Number(NodeFs.readFileSync(paths.pidPath, "utf8"));
+      await sidecar.stop();
+      assert.isFalse(alive(pid) && !isZombie(pid));
+
+      // A stop issued mid-start returns only after that start settled; nothing spawns later.
+      const late = new Sidecar({
+        paths,
+        binaryPath: binary,
+        clientKey: "k",
+        managementKey: "m",
+        ensurePort: async () => {
+          await sleep(300);
+          return freePort();
+        },
+        onChange: () => undefined,
+      });
+      const starting = late.start();
+      await sleep(50);
+      await late.stop();
+      await starting;
+      await sleep(500);
+      assert.isFalse(NodeFs.existsSync(paths.pidPath));
+      assert.notStrictEqual(late.state.phase, "running");
+    },
+  );
 });
 
 describe("controller", () => {
@@ -274,6 +370,167 @@ describe("controller", () => {
     } finally {
       await pool.shutdown();
       blocker.close();
+    }
+  });
+
+  it("serialises routing: the key file ends with the latest key", async () => {
+    const paths = poolPaths(tempDir());
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    const urls = Array.from({ length: 8 }, (_, i) => `http://pool-${i}.example.com`);
+    await Promise.all(
+      urls.map((url, i) =>
+        pool.setSource({ source: "external", externalUrl: url, externalKey: `key-${i}` }),
+      ),
+    );
+    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+      external: { key: string };
+    };
+    assert.strictEqual(NodeFs.readFileSync(paths.clientKeyPath, "utf8"), saved.external.key);
+    assert.strictEqual((NodeFs.statSync(paths.clientKeyPath).mode & 0o777).toString(8), "600");
+    await pool.shutdown();
+  });
+
+  it("retries routing that failed instead of treating it as applied", async () => {
+    const paths = poolPaths(tempDir());
+    let failNext = true;
+    let reconciled = 0;
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+      reconcile: async () => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("settings write failed");
+        }
+        reconciled++;
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    await pool
+      .setSource({ source: "external", externalUrl: "http://pool.example.com", externalKey: "k1" })
+      .catch(() => undefined);
+    await pool.setRoute("claudeAgent", "pool");
+    assert.strictEqual(reconciled, 1, "the failed change is applied by the next one");
+    await pool.shutdown();
+  });
+
+  it("resolves omitted external fields against the latest state", async () => {
+    const paths = poolPaths(tempDir());
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    await pool.setSource({
+      source: "external",
+      externalUrl: "http://old.example.com",
+      externalKey: "old",
+    });
+    await Promise.all([
+      pool.setSource({ source: "external", externalUrl: "http://new.example.com" }),
+      pool.setSource({ source: "external", externalKey: "new" }),
+    ]);
+    const saved = JSON.parse(NodeFs.readFileSync(paths.statePath, "utf8")) as {
+      external: { url: string; key: string };
+    };
+    assert.deepStrictEqual(saved.external, { url: "http://new.example.com", key: "new" });
+    await pool.shutdown();
+  });
+
+  it("flags cross-family models on pooled instances, from T3 and from settings.json", async () => {
+    const paths = poolPaths(tempDir());
+    const claudeHome = tempDir();
+    NodeFs.writeFileSync(
+      NodePath.join(claudeHome, "settings.json"),
+      JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "gpt-6-astra", ANTHROPIC_MODEL: "claude-opus-5-5" },
+      }),
+    );
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          customModels: ["gpt-6-astra", "claude-x"],
+        },
+      },
+    } as typeof DEFAULT_SERVER_SETTINGS;
+    const { deps } = fakeDeps(paths, {
+      instanceMap: async () => deriveProviderInstanceConfigMap(settings),
+      claudeConfigDir: async () => claudeHome,
+      installBinary: async () => {
+        throw new Error("offline");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    await pool.setSource({
+      source: "external",
+      externalUrl: "http://pool.example.com",
+      externalKey: "k",
+    });
+    const status = await pool.status();
+    const issues = (status.modelIssues ?? []).map((issue) => [
+      issue.where,
+      issue.slug,
+      issue.setting ?? null,
+    ]);
+    assert.deepStrictEqual(issues, [
+      ["customModels", "gpt-6-astra", null],
+      ["claudeSettings", "gpt-6-astra", "ANTHROPIC_DEFAULT_OPUS_MODEL"],
+    ]);
+    const family = status.checks.find((entry) => entry.id === "modelFamilies");
+    assert.strictEqual(family?.state, "fail");
+    assert.include(family?.detail ?? "", "run GPT inside Claude Code");
+    // The overlay itself still never offers the GPT slug to the pooled Claude instance.
+    const routed = (await deps.instanceMap())["claudeAgent" as never] as {
+      config: { customModels: unknown };
+    };
+    assert.deepStrictEqual(routed.config.customModels, ["claude-x"]);
+    await pool.shutdown();
+  });
+
+  it("re-runs checks requested mid-run, so an external pool never shows a stale failure", async () => {
+    const paths = poolPaths(tempDir());
+    const server = await new Promise<NodeHttp.Server>((resolve) => {
+      const created = NodeHttp.createServer((_request, response) => response.end("{}"));
+      created.listen(0, "127.0.0.1", () => resolve(created));
+    });
+    const { port } = server.address() as NodeNet.AddressInfo;
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+    });
+    const pool = new PoolController(deps);
+    try {
+      await pool.init();
+      await pool.setSource({
+        source: "external",
+        externalUrl: `http://127.0.0.1:${port}`,
+        externalKey: "k",
+      });
+      let proxy: string | undefined;
+      for (let i = 0; i < 40; i++) {
+        proxy = (await pool.status()).checks.find((entry) => entry.id === "proxy")?.state;
+        if (proxy === "ok") break;
+        await sleep(100);
+      }
+      assert.strictEqual(proxy, "ok");
+    } finally {
+      await pool.shutdown();
+      server.close();
     }
   });
 });

@@ -11,6 +11,7 @@
  * rebuild them and end every running session; the sidecar restarts itself
  * instead.
  */
+import * as NodeCrypto from "node:crypto";
 import * as NodeFsPromises from "node:fs/promises";
 import * as NodePath from "node:path";
 
@@ -19,11 +20,14 @@ import type {
   PoolCheck,
   PoolLoginStart,
   PoolLoginState,
+  PoolModelIssue,
   PoolProvider,
+  PoolRoute,
   PoolRouteMode,
   PoolRuntimeState,
   PoolSetSourceInput,
   PoolStatus,
+  ProviderInstanceConfig,
   ProviderInstanceConfigMap,
   UsageLimitSourceAccount,
   UsageLimitSourceConfig,
@@ -44,7 +48,13 @@ import {
   setAuthFileDisabled,
   startLogin,
 } from "./management.ts";
-import { describeRoutes, poolOverlay, type PoolRoutingContext } from "./overlay.ts";
+import {
+  customModelSlug,
+  describeRoutes,
+  isForeignModel,
+  poolOverlay,
+  type PoolRoutingContext,
+} from "./overlay.ts";
 import {
   check,
   findEnvConflicts,
@@ -80,6 +90,8 @@ export interface PoolDeps {
   readonly claudeProbe: (
     instanceId: string,
   ) => Promise<ToolSearchProbe & { readonly configDir?: string }>;
+  /** The Claude config directory `instanceId` uses (`CLAUDE_CONFIG_DIR`), for its `settings.json`. */
+  readonly claudeConfigDir: (instanceId: string) => Promise<string | undefined>;
   /** The version of the Codex CLI the pooled Codex instance runs (`client_version` for its catalog). */
   readonly codexVersion: () => Promise<string | undefined>;
   /** Tests replace the download; production uses `ensureBinary`. */
@@ -88,6 +100,17 @@ export interface PoolDeps {
 }
 
 const PROVIDER_NAMES: Record<PoolProvider, string> = { claude: "Claude", codex: "ChatGPT" };
+
+/** Claude Code env variables that name a model (aliases, the main model, subagents, background tasks). */
+const CLAUDE_MODEL_ALIASES: ReadonlyArray<string> = [
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+];
 
 /** Native Codex refreshes its catalog on a similar cadence. */
 const CODEX_CATALOG_MAX_AGE_MS = 12 * 60 * 60 * 1000;
@@ -136,6 +159,7 @@ export class PoolController {
   private checks: PoolCheck[] = [];
   private checkedAt: string | undefined;
   private checking: Promise<void> | undefined;
+  private checkAgain = false;
   private signature: string | undefined;
   private codexCatalogPath: string | undefined;
   private codexCatalogError: string | undefined;
@@ -147,6 +171,10 @@ export class PoolController {
   private startAbort: AbortController | undefined;
   /** Serialises state writes: one file, one writer at a time. */
   private stateQueue: Promise<void> = Promise.resolve();
+  /** Serialises routing changes (key file + reconcile), so an older one never lands last. */
+  private routingQueue: Promise<void> = Promise.resolve();
+  /** The instance map as it reached the pool's overlay (custom models unfiltered). */
+  private baseMap: ProviderInstanceConfigMap | undefined;
 
   private readonly deps: PoolDeps;
 
@@ -161,9 +189,10 @@ export class PoolController {
       () => this.deps.paths.codexCatalogPath,
       () => undefined,
     );
-    this.unregisterOverlay = registerInstanceOverlay("pool", (map) =>
-      poolOverlay(this.routingContext())(map),
-    );
+    this.unregisterOverlay = registerInstanceOverlay("pool", (map) => {
+      this.baseMap = map;
+      return poolOverlay(this.routingContext())(map);
+    });
     // Rewriting settings to re-reconcile is only needed when the overlay changes something.
     const context = this.routingContext();
     if (context.claude || context.codex) await this.applyRouting();
@@ -224,14 +253,22 @@ export class PoolController {
   }
 
   /** Reconciles the provider instances when anything the overlay reads has changed. */
-  private async applyRouting() {
-    const context = this.routingContext();
-    const signature = this.routingSignature(context);
-    if (signature === this.signature) return;
-    this.signature = signature;
-    await this.writeClientKey(context.claude?.key ?? context.codex?.key);
-    await this.deps.reconcile();
-    void this.runChecks();
+  private applyRouting(): Promise<void> {
+    const run = this.routingQueue.then(async () => {
+      const context = this.routingContext();
+      const signature = this.routingSignature(context);
+      if (signature === this.signature) return;
+      await this.writeClientKey(context.claude?.key ?? context.codex?.key);
+      await this.deps.reconcile();
+      // Committed only once both landed, so a failure is retried by the next change.
+      this.signature = signature;
+      void this.runChecks();
+    });
+    this.routingQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   /** The key file `apiKeyHelper` prints (0600; the key never goes on a command line). */
@@ -239,8 +276,10 @@ export class PoolController {
     if (!key) return;
     const path = this.deps.paths.clientKeyPath;
     await NodeFsPromises.mkdir(this.deps.paths.root, { recursive: true, mode: 0o700 });
-    await NodeFsPromises.writeFile(path, key, { mode: 0o600 });
-    await NodeFsPromises.chmod(path, 0o600);
+    // Temp + rename: a reader never sees a half-written key.
+    const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
+    await NodeFsPromises.writeFile(temp, key, { mode: 0o600 });
+    await NodeFsPromises.rename(temp, path);
   }
 
   /** Serialised: the change sees the latest state, and memory follows only a successful write. */
@@ -480,6 +519,21 @@ export class PoolController {
         ? "Add the pool URL and key"
         : `Waiting for a ${PROVIDER_NAMES[provider]} account`,
     );
+    // Live, not from the last check run: a removed model clears on the next poll.
+    const modelIssues = await this.modelIssues(routes).catch(() => []);
+    const checks = [
+      ...this.checks.filter((entry) => entry.id !== "modelFamilies"),
+      ...(modelIssues.length > 0
+        ? [
+            check(
+              "modelFamilies",
+              "Model families",
+              "fail",
+              modelIssues.map((issue) => issue.message).join(" "),
+            ),
+          ]
+        : []),
+    ];
     return {
       source: this.state.source,
       runtime: this.runtimeState(),
@@ -492,9 +546,70 @@ export class PoolController {
       accounts: this.state.source === "local" ? accounts : [],
       ...(this.accountsError ? { accountsError: this.accountsError } : {}),
       routes,
-      checks: this.checks,
+      checks,
+      ...(modelIssues.length > 0 ? { modelIssues } : {}),
       ...(this.checkedAt ? { checkedAt: this.checkedAt } : {}),
     };
+  }
+
+  /**
+   * Models of the other family configured on pooled instances: T3's own custom
+   * models, and for Claude the model aliases in the instance's environment and in
+   * its `settings.json` (read only). T3 never offers one through the pool; a
+   * hand-configured one is flagged, not blocked.
+   */
+  private async modelIssues(routes: ReadonlyArray<PoolRoute>): Promise<PoolModelIssue[]> {
+    const base = this.baseMap as
+      | Readonly<Record<string, ProviderInstanceConfig | undefined>>
+      | undefined;
+    if (!base) return [];
+    const issues: PoolModelIssue[] = [];
+    for (const route of routes) {
+      const instance = route.active ? base[route.instanceId] : undefined;
+      if (!instance) continue;
+      const common = {
+        instanceId: route.instanceId,
+        displayName: route.displayName,
+        provider: route.provider,
+      };
+      const foreign = route.provider === "claude" ? "GPT" : "Claude";
+      const harness = route.provider === "claude" ? "Claude Code" : "Codex";
+      const config = (instance.config ?? {}) as Record<string, unknown>;
+      for (const model of Array.isArray(config.customModels) ? config.customModels : []) {
+        const slug = customModelSlug(model);
+        if (!slug || !isForeignModel(slug, route.provider)) continue;
+        issues.push({
+          ...common,
+          slug,
+          where: "customModels",
+          message: `${route.displayName} has a ${foreign} model (${slug}) in its custom models; through the pool it would run ${foreign} inside ${harness}.`,
+        });
+      }
+      if (route.provider !== "claude") continue;
+      const aliasIssue = (setting: string, slug: string, where: "instanceEnv" | "claudeSettings") =>
+        issues.push({
+          ...common,
+          slug,
+          where,
+          setting,
+          message: `${setting} in ${where === "claudeSettings" ? "~/.claude/settings.json" : `${route.displayName}'s environment`} points Claude at ${slug}; through the pool it would run GPT inside Claude Code.`,
+        });
+      for (const entry of instance.environment ?? []) {
+        if (CLAUDE_MODEL_ALIASES.includes(entry.name) && isForeignModel(entry.value, "claude")) {
+          aliasIssue(entry.name, entry.value, "instanceEnv");
+        }
+      }
+      const settingsEnv = await readClaudeSettingsEnv(
+        await this.deps.claudeConfigDir(route.instanceId),
+      );
+      for (const name of CLAUDE_MODEL_ALIASES) {
+        const value = settingsEnv[name];
+        if (typeof value === "string" && isForeignModel(value, "claude")) {
+          aliasIssue(name, value, "claudeSettings");
+        }
+      }
+    }
+    return issues;
   }
 
   // -------------------------------------------------------------------------
@@ -502,16 +617,16 @@ export class PoolController {
 
   async setSource(input: PoolSetSourceInput) {
     if (input.source === "external") {
-      const url = (input.externalUrl ?? this.state.external.url).trim();
-      const key = (input.externalKey ?? this.state.external.key).trim();
-      if (!/^https?:\/\/\S+$/i.test(url))
-        throw new Error("Enter the pool's URL, e.g. https://pool.example.com");
-      if (!key) throw new Error("Enter the key the pool gave you.");
-      await this.updateState((current) => ({
-        ...current,
-        source: "external",
-        external: { url, key },
-      }));
+      // Omitted fields resolve inside the queue, against the latest state.
+      await this.updateState((current) => {
+        const url = (input.externalUrl ?? current.external.url).trim();
+        const key = (input.externalKey ?? current.external.key).trim();
+        if (!/^https?:\/\/\S+$/i.test(url)) {
+          throw new Error("Enter the pool's URL, e.g. https://pool.example.com");
+        }
+        if (!key) throw new Error("Enter the key the pool gave you.");
+        return { ...current, source: "external", external: { url, key } };
+      });
       await this.stopLocal();
       await this.syncUsageSource().catch(() => undefined);
       await this.applyRouting();
@@ -603,17 +718,25 @@ export class PoolController {
   // -------------------------------------------------------------------------
   // Native-parity checks
 
+  /** Runs the checks; a request made while they run queues exactly one more pass. */
   private runChecks(): Promise<void> {
-    if (this.checking) return this.checking;
-    this.checking = this.computeChecks()
-      .then((checks) => {
-        this.checks = checks;
-        this.checkedAt = new Date().toISOString();
-      })
-      .catch((error) => this.deps.log("Pool checks failed", error))
-      .finally(() => {
-        this.checking = undefined;
-      });
+    if (this.checking) {
+      this.checkAgain = true;
+      return this.checking;
+    }
+    this.checking = (async () => {
+      do {
+        this.checkAgain = false;
+        try {
+          this.checks = await this.computeChecks();
+          this.checkedAt = new Date().toISOString();
+        } catch (error) {
+          this.deps.log("Pool checks failed", error);
+        }
+      } while (this.checkAgain && !this.closed);
+    })().finally(() => {
+      this.checking = undefined;
+    });
     return this.checking;
   }
 
@@ -635,9 +758,11 @@ export class PoolController {
         );
     } else {
       checks.push(
-        this.external.reachable
-          ? check("proxy", "Pool", "ok", `Connected to ${this.state.external.url}`)
-          : check("proxy", "Pool", "fail", this.external.message ?? "Can't reach the pool."),
+        this.external.reachable === undefined
+          ? check("proxy", "Pool", "unknown", "Checking the pool server…")
+          : this.external.reachable
+            ? check("proxy", "Pool", "ok", `Connected to ${this.state.external.url}`)
+            : check("proxy", "Pool", "fail", this.external.message ?? "Can't reach the pool."),
       );
     }
 
@@ -670,11 +795,18 @@ export class PoolController {
       checks.push(check("cache", "1h cache", "unknown", reason));
       checks.push(check("advisor", "Advisor", "unknown", reason));
     } else {
-      const probe = await this.deps.claudeProbe(claudeRoute.instanceId);
-      const toolSearch = await probeToolSearch(probe).then(
-        (on) => (on ? ("ok" as const) : ("fail" as const)),
-        (error) => ({ error: messageOf(error) }),
-      );
+      // Preparing or running the probe can fail (e.g. no `claude` on this machine): that
+      // marks tool search unknown, never the whole check run.
+      const probe = await this.deps
+        .claudeProbe(claudeRoute.instanceId)
+        .catch((error: unknown) => ({ error: messageOf(error) }) as const);
+      const toolSearch =
+        "error" in probe
+          ? probe
+          : await probeToolSearch(probe).then(
+              (on) => (on ? ("ok" as const) : ("fail" as const)),
+              (error) => ({ error: messageOf(error) }),
+            );
       checks.push(
         toolSearch === "ok"
           ? check(
@@ -697,7 +829,14 @@ export class PoolController {
                 `The Claude probe failed: ${toolSearch.error}`,
               ),
       );
-      const conflicts = findEnvConflicts(await readClaudeSettingsEnv(probe.configDir), process.env);
+      const conflicts = findEnvConflicts(
+        await readClaudeSettingsEnv(
+          "error" in probe
+            ? await this.deps.claudeConfigDir(claudeRoute.instanceId)
+            : probe.configDir,
+        ),
+        process.env,
+      );
       const cacheConflict = conflicts.find((conflict) => /CACHING/.test(conflict));
       checks.push(
         cacheConflict

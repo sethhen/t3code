@@ -25,7 +25,9 @@
  * attributes and in T3's resource telemetry): flag settings blank both token
  * variables, which also neutralises a stale token in `~/.claude/settings.json`,
  * and `apiKeyHelper` reads the key from a 0600 file. Claude Code runs the helper
- * with `shell: true`, i.e. `/bin/sh` or `cmd.exe`.
+ * with `shell: true`, i.e. `/bin/sh` or `cmd.exe`; the file's path reaches it
+ * through an environment variable, never the command text, so neither shell can
+ * expand anything in it (cmd expands `%VAR%` even inside quotes).
  *
  * Models stay in their own harness (Seth's rule): Claude models only through
  * Claude Code, OpenAI models only through Codex, although the proxy would serve
@@ -59,9 +61,18 @@ export interface KeyHelper {
   readonly platform: string;
 }
 
-/** A shell command that prints the key file: `cmd.exe` on Windows, `/bin/sh` elsewhere. */
-export const keyHelperCommand = ({ path, platform }: KeyHelper) =>
-  platform === "win32" ? `type "${path}"` : `cat '${path.replaceAll("'", `'\\''`)}'`;
+/** Carries the key file's path to `apiKeyHelper` (see `keyHelperCommand`). */
+export const KEY_FILE_ENV = "T3_POOL_KEY_FILE";
+
+/**
+ * Prints the key file named by `T3_POOL_KEY_FILE`. The command text holds no
+ * path: `/bin/sh` expands only the variable, and PowerShell reads it as a
+ * literal path (`cmd.exe`, which runs the helper on Windows, sees nothing to expand).
+ */
+export const keyHelperCommand = (platform: string) =>
+  platform === "win32"
+    ? `powershell -NoProfile -NonInteractive -Command "Get-Content -Raw -LiteralPath $env:${KEY_FILE_ENV}"`
+    : `cat "$${KEY_FILE_ENV}"`;
 
 export interface PoolRoutingContext {
   /** Present when the pool can serve Claude right now. */
@@ -92,26 +103,34 @@ export const claudeParityEnv = (endpoint: PoolEndpoint): Readonly<Record<string,
  */
 export const claudeFlagSettings = (endpoint: PoolEndpoint, keyHelper: KeyHelper) => ({
   advisorModel: "opus",
-  apiKeyHelper: keyHelperCommand(keyHelper),
-  env: { ...claudeParityEnv(endpoint), ANTHROPIC_AUTH_TOKEN: "", ANTHROPIC_API_KEY: "" },
+  apiKeyHelper: keyHelperCommand(keyHelper.platform),
+  env: {
+    ...claudeParityEnv(endpoint),
+    [KEY_FILE_ENV]: keyHelper.path,
+    ANTHROPIC_AUTH_TOKEN: "",
+    ANTHROPIC_API_KEY: "",
+  },
 });
 
 const OPENAI_MODEL = /^(gpt|o\d|codex|chatgpt)/i;
 const CLAUDE_MODEL = /(claude|opus|sonnet|haiku|fable)/i;
 
+/** True when `slug` belongs to the other family (an OpenAI model in Claude, or vice versa). */
+export const isForeignModel = (slug: string, provider: PoolProvider) =>
+  (provider === "claude" ? OPENAI_MODEL : CLAUDE_MODEL).test(slug);
+
+/** The slug of a `customModels` entry (a bare string or `{ slug }`). */
+export const customModelSlug = (model: unknown): string =>
+  typeof model === "string"
+    ? model
+    : typeof model === "object" && model !== null && "slug" in model
+      ? String((model as { slug: unknown }).slug)
+      : "";
+
 /** Drops custom models of the other family from a pooled instance. */
 export const sameFamilyModels = (customModels: unknown, provider: PoolProvider): unknown => {
   if (!Array.isArray(customModels)) return customModels;
-  const foreign = provider === "claude" ? OPENAI_MODEL : CLAUDE_MODEL;
-  return customModels.filter((model: unknown) => {
-    const slug =
-      typeof model === "string"
-        ? model
-        : typeof model === "object" && model !== null && "slug" in model
-          ? String((model as { slug: unknown }).slug)
-          : "";
-    return !foreign.test(slug);
-  });
+  return customModels.filter((model: unknown) => !isForeignModel(customModelSlug(model), provider));
 };
 
 /** `-c key=<TOML string>`, single-quoted for `tokenizeCliArgs` (JSON strings are valid TOML basic strings). */
@@ -177,6 +196,7 @@ export const routeInstance = (
         instance.environment,
         {
           ...claudeParityEnv(context.claude),
+          [KEY_FILE_ENV]: context.keyHelper.path,
           ANTHROPIC_AUTH_TOKEN: context.claude.key,
           ANTHROPIC_API_KEY: "",
         },

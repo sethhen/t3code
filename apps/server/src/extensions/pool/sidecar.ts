@@ -135,6 +135,7 @@ export class Sidecar {
   private stopping = false;
   private failures = 0;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private startPromise: Promise<void> | undefined;
   private currentPort: number | undefined;
 
   constructor(options: SidecarOptions) {
@@ -155,26 +156,38 @@ export class Sidecar {
     this.options.onChange();
   }
 
-  /** Starts the proxy and waits (bounded) for it to answer. Failures retry with backoff. */
-  async start(): Promise<void> {
+  /**
+   * Starts the proxy and waits (bounded) for it to answer. Serialised: a retry
+   * and a controller start share one attempt. Never rejects; a failure is
+   * recorded and retried with backoff (it may run from a timer, where a
+   * rejection would be unhandled and take the server down).
+   */
+  start(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    this.startPromise ??= this.attempt()
+      .catch((error: unknown) => {
+        if (!this.stopping) this.fail(`The pool could not start: ${messageOf(error)}.`);
+      })
+      .finally(() => {
+        this.startPromise = undefined;
+      });
+    return this.startPromise;
+  }
+
+  private async attempt(): Promise<void> {
     if (this.child || this.stopping) return;
     this.clearRetry();
     this.set({ phase: "starting" });
     const { paths } = this.options;
-    let port: number;
-    try {
-      port = await this.options.ensurePort();
-      await NodeFsPromises.mkdir(paths.authDir, { recursive: true, mode: 0o700 });
-      // In place: the proxy watches this file, and a rename reads as a delete.
-      await NodeFsPromises.writeFile(
-        paths.configPath,
-        renderProxyConfig({ ...this.options, port, authDir: paths.authDir }),
-        { mode: 0o600 },
-      );
-    } catch (error) {
-      this.fail(`The pool could not start: ${messageOf(error)}`);
-      return;
-    }
+    const port = await this.options.ensurePort();
+    if (this.stopping) return;
+    await NodeFsPromises.mkdir(paths.authDir, { recursive: true, mode: 0o700 });
+    // In place: the proxy watches this file, and a rename reads as a delete.
+    await NodeFsPromises.writeFile(
+      paths.configPath,
+      renderProxyConfig({ ...this.options, port, authDir: paths.authDir }),
+      { mode: 0o600 },
+    );
     if (this.stopping || this.child) return;
     this.currentPort = port;
 
@@ -186,12 +199,9 @@ export class Sidecar {
         stdio: ["ignore", log, log],
         windowsHide: true,
       });
-    } catch (error) {
+    } finally {
       NodeFs.closeSync(log);
-      this.fail(`The pool could not start: ${messageOf(error)}`);
-      return;
     }
-    NodeFs.closeSync(log);
     this.child = child;
 
     // One path for every way the process can go (a failed spawn emits 'error' and may
@@ -207,14 +217,17 @@ export class Sidecar {
       gone = true;
       process.off("exit", killOnExit);
       if (this.child === child) this.child = undefined;
-      void removePidFileIf(paths.pidPath, child.pid);
+      void removePidFileIf(paths.pidPath, child.pid).catch(() => undefined);
       if (!this.stopping) this.fail(`${reason}. Log: ${paths.logPath}.`);
     };
     process.once("exit", killOnExit);
     child.once("error", (error) => onGone(`The pool could not start: ${error.message}`));
     child.once("exit", (code, signal) => onGone(`The pool stopped (${signal ?? `exit ${code}`})`));
 
-    if (child.pid) await NodeFsPromises.writeFile(paths.pidPath, String(child.pid));
+    // Only for crash cleanup: a failed write must not take down a healthy proxy.
+    if (child.pid) {
+      await NodeFsPromises.writeFile(paths.pidPath, String(child.pid)).catch(() => undefined);
+    }
 
     const deadline = Date.now() + HEALTH_TIMEOUT_MS;
     while (Date.now() < deadline && this.child === child) {
@@ -262,18 +275,26 @@ export class Sidecar {
     }
   }
 
+  /** Stops the proxy; waits out a start in progress so nothing lands after it returns. */
   async stop(): Promise<void> {
     this.stopping = true;
     this.clearRetry();
-    const child = this.child;
-    this.child = undefined;
-    if (child && child.exitCode === null && child.pid !== undefined) {
+    await this.kill(this.child);
+    await this.startPromise;
+    // A start that spawned just before it saw `stopping`.
+    await this.kill(this.child);
+    this.snapshot = { phase: "stopped" };
+  }
+
+  private async kill(child: NodeChildProcess.ChildProcess | undefined) {
+    if (!child) return;
+    if (this.child === child) this.child = undefined;
+    if (child.exitCode === null && child.signalCode === null && child.pid !== undefined) {
       const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
       child.kill("SIGTERM");
       await Promise.race([exited, sleep(3_000)]);
-      if (child.exitCode === null) child.kill("SIGKILL");
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
-    await removePidFileIf(this.options.paths.pidPath, child?.pid);
-    this.snapshot = { phase: "stopped" };
+    await removePidFileIf(this.options.paths.pidPath, child.pid).catch(() => undefined);
   }
 }

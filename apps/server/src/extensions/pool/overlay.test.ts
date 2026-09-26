@@ -70,7 +70,8 @@ describe("routeInstance: Claude", () => {
     };
     assert.strictEqual(settings.env.ANTHROPIC_AUTH_TOKEN, "");
     assert.strictEqual(settings.env.ANTHROPIC_API_KEY, "");
-    assert.strictEqual(settings.apiKeyHelper, "cat '/state/pool/client-key'");
+    assert.strictEqual(settings.apiKeyHelper, 'cat "$T3_POOL_KEY_FILE"');
+    assert.strictEqual(settings.env.T3_POOL_KEY_FILE, "/state/pool/client-key");
   });
 
   it("replaces a user env entry of the same name instead of duplicating it", () => {
@@ -124,15 +125,28 @@ describe("routeInstance: Codex", () => {
 });
 
 describe("keyHelperCommand", () => {
-  it("prints the key file with the shell Claude Code uses", () => {
+  it("reads the key file through an env var, so no path is ever in the command text", () => {
+    assert.strictEqual(keyHelperCommand("darwin"), 'cat "$T3_POOL_KEY_FILE"');
     assert.strictEqual(
-      keyHelperCommand({ path: "/Users/o'brien/pool/client-key", platform: "linux" }),
-      `cat '/Users/o'\\''brien/pool/client-key'`,
+      keyHelperCommand("win32"),
+      'powershell -NoProfile -NonInteractive -Command "Get-Content -Raw -LiteralPath $env:T3_POOL_KEY_FILE"',
     );
-    assert.strictEqual(
-      keyHelperCommand({ path: String.raw`C:\Users\me\pool\client-key`, platform: "win32" }),
-      String.raw`type "C:\Users\me\pool\client-key"`,
+  });
+
+  it("carries a path cmd.exe or sh would expand only in the env, verbatim", () => {
+    const path = String.raw`C:\Users\%TEMP%\$HOME\pool\client-key`;
+    const routed = routeInstance(
+      "claudeAgent",
+      claude(),
+      context({ keyHelper: { path, platform: "win32" } }),
     );
+    const settings = launchArgSettings(launchArgs(routed)) as {
+      env: Record<string, string>;
+      apiKeyHelper: string;
+    };
+    assert.notInclude(settings.apiKeyHelper, "%TEMP%");
+    assert.strictEqual(settings.env.T3_POOL_KEY_FILE, path);
+    assert.strictEqual(envOf(routed).T3_POOL_KEY_FILE?.value, path);
   });
 });
 

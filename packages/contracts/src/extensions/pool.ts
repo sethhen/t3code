@@ -99,6 +99,24 @@ export const PoolCheck = Schema.Struct({
 });
 export type PoolCheck = typeof PoolCheck.Type;
 
+/**
+ * A model of the other family configured on a pooled instance (e.g. a GPT slug
+ * in Claude's custom models). T3 never offers one through the pool; these are
+ * hand-configured, so the section flags them rather than blocking.
+ */
+export const PoolModelIssue = Schema.Struct({
+  instanceId: Schema.String,
+  displayName: Schema.String,
+  provider: PoolProvider,
+  slug: Schema.String,
+  /** `customModels`: T3's own setting (removable from the section). Otherwise where to edit it. */
+  where: Schema.Literals(["customModels", "instanceEnv", "claudeSettings"]),
+  /** The env variable, for `instanceEnv` / `claudeSettings`. */
+  setting: Schema.optional(Schema.String),
+  message: Schema.String,
+});
+export type PoolModelIssue = typeof PoolModelIssue.Type;
+
 export const PoolStatus = Schema.Struct({
   source: PoolSource,
   runtime: PoolRuntime,
@@ -108,6 +126,7 @@ export const PoolStatus = Schema.Struct({
   routes: Schema.Array(PoolRoute),
   checks: Schema.Array(PoolCheck),
   checkedAt: Schema.optional(Schema.String),
+  modelIssues: Schema.optional(Schema.Array(PoolModelIssue)),
 });
 export type PoolStatus = typeof PoolStatus.Type;
 
