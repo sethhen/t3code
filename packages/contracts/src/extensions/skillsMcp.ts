@@ -255,6 +255,8 @@ export const SkillAppEntry = Schema.Struct({
   /** symlink/copy: deployed by the store. native: the app's own folder (unmanaged). */
   mode: Schema.optional(Schema.Literals(["symlink", "copy", "native"])),
   editable: Schema.Boolean,
+  /** A plain folder directly in the app's user skills folder, so `adopt` accepts it. */
+  adoptable: Schema.optional(Schema.Boolean),
 });
 export type SkillAppEntry = typeof SkillAppEntry.Type;
 
@@ -444,6 +446,8 @@ export type McpContextCost = typeof McpContextCost.Type;
 export const AppContext = Schema.Struct({
   /** True when the agent measured it (Claude `/context`); false for a local estimate (Codex). */
   exact: Schema.Boolean,
+  /** What an estimate covers, e.g. Codex: "MCP tools and skills only". */
+  note: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
   windowTokens: Schema.optional(Schema.Number),
   /** Tokens a new thread in this cwd starts with before the first message. */
