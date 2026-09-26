@@ -30,6 +30,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { isDesktopLocalConnectionTarget } from "../../connection/desktopLocal";
 import { isElectron } from "../../env";
+import { ProviderSettingsExtensions } from "~/extensions/providerSettings"; // t3-ext
 import { usePrimarySessionState } from "../../environments/primary";
 import {
   useEnvironmentSettings,
@@ -989,6 +990,12 @@ export function EnvironmentProviderSettings({
 
   return (
     <>
+      {/* t3-ext */}
+      <ProviderSettingsExtensions
+        environmentId={environmentId}
+        environmentLabel={environmentLabel}
+        readOnly={readOnly}
+      />
       <SettingsSection {...searchableSetting("providers")} hideTitle variant="plain">
         <div className="flex min-h-11 min-w-0 items-center gap-2 px-3 sm:px-4">
           {deviceTabs}
