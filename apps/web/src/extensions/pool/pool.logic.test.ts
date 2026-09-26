@@ -1,0 +1,396 @@
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type PoolAccount,
+  type PoolCheck,
+  type PoolModelIssue,
+  type PoolRoute,
+  type PoolStatus,
+} from "@t3tools/contracts";
+import { assert, describe, it } from "vite-plus/test";
+
+import {
+  accountLabel,
+  accountNotice,
+  isParityVisible,
+  isPoolUnsupported,
+  isRoutingVisible,
+  joinNames,
+  modelIssueHint,
+  orderRoutes,
+  poolStartFailure,
+  withLiveStartFailure,
+  normalizeExternalUrl,
+  orderAccounts,
+  parityHeadline,
+  parityProblems,
+  parityProblemText,
+  poolHeaderStatus,
+  routeWaitingReason,
+  routingSummary,
+  statusPollDelay,
+  withoutCustomModel,
+} from "./pool.logic";
+
+function account(overrides: Partial<PoolAccount> = {}): PoolAccount {
+  return { id: "claude-a.json", provider: "claude", status: "ready", windows: [], ...overrides };
+}
+
+function status(overrides: Partial<PoolStatus> = {}): PoolStatus {
+  return {
+    source: "local",
+    runtime: { state: "running", version: "6.0.0" },
+    external: { url: "", hasKey: false },
+    accounts: [],
+    routes: [],
+    checks: [],
+    ...overrides,
+  };
+}
+
+function route(overrides: Partial<PoolRoute> = {}): PoolRoute {
+  return {
+    instanceId: "claudeAgent",
+    provider: "claude",
+    displayName: "Claude",
+    mode: "pool",
+    active: true,
+    ...overrides,
+  };
+}
+
+describe("poolHeaderStatus", () => {
+  it("names each local runtime state", () => {
+    const labels = (["idle", "downloading", "starting", "error"] as const).map(
+      (state) => poolHeaderStatus(status({ runtime: { state, version: "6.0.0" } })).label,
+    );
+    assert.deepEqual(labels, ["Not set up", "Downloading…", "Starting…", "Can't start the pool"]);
+  });
+
+  it("counts accounts while running, with the singular for one", () => {
+    assert.deepEqual(poolHeaderStatus(status({ accounts: [account()] })), {
+      label: "Running · 1 account",
+      tone: "ready",
+    });
+    assert.equal(
+      poolHeaderStatus(status({ accounts: [account(), account({ id: "b" })] })).label,
+      "Running · 2 accounts",
+    );
+  });
+
+  it("says it can't start, with the runtime's own reason for the tooltip", () => {
+    assert.deepEqual(
+      poolHeaderStatus(
+        status({ runtime: { state: "error", version: "6.0.0", message: "Port 18417 is in use" } }),
+      ),
+      { label: "Can't start the pool", tone: "error", detail: "Port 18417 is in use" },
+    );
+  });
+
+  it("reports an external pool by reachability, not by the local runtime", () => {
+    const external = (reachable: boolean | undefined, url = "http://pool:8317") =>
+      poolHeaderStatus(
+        status({
+          source: "external",
+          runtime: { state: "error", version: "6.0.0", message: "ignored" },
+          external: { url, hasKey: true, ...(reachable === undefined ? {} : { reachable }) },
+        }),
+      );
+    assert.deepEqual(external(true), { label: "Connected", tone: "ready" });
+    assert.deepEqual(external(false), { label: "Unreachable", tone: "error" });
+    assert.equal(external(undefined).label, "Connecting…");
+    assert.equal(external(true, "").label, "Not connected");
+  });
+});
+
+describe("accounts", () => {
+  it("maps statuses to notices, with fallbacks when the server sends no message", () => {
+    assert.equal(accountNotice(account()), null);
+    assert.deepEqual(accountNotice(account({ status: "disabled" })), { kind: "paused" });
+    assert.deepEqual(
+      accountNotice(account({ status: "cooling", message: "Cooling down · resets in 3h" })),
+      { kind: "cooling", text: "Cooling down · resets in 3h" },
+    );
+    assert.deepEqual(accountNotice(account({ status: "cooling", message: "  " })), {
+      kind: "cooling",
+      text: "Cooling down",
+    });
+    assert.deepEqual(accountNotice(account({ status: "error" })), {
+      kind: "error",
+      text: "Needs attention",
+    });
+  });
+
+  it("labels an account by email, else by what was signed in", () => {
+    assert.equal(accountLabel(account({ email: "a@example.com" })), "a@example.com");
+    assert.equal(accountLabel(account({ provider: "codex" })), "ChatGPT account");
+  });
+
+  it("orders Claude before Codex and keeps server order within each", () => {
+    const ordered = orderAccounts([
+      account({ id: "x1", provider: "codex" }),
+      account({ id: "c1" }),
+      account({ id: "x2", provider: "codex" }),
+      account({ id: "c2" }),
+    ]);
+    assert.deepEqual(
+      ordered.map((entry) => entry.id),
+      ["c1", "c2", "x1", "x2"],
+    );
+  });
+});
+
+describe("routeWaitingReason", () => {
+  it("only explains pool routes that are not serving", () => {
+    assert.equal(routeWaitingReason(route()), null);
+    assert.equal(routeWaitingReason(route({ mode: "direct", active: false })), null);
+    assert.equal(
+      routeWaitingReason(route({ active: false, reason: "Pool is starting" })),
+      "Pool is starting",
+    );
+    assert.equal(
+      routeWaitingReason(route({ provider: "codex", active: false })),
+      "Waiting for a ChatGPT account",
+    );
+  });
+});
+
+describe("routing summary", () => {
+  const claude = route();
+  const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+
+  it("says who uses the pool, who waits and who is direct, in one line", () => {
+    assert.equal(routingSummary([claude, codex]), "Claude and Codex use the pool");
+    assert.equal(routingSummary([codex, claude]), "Claude and Codex use the pool");
+    assert.equal(
+      routingSummary([codex, { ...claude, mode: "direct", active: false }]),
+      "Codex uses the pool · Claude is direct",
+    );
+    assert.equal(
+      routingSummary([{ ...claude, active: false }]),
+      "Claude is waiting for a Claude account",
+    );
+    assert.equal(
+      routingSummary([
+        claude,
+        { ...codex, active: false },
+        route({
+          instanceId: "claudeAgent_work",
+          displayName: "Claude (Work)",
+          mode: "direct",
+          active: false,
+        }),
+      ]),
+      "Claude uses the pool · Codex is waiting for a ChatGPT account · Claude (Work) is direct",
+    );
+    assert.equal(routingSummary([]), "No Claude or Codex provider is set up");
+  });
+
+  it("joins names the way a sentence would", () => {
+    assert.equal(joinNames(["A"]), "A");
+    assert.equal(joinNames(["A", "B"]), "A and B");
+    assert.equal(joinNames(["A", "B", "C"]), "A, B and C");
+  });
+
+  it("appears once the pool can serve something", () => {
+    assert.isFalse(isRoutingVisible(status()));
+    assert.isTrue(isRoutingVisible(status({ accounts: [account()] })));
+    assert.isTrue(
+      isRoutingVisible(
+        status({ source: "external", external: { url: "http://pool:8317", hasKey: true } }),
+      ),
+    );
+  });
+});
+
+describe("native parity", () => {
+  const ok: PoolCheck = { id: "tools", label: "Tool search", state: "ok" };
+  const unknown: PoolCheck = { id: "codex", label: "Codex", state: "unknown" };
+  const warn: PoolCheck = {
+    id: "codex",
+    label: "Codex",
+    state: "warn",
+    detail: "Built-in catalog",
+  };
+  const fail: PoolCheck = { id: "proxy", label: "Pool", state: "fail", detail: "Not running" };
+
+  it("shows problems first (failures, then warnings) and nothing else", () => {
+    assert.deepEqual(parityProblems([ok, warn, unknown, fail]), [fail, warn]);
+    assert.deepEqual(parityProblems([ok, unknown]), []);
+  });
+
+  it("says all passed when something passed and nothing needs attention", () => {
+    assert.equal(parityHeadline([ok, unknown]), "passed");
+    assert.equal(parityHeadline([unknown]), "unchecked");
+  });
+
+  it("writes each problem as a sentence", () => {
+    assert.equal(parityProblemText(fail), "Pool: Not running");
+    assert.equal(
+      parityProblemText({ id: "sticky", label: "Sticky sessions", state: "fail" }),
+      "Sticky sessions is off in pooled sessions.",
+    );
+    assert.equal(
+      parityProblemText({ id: "x", label: "Codex", state: "warn" }),
+      "Codex needs attention.",
+    );
+  });
+
+  it("appears only once a provider goes through the pool", () => {
+    assert.isFalse(isParityVisible(status({ routes: [route({ active: false })] })));
+    assert.isTrue(isParityVisible(status({ routes: [route()] })));
+  });
+});
+
+describe("normalizeExternalUrl", () => {
+  it("keeps http(s) URLs and drops a trailing slash", () => {
+    assert.equal(
+      normalizeExternalUrl(" https://pool.example.com:8317/ "),
+      "https://pool.example.com:8317",
+    );
+    assert.equal(normalizeExternalUrl("http://10.0.0.5:8317"), "http://10.0.0.5:8317");
+  });
+
+  it("adds http:// to a bare host", () => {
+    assert.equal(
+      normalizeExternalUrl("hub.tail1234.ts.net:8317"),
+      "http://hub.tail1234.ts.net:8317",
+    );
+  });
+
+  it("refuses empty input and other schemes", () => {
+    assert.equal(normalizeExternalUrl("   "), null);
+    assert.equal(normalizeExternalUrl("ftp://pool.example.com"), null);
+    assert.equal(normalizeExternalUrl("http://"), null);
+  });
+});
+
+describe("environment triage", () => {
+  it("treats a missing pool or a missing extension RPC as unsupported", () => {
+    assert.isTrue(isPoolUnsupported("Unknown extension method pool.status"));
+    assert.isTrue(isPoolUnsupported("Unknown request tag: extension.call"));
+    assert.isFalse(isPoolUnsupported("Pool config could not be read"));
+    assert.isFalse(isPoolUnsupported("Unknown extension method skillsMcp.context.get"));
+  });
+
+  it("polls faster only while a sign-in is pending", () => {
+    assert.isBelow(statusPollDelay(true), statusPollDelay(false));
+  });
+});
+
+describe("model families", () => {
+  const issue: PoolModelIssue = {
+    instanceId: "claudeAgent",
+    displayName: "Claude",
+    provider: "claude",
+    slug: "gpt-6-astra",
+    where: "customModels",
+    message: "Claude has a GPT model (gpt-6-astra) in its custom models; …",
+  };
+
+  it("removes T3's own foreign custom model from the default slot's legacy settings", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providers: {
+        ...DEFAULT_SERVER_SETTINGS.providers,
+        claudeAgent: {
+          ...DEFAULT_SERVER_SETTINGS.providers.claudeAgent,
+          customModels: ["gpt-6-astra", { slug: "claude-x" }],
+        },
+      },
+    } as typeof DEFAULT_SERVER_SETTINGS;
+    const edit = withoutCustomModel(settings, issue);
+    assert.isNotNull(edit);
+    assert.isTrue(edit?.isDefault);
+    assert.deepEqual((edit!.instance.config as { customModels: unknown }).customModels, [
+      { slug: "claude-x" },
+    ]);
+  });
+
+  it("edits an explicit instance, and offers nothing for aliases or absent models", () => {
+    const settings = {
+      ...DEFAULT_SERVER_SETTINGS,
+      providerInstances: {
+        claudeAgent_work: {
+          driver: "claudeAgent",
+          config: { customModels: [{ slug: "gpt-6-astra" }] },
+        },
+      },
+    } as unknown as typeof DEFAULT_SERVER_SETTINGS;
+    const edit = withoutCustomModel(settings, { ...issue, instanceId: "claudeAgent_work" });
+    assert.isFalse(edit?.isDefault);
+    assert.deepEqual((edit!.instance.config as { customModels: unknown }).customModels, []);
+    assert.isNull(
+      withoutCustomModel(settings, {
+        ...issue,
+        where: "claudeSettings",
+        setting: "ANTHROPIC_MODEL",
+      }),
+    );
+    assert.isNull(withoutCustomModel(DEFAULT_SERVER_SETTINGS, issue));
+  });
+
+  it("says where to edit an alias the pool never writes", () => {
+    assert.equal(
+      modelIssueHint({ ...issue, where: "claudeSettings", setting: "ANTHROPIC_MODEL" }),
+      "Edit ~/.claude/settings.json",
+    );
+    assert.equal(
+      modelIssueHint({ ...issue, where: "instanceEnv" }),
+      "Edit Claude's environment below",
+    );
+    assert.isNull(modelIssueHint(issue));
+  });
+});
+
+describe("friendlier failures and ordering", () => {
+  it("lists Claude before Codex, keeping each provider's own order", () => {
+    const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+    const work = route({ instanceId: "claudeAgent_work", displayName: "Claude (Work)" });
+    assert.deepEqual(
+      orderRoutes([codex, route(), work]).map((entry) => entry.instanceId),
+      ["claudeAgent", "claudeAgent_work", "codex"],
+    );
+  });
+
+  it("turns a spawn error into one calm sentence, keeping the proxy's words and the log", () => {
+    const technical =
+      "The pool could not start: spawn /state/pool/bin/7.3.17/cli-proxy-api EACCES. Log: /state/pool/proxy.log. Retrying in 30s.";
+    const failure = poolStartFailure(
+      status({ runtime: { state: "error", version: "7.3.17", message: technical } }),
+    );
+    assert.deepEqual(failure, {
+      text: "The pool couldn't start. Retrying in 30s.",
+      technical,
+      logPath: "/state/pool/proxy.log",
+    });
+    assert.deepEqual(
+      poolStartFailure(status({ runtime: { state: "error", version: "7.3.17", message: "boom" } })),
+      { text: "The pool couldn't start.", technical: "boom" },
+    );
+    assert.isNull(poolStartFailure(status()));
+    assert.isNull(
+      poolStartFailure(
+        status({
+          source: "external",
+          runtime: { state: "error", version: "7.3.17", message: technical },
+        }),
+      ),
+    );
+  });
+
+  it("fails the pool check from live state, even when the last check run passed", () => {
+    const failure = { text: "The pool couldn't start.", technical: "spawn EACCES" };
+    const passed = [
+      { id: "proxy", label: "Pool", state: "ok" as const, detail: "Running on 127.0.0.1:18417" },
+      { id: "cache", label: "1-hour cache", state: "ok" as const },
+    ];
+    assert.deepEqual(withLiveStartFailure(passed, failure), [
+      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+      passed[1]!,
+    ]);
+    assert.deepEqual(withLiveStartFailure([], failure), [
+      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+    ]);
+    assert.deepEqual(withLiveStartFailure(passed, null), passed);
+  });
+});

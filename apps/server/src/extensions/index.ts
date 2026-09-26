@@ -4,6 +4,10 @@
  */
 import * as Effect from "effect/Effect";
 
+import { makePoolServerExtension } from "./pool/index.ts";
 import { makeSkillsMcpServerExtension } from "./skillsMcp/index.ts";
 
-export const makeServerExtensions = Effect.all([makeSkillsMcpServerExtension]);
+export const makeServerExtensions = Effect.all([
+  makeSkillsMcpServerExtension,
+  makePoolServerExtension,
+]);
