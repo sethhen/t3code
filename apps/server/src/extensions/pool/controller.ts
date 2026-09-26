@@ -345,7 +345,7 @@ export class PoolController {
     this.startAbort = abort;
     const stillWanted = () =>
       generation === this.generation && !this.closed && this.state.source === "local";
-    const stopped = () => new Error("The pool was stopped.");
+    const stopped = () => new Error("Account sharing was stopped.");
     this.starting = (async () => {
       this.startError = undefined;
       try {
@@ -377,7 +377,7 @@ export class PoolController {
         }
         await this.sidecar.start();
         if (!this.running) {
-          throw new Error(this.sidecar?.state.message ?? "The pool did not start.");
+          throw new Error(this.sidecar?.state.message ?? "Account sharing did not start.");
         }
       } catch (error) {
         if (stillWanted()) this.startError = messageOf(error);
@@ -473,7 +473,7 @@ export class PoolController {
       this.state.source === "local" && this.running && this.accounts.length > 0
         ? {
             kind: "cliproxy",
-            label: "Pool",
+            label: "Shared accounts",
             url: this.localBaseUrl,
             managementKey: this.state.managementKey,
             enabled: true,
@@ -491,7 +491,7 @@ export class PoolController {
     const result =
       url && key
         ? await probeClientKey(url, key)
-        : { ok: false, message: "Add the pool URL and key." };
+        : { ok: false, message: "Add the server URL and key." };
     this.external = {
       reachable: result.ok,
       ...(result.message ? { message: result.message } : {}),
@@ -514,7 +514,7 @@ export class PoolController {
       return {
         ...base,
         state: "error",
-        message: sidecar?.message ?? this.startError ?? "The pool stopped.",
+        message: sidecar?.message ?? this.startError ?? "Account sharing stopped.",
         logPath: this.deps.paths.logPath,
       };
     }
@@ -549,7 +549,7 @@ export class PoolController {
     const context = this.routingContext();
     const routes = describeRoutes(await this.deps.instanceMap(), context, (provider) =>
       this.state.source === "external"
-        ? "Add the pool URL and key"
+        ? "Add the server URL and key"
         : `Waiting for a ${PROVIDER_NAMES[provider]} account`,
     );
     // Live, not from the last check run: a removed model clears on the next poll.
@@ -615,7 +615,7 @@ export class PoolController {
           ...common,
           slug,
           where: "customModels",
-          message: `${route.displayName} has a ${foreign} model (${slug}) in its custom models; through the pool it would run ${foreign} inside ${harness}.`,
+          message: `${route.displayName} has a ${foreign} model (${slug}) in its custom models; on these accounts it would run ${foreign} inside ${harness}.`,
         });
       }
       if (route.provider !== "claude") continue;
@@ -625,7 +625,7 @@ export class PoolController {
           slug,
           where,
           setting,
-          message: `${setting} in ${where === "claudeSettings" ? "~/.claude/settings.json" : `${route.displayName}'s environment`} points Claude at ${slug}; through the pool it would run GPT inside Claude Code.`,
+          message: `${setting} in ${where === "claudeSettings" ? "~/.claude/settings.json" : `${route.displayName}'s environment`} points Claude at ${slug}; on these accounts it would run GPT inside Claude Code.`,
         });
       for (const entry of instance.environment ?? []) {
         if (CLAUDE_MODEL_ALIASES.includes(entry.name) && isForeignModel(entry.value, "claude")) {
@@ -655,9 +655,9 @@ export class PoolController {
         const url = (input.externalUrl ?? current.external.url).trim();
         const key = (input.externalKey ?? current.external.key).trim();
         if (!/^https?:\/\/\S+$/i.test(url)) {
-          throw new Error("Enter the pool's URL, e.g. https://pool.example.com");
+          throw new Error("Enter the server's URL, e.g. https://accounts.example.com");
         }
-        if (!key) throw new Error("Enter the key the pool gave you.");
+        if (!key) throw new Error("Enter the key from the server's owner.");
         return { ...current, source: "external", external: { url, key } };
       });
       await this.stopLocal();
@@ -687,7 +687,7 @@ export class PoolController {
 
   private requireLocal() {
     if (this.state.source !== "local") {
-      throw new Error("Switch the pool to This Mac to manage accounts here.");
+      throw new Error("Disconnect from the team server to manage accounts here.");
     }
   }
 
@@ -700,7 +700,7 @@ export class PoolController {
 
   async loginStatus(loginId: string): Promise<PoolLoginState> {
     this.requireLocal();
-    if (!this.running) return { state: "error", message: "The pool isn't running." };
+    if (!this.running) return { state: "error", message: "Account sharing isn't running." };
     const result = await loginStatus(this.target, loginId);
     if (result.state === "done") {
       await this.refreshAccounts();
@@ -782,25 +782,32 @@ export class PoolController {
 
     if (this.state.source === "local") {
       if (this.running)
-        checks.push(check("proxy", "Pool", "ok", `Running on 127.0.0.1:${this.state.port}`));
+        checks.push(
+          check("proxy", "Account sharing", "ok", `Running on 127.0.0.1:${this.state.port}`),
+        );
       else if (this.accounts.length === 0)
-        checks.push(check("proxy", "Pool", "unknown", "Add an account to start the pool."));
+        checks.push(check("proxy", "Account sharing", "unknown", "Starts with the first account."));
       else
         checks.push(
-          check("proxy", "Pool", "fail", this.runtimeState().message ?? "The pool isn't running."),
+          check("proxy", "Account sharing", "fail", this.runtimeState().message ?? "Not running."),
         );
     } else {
       checks.push(
         this.external.reachable === undefined
-          ? check("proxy", "Pool", "unknown", "Checking the pool server…")
+          ? check("proxy", "Account sharing", "unknown", "Checking the team server…")
           : this.external.reachable
-            ? check("proxy", "Pool", "ok", `Connected to ${this.state.external.url}`)
-            : check("proxy", "Pool", "fail", this.external.message ?? "Can't reach the pool."),
+            ? check("proxy", "Account sharing", "ok", `Connected to ${this.state.external.url}`)
+            : check(
+                "proxy",
+                "Account sharing",
+                "fail",
+                this.external.message ?? "Can't reach the team server.",
+              ),
       );
     }
 
     if (this.state.source === "external") {
-      checks.push(check("sticky", "Sticky sessions", "unknown", "Set on the pool server."));
+      checks.push(check("sticky", "Sticky sessions", "unknown", "Set on the team server."));
     } else if (this.running) {
       const routing = await readRouting(this.target).catch(() => undefined);
       checks.push(
@@ -815,15 +822,17 @@ export class PoolController {
               "sticky",
               "Sticky sessions",
               "fail",
-              "The pool isn't pinning sessions to accounts; restart it.",
+              "Sessions aren't pinned to accounts; restart account sharing.",
             ),
       );
     } else {
-      checks.push(check("sticky", "Sticky sessions", "unknown", "Checked once the pool runs."));
+      checks.push(
+        check("sticky", "Sticky sessions", "unknown", "Checked once account sharing runs."),
+      );
     }
 
     if (!claudeRoute) {
-      const reason = "No Claude instance goes through the pool.";
+      const reason = "No Claude instance uses these accounts.";
       checks.push(check("toolSearch", "Tool search", "unknown", reason));
       checks.push(check("cache", "1h cache", "unknown", reason));
       checks.push(check("advisor", "Advisor", "unknown", reason));
@@ -897,14 +906,14 @@ export class PoolController {
     }
 
     if (!codexRoute) {
-      checks.push(check("codex", "Codex", "unknown", "No Codex instance goes through the pool."));
+      checks.push(check("codex", "Codex", "unknown", "No Codex instance uses these accounts."));
     } else if (process.env.T3CODE_CODEX_LAUNCH_ARGS) {
       checks.push(
         check(
           "codex",
           "Codex",
           "warn",
-          "T3CODE_CODEX_LAUNCH_ARGS replaces the pool's Codex settings.",
+          "T3CODE_CODEX_LAUNCH_ARGS replaces the Codex settings these accounts need.",
         ),
       );
     } else if (this.state.source === "local" && !context.codexCatalogPath) {
@@ -918,7 +927,12 @@ export class PoolController {
       );
     } else {
       checks.push(
-        check("codex", "Codex", "ok", "Codex uses the pool with OpenAI's current model catalog."),
+        check(
+          "codex",
+          "Codex",
+          "ok",
+          "Codex uses these accounts with OpenAI's current model catalog.",
+        ),
       );
     }
     return checks;

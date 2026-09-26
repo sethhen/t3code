@@ -1,6 +1,8 @@
 /**
- * Pure helpers for the Pool section: header status, labels, account and route
- * presentation, parity checks, the external URL draft and failure triage.
+ * Pure helpers for the accounts section of Settings → Providers: header status,
+ * labels, account and route presentation, parity checks, the external URL
+ * draft and failure triage. The UI never says "pool": to the user these are
+ * their Claude and ChatGPT accounts, with usage shared between them.
  */
 import {
   defaultInstanceIdForDriver,
@@ -42,40 +44,37 @@ export function poolProviderDriver(provider: PoolProvider): ProviderDriverKind {
   return DRIVER[provider];
 }
 
-export function accountCountLabel(count: number): string {
-  return `${count} ${count === 1 ? "account" : "accounts"}`;
-}
-
 export interface HeaderStatus {
   readonly label: string;
   readonly tone: PoolTone;
-  /** Longer text for the tooltip (e.g. why the pool can't start). */
+  /** Longer text for the tooltip (e.g. why account sharing can't start). */
   readonly detail?: string;
 }
 
-/** The section header's one-line state: the local runtime, or the external server's reachability. */
-export function poolHeaderStatus(status: PoolStatus): HeaderStatus {
+/**
+ * The section header's state, only while something is not simply working:
+ * the local runtime setting up or failing, or the external server not answering.
+ */
+export function poolHeaderStatus(status: PoolStatus): HeaderStatus | null {
   if (status.source === "external") {
     const { external } = status;
-    if (external.url.trim() === "") return { label: "Not connected", tone: "disabled" };
-    if (external.reachable === undefined) return { label: "Connecting…", tone: "disabled" };
-    return external.reachable
-      ? { label: "Connected", tone: "ready" }
-      : { label: "Unreachable", tone: "error" };
+    if (external.url.trim() === "" || external.reachable === true) return null;
+    return external.reachable === undefined
+      ? { label: "Connecting…", tone: "disabled" }
+      : { label: "Can't reach the server", tone: "error" };
   }
   const { runtime } = status;
   switch (runtime.state) {
     case "idle":
-      return { label: "Not set up", tone: "disabled" };
+    case "running":
+      return null;
     case "downloading":
-      return { label: "Downloading…", tone: "disabled" };
+      return { label: "Setting up…", tone: "disabled" };
     case "starting":
       return { label: "Starting…", tone: "disabled" };
-    case "running":
-      return { label: `Running · ${accountCountLabel(status.accounts.length)}`, tone: "ready" };
     case "error": {
       const detail = runtime.message?.trim();
-      return { label: "Can't start the pool", tone: "error", ...(detail ? { detail } : {}) };
+      return { label: "Can't start", tone: "error", ...(detail ? { detail } : {}) };
     }
   }
 }
@@ -86,7 +85,7 @@ export function joinNames(names: readonly string[]): string {
   return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
 }
 
-/** Routing is only worth showing once the pool can serve something: an account, or a connected server. */
+/** Routing is only worth offering once there is something to route to: an account, or a connected server. */
 export function isRoutingVisible(status: PoolStatus): boolean {
   return status.source === "external"
     ? status.external.url.trim() !== ""
@@ -101,26 +100,30 @@ export function orderRoutes(routes: readonly PoolRoute[]): PoolRoute[] {
 }
 
 /**
- * Routing in one line, e.g. "Claude and Codex use the pool",
- * "Codex uses the pool · Claude is direct", "Claude is waiting for a Claude account".
+ * The line under a provider: what its accounts do, and which of its instances
+ * are not using them (set to their own sign-in, or with every account paused).
  */
-export function routingSummary(routes: readonly PoolRoute[]): string {
-  if (routes.length === 0) return "No Claude or Codex provider is set up";
-  routes = orderRoutes(routes);
-  const using = routes.filter((route) => route.mode === "pool" && route.active);
-  const waiting = routes.filter((route) => route.mode === "pool" && !route.active);
-  const direct = routes.filter((route) => route.mode === "direct");
-  const names = (list: readonly PoolRoute[]) => joinNames(list.map((route) => route.displayName));
-  const parts: string[] = [];
-  if (using.length > 0)
-    parts.push(`${names(using)} ${using.length === 1 ? "uses" : "use"} the pool`);
-  for (const route of waiting) {
-    const reason = routeWaitingReason(route) ?? "";
-    parts.push(`${route.displayName} is ${reason.charAt(0).toLowerCase()}${reason.slice(1)}`);
-  }
-  if (direct.length > 0)
-    parts.push(`${names(direct)} ${direct.length === 1 ? "is" : "are"} direct`);
-  return parts.join(" · ");
+export function providerNote(
+  provider: PoolProvider,
+  accountCount: number,
+  routes: readonly PoolRoute[],
+): string {
+  const kind = POOL_ACCOUNT_KIND[provider];
+  if (accountCount === 0)
+    return `Sign in with one or more ${kind}s. Usage is shared between them automatically.`;
+  const own = routes.filter((route) => route.provider === provider && !route.active);
+  const using = routes.some((route) => route.provider === provider && route.active);
+  if (!using && own.length === 0)
+    return `${POOL_PROVIDER_LABEL[provider]} is turned off, so these accounts aren't used.`;
+  const ownNames = joinNames(own.map((route) => route.displayName));
+  const ownSignIn =
+    own.length === 1 ? `${ownNames} uses its own sign-in` : `${ownNames} use their own sign-in`;
+  if (!using) return `${ownSignIn}, not these accounts.`;
+  const shared =
+    accountCount === 1
+      ? `Add another ${kind} and usage is shared between them automatically.`
+      : "Usage is shared between accounts automatically.";
+  return own.length === 0 ? shared : `${shared} ${ownSignIn}.`;
 }
 
 /** Parity is only meaningful once some provider actually goes through the pool. */
@@ -145,9 +148,7 @@ export function parityHeadline(checks: readonly PoolCheck[]): "passed" | "unchec
 export function parityProblemText(check: PoolCheck): string {
   const detail = check.detail?.trim();
   if (detail) return `${check.label}: ${detail}`;
-  return check.state === "fail"
-    ? `${check.label} is off in pooled sessions.`
-    : `${check.label} needs attention.`;
+  return check.state === "fail" ? `${check.label} is off.` : `${check.label} needs attention.`;
 }
 
 /** The label a row, menu or dialog uses for an account: its email, else its kind. */
@@ -274,10 +275,11 @@ export function withoutCustomModel(
   };
 }
 
-/** Where to fix an alias the pool can't edit (it never writes the user's own files). */
+/** Where to fix an alias T3 can't edit (the pool never writes the user's own files). */
 export function modelIssueHint(issue: PoolModelIssue): string | null {
   if (issue.where === "claudeSettings") return "Edit ~/.claude/settings.json";
-  if (issue.where === "instanceEnv") return `Edit ${issue.displayName}'s environment below`;
+  if (issue.where === "instanceEnv")
+    return `Edit ${issue.displayName}'s environment under More provider settings`;
   return null;
 }
 
@@ -292,7 +294,7 @@ export interface PoolStartFailure {
 
 /**
  * The local proxy failing to start, in words a teammate can act on:
- * "The pool couldn't start. Retrying in 30s." instead of a spawn error and paths.
+ * "Account sharing couldn't start. Retrying in 30s." instead of a spawn error and paths.
  */
 export function poolStartFailure(status: PoolStatus): PoolStartFailure | null {
   if (status.source !== "local" || status.runtime.state !== "error") return null;
@@ -300,7 +302,9 @@ export function poolStartFailure(status: PoolStatus): PoolStartFailure | null {
   const retry = /Retrying in (\d+)s/.exec(technical)?.[1];
   const logPath = status.runtime.logPath;
   return {
-    text: retry ? `The pool couldn't start. Retrying in ${retry}s.` : "The pool couldn't start.",
+    text: retry
+      ? `Account sharing couldn't start. Retrying in ${retry}s.`
+      : "Account sharing couldn't start.",
     technical,
     ...(logPath ? { logPath } : {}),
   };
@@ -309,14 +313,19 @@ export function poolStartFailure(status: PoolStatus): PoolStartFailure | null {
 /**
  * The last check run with the pool's live state on top. Checks can be minutes
  * old; a pool that has stopped since then fails here too, so the section never
- * reads "All checks passed" under "Can't start the pool".
+ * reads "All checks passed" under "Can't start".
  */
 export function withLiveStartFailure(
   checks: readonly PoolCheck[],
   failure: PoolStartFailure | null,
 ): PoolCheck[] {
   if (!failure) return [...checks];
-  const proxy: PoolCheck = { id: "proxy", label: "Pool", state: "fail", detail: failure.technical };
+  const proxy: PoolCheck = {
+    id: "proxy",
+    label: "Account sharing",
+    state: "fail",
+    detail: failure.technical,
+  };
   return checks.some((check) => check.id === "proxy")
     ? checks.map((check) => (check.id === "proxy" ? proxy : check))
     : [proxy, ...checks];

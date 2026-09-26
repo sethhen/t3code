@@ -58,7 +58,9 @@ const request = async (
   }
   if (!response.ok) {
     const message = isRecord(json) && typeof json.error === "string" ? json.error : text.trim();
-    throw new Error(`The pool refused ${path} (HTTP ${response.status}): ${message.slice(0, 200)}`);
+    throw new Error(
+      `Account sharing refused ${path} (HTTP ${response.status}): ${message.slice(0, 200)}`,
+    );
   }
   return json;
 };
@@ -154,7 +156,7 @@ export const startLogin = async (target: ManagementTarget, provider: PoolProvide
     `${provider === "claude" ? "anthropic" : "codex"}-auth-url?is_webui=true`,
   );
   if (!isRecord(json) || typeof json.url !== "string" || typeof json.state !== "string") {
-    throw new Error("The pool did not return a sign-in link.");
+    throw new Error("Couldn't get a sign-in link.");
   }
   return { url: json.url, state: json.state };
 };
@@ -243,13 +245,13 @@ export const probeClientKey = async (
       ok: false,
       message:
         response.status === 401 || response.status === 403
-          ? "The pool rejected the key."
-          : `The pool answered HTTP ${response.status}.`,
+          ? "The server rejected the key."
+          : `The server answered HTTP ${response.status}.`,
     };
   } catch (error) {
     return {
       ok: false,
-      message: `Can't reach the pool: ${error instanceof Error ? error.message : String(error)}`,
+      message: `Can't reach the server: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 };

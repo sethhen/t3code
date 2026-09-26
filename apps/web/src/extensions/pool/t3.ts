@@ -1,17 +1,17 @@
 /**
- * Upstream internals the Pool section reuses so it looks exactly like the rest
- * of Settings → Providers and the usage page. If upstream moves one, fix it here.
+ * Upstream internals the accounts section reuses so it looks exactly like the
+ * rest of Settings → Providers. If upstream moves one, fix it here.
  */
 export { ProviderInstanceIcon } from "~/components/chat/ProviderInstanceIcon";
-export { ClaudeAI, OpenAI } from "~/components/Icons";
 export { PROVIDER_STATUS_STYLES } from "~/components/settings/providerStatus";
 export { RedactedSensitiveText } from "~/components/settings/RedactedSensitiveText";
 export {
   SettingsRow,
   SettingsSection,
   useRelativeTimeTick,
+  useSettingsSearchTargetId,
 } from "~/components/settings/settingsLayout";
-export { LimitWindows } from "~/components/usage/UsageLimits";
+export { searchableSetting } from "~/components/settings/settingsSearch";
 export { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 export { readLocalApi } from "~/localApi";
 export { getRelativeTimeState } from "~/timestampFormat";

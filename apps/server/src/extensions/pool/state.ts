@@ -77,7 +77,7 @@ export const findFreePort = async (from = 18_417, to = 18_499): Promise<number> 
   for (let port = from; port <= to; port++) {
     if (await isPortFree(port)) return port;
   }
-  throw new Error(`No free port for the pool between ${from} and ${to}.`);
+  throw new Error(`No free port for account sharing between ${from} and ${to}.`);
 };
 
 export const isPortFree = (port: number) =>

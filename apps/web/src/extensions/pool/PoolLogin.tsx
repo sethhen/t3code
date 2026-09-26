@@ -1,5 +1,5 @@
 /**
- * Adding a pool account: `login.start` from the click (never from an effect,
+ * Adding an account: `login.start` from the click (never from an effect,
  * so a StrictMode remount cannot open two browser tabs), the sign-in page in
  * the user's browser, then `login.status` polled until the proxy has the
  * account. The dialog keeps the link at hand for when the browser did not open.
@@ -144,7 +144,7 @@ export function PoolLoginDialog({
   onClose,
 }: {
   readonly login: PoolLoginState | null;
-  /** The local pool is downloading or starting, which the first sign-in waits for. */
+  /** Account sharing is downloading or starting, which the first sign-in waits for. */
   readonly preparing: boolean;
   readonly onRetry: (provider: PoolProvider) => void;
   readonly onClose: () => void;
@@ -182,7 +182,7 @@ export function PoolLoginDialog({
           <DialogDescription>
             {shown.phase === "error"
               ? "The sign-in did not go through."
-              : `Sign in with the ${kind} you want to add to the pool.`}
+              : `Sign in with the ${kind} you want to add.`}
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="grid gap-3">
@@ -197,7 +197,7 @@ export function PoolLoginDialog({
                 {shown.phase === "waiting"
                   ? "Finish signing in with your browser…"
                   : preparing
-                    ? "Setting up the pool. The first time takes a minute…"
+                    ? "Getting ready. The first time takes a minute…"
                     : "Getting the sign-in page…"}
               </span>
             </div>

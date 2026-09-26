@@ -1,11 +1,14 @@
 /**
- * Fork sections at the top of Settings → Providers. The upstream page renders
- * `ProviderSettingsExtensions` above its provider list and knows nothing else,
- * so a new fork feature adds one line here. Each section follows the device
- * the page shows and must disable its writes when `readOnly` is set.
+ * Fork sections of Settings → Providers. The upstream page wraps its own
+ * sections (provider list, usage hubs, advanced, dialogs) in
+ * `ProviderSettingsExtensions` and knows nothing else. The device switcher sits
+ * on top because it picks the environment for the whole page; the accounts
+ * section follows and folds the upstream sections away where it is in charge.
+ * Each section follows the device the page shows and must disable its writes
+ * when `readOnly` is set.
  */
-import { type EnvironmentId, POOL_EXTENSION_ID } from "@t3tools/contracts";
-import type { ComponentType } from "react";
+import type { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
+import type { ReactNode } from "react";
 
 import { PoolSettings } from "./pool";
 
@@ -15,25 +18,22 @@ export interface ProviderSettingsExtensionProps {
   readonly environmentLabel: string;
   /** This session can view the device's providers but not change them. */
   readonly readOnly: boolean;
+  /** The page was opened on this provider instance, so the upstream list must show. */
+  readonly targetInstanceId?: ProviderInstanceId | undefined;
+  /** The upstream sections. */
+  readonly children: ReactNode;
 }
 
-export interface ProviderSettingsExtension {
-  readonly id: string;
-  /** Renders nothing when its environment does not support it. */
-  readonly Section: ComponentType<ProviderSettingsExtensionProps>;
-}
-
-export const PROVIDER_SETTINGS_EXTENSIONS: readonly ProviderSettingsExtension[] = [
-  { id: POOL_EXTENSION_ID, Section: PoolSettings },
-];
-
-/** Every registered section, in order. */
-export function ProviderSettingsExtensions(props: ProviderSettingsExtensionProps) {
+export function ProviderSettingsExtensions({
+  deviceTabs,
+  ...props
+}: ProviderSettingsExtensionProps & { readonly deviceTabs?: ReactNode }) {
   return (
     <>
-      {PROVIDER_SETTINGS_EXTENSIONS.map(({ id, Section }) => (
-        <Section key={id} {...props} />
-      ))}
+      {deviceTabs ? (
+        <div className="flex min-h-11 min-w-0 items-center px-3 sm:px-4">{deviceTabs}</div>
+      ) : null}
+      <PoolSettings {...props} />
     </>
   );
 }

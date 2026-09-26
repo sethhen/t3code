@@ -25,8 +25,8 @@ import {
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
+  providerNote,
   routeWaitingReason,
-  routingSummary,
   statusPollDelay,
   withoutCustomModel,
 } from "./pool.logic";
@@ -59,22 +59,16 @@ function route(overrides: Partial<PoolRoute> = {}): PoolRoute {
 }
 
 describe("poolHeaderStatus", () => {
-  it("names each local runtime state", () => {
-    const labels = (["idle", "downloading", "starting", "error"] as const).map(
-      (state) => poolHeaderStatus(status({ runtime: { state, version: "6.0.0" } })).label,
-    );
-    assert.deepEqual(labels, ["Not set up", "Downloading…", "Starting…", "Can't start the pool"]);
+  it("says nothing while the local pool is idle or running", () => {
+    assert.isNull(poolHeaderStatus(status()));
+    assert.isNull(poolHeaderStatus(status({ runtime: { state: "idle", version: "6.0.0" } })));
   });
 
-  it("counts accounts while running, with the singular for one", () => {
-    assert.deepEqual(poolHeaderStatus(status({ accounts: [account()] })), {
-      label: "Running · 1 account",
-      tone: "ready",
-    });
-    assert.equal(
-      poolHeaderStatus(status({ accounts: [account(), account({ id: "b" })] })).label,
-      "Running · 2 accounts",
+  it("names the states that are on their way", () => {
+    const labels = (["downloading", "starting"] as const).map(
+      (state) => poolHeaderStatus(status({ runtime: { state, version: "6.0.0" } }))?.label,
     );
+    assert.deepEqual(labels, ["Setting up…", "Starting…"]);
   });
 
   it("says it can't start, with the runtime's own reason for the tooltip", () => {
@@ -82,11 +76,11 @@ describe("poolHeaderStatus", () => {
       poolHeaderStatus(
         status({ runtime: { state: "error", version: "6.0.0", message: "Port 18417 is in use" } }),
       ),
-      { label: "Can't start the pool", tone: "error", detail: "Port 18417 is in use" },
+      { label: "Can't start", tone: "error", detail: "Port 18417 is in use" },
     );
   });
 
-  it("reports an external pool by reachability, not by the local runtime", () => {
+  it("reports a team server by reachability, not by the local runtime", () => {
     const external = (reachable: boolean | undefined, url = "http://pool:8317") =>
       poolHeaderStatus(
         status({
@@ -95,10 +89,10 @@ describe("poolHeaderStatus", () => {
           external: { url, hasKey: true, ...(reachable === undefined ? {} : { reachable }) },
         }),
       );
-    assert.deepEqual(external(true), { label: "Connected", tone: "ready" });
-    assert.deepEqual(external(false), { label: "Unreachable", tone: "error" });
-    assert.equal(external(undefined).label, "Connecting…");
-    assert.equal(external(true, "").label, "Not connected");
+    assert.isNull(external(true));
+    assert.deepEqual(external(false), { label: "Can't reach the server", tone: "error" });
+    assert.equal(external(undefined)?.label, "Connecting…");
+    assert.isNull(external(true, ""));
   });
 });
 
@@ -154,35 +148,59 @@ describe("routeWaitingReason", () => {
   });
 });
 
-describe("routing summary", () => {
+describe("providerNote", () => {
   const claude = route();
-  const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+  const work = route({
+    instanceId: "claudeAgent_work",
+    displayName: "Claude (Work)",
+    mode: "direct",
+    active: false,
+  });
 
-  it("says who uses the pool, who waits and who is direct, in one line", () => {
-    assert.equal(routingSummary([claude, codex]), "Claude and Codex use the pool");
-    assert.equal(routingSummary([codex, claude]), "Claude and Codex use the pool");
+  it("invites a first sign-in, and more than one", () => {
     assert.equal(
-      routingSummary([codex, { ...claude, mode: "direct", active: false }]),
-      "Codex uses the pool · Claude is direct",
+      providerNote("codex", 0, []),
+      "Sign in with one or more ChatGPT accounts. Usage is shared between them automatically.",
+    );
+  });
+
+  it("nudges towards a second account, then says usage is shared", () => {
+    assert.equal(
+      providerNote("claude", 1, [claude]),
+      "Add another Claude account and usage is shared between them automatically.",
     );
     assert.equal(
-      routingSummary([{ ...claude, active: false }]),
-      "Claude is waiting for a Claude account",
+      providerNote("claude", 2, [claude]),
+      "Usage is shared between accounts automatically.",
+    );
+  });
+
+  it("names the instances that don't use the accounts", () => {
+    assert.equal(
+      providerNote("claude", 2, [claude, work]),
+      "Usage is shared between accounts automatically. Claude (Work) uses its own sign-in.",
     );
     assert.equal(
-      routingSummary([
-        claude,
-        { ...codex, active: false },
-        route({
-          instanceId: "claudeAgent_work",
-          displayName: "Claude (Work)",
-          mode: "direct",
-          active: false,
-        }),
-      ]),
-      "Claude uses the pool · Codex is waiting for a ChatGPT account · Claude (Work) is direct",
+      providerNote("claude", 2, [{ ...claude, mode: "direct", active: false }, work]),
+      "Claude and Claude (Work) use their own sign-in, not these accounts.",
     );
-    assert.equal(routingSummary([]), "No Claude or Codex provider is set up");
+    // Every account paused: the route waits, so the provider signs in on its own.
+    assert.equal(
+      providerNote("claude", 1, [{ ...claude, active: false }]),
+      "Claude uses its own sign-in, not these accounts.",
+    );
+  });
+
+  it("only looks at its own provider's instances", () => {
+    const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+    assert.equal(
+      providerNote("claude", 2, [claude, { ...codex, mode: "direct", active: false }]),
+      "Usage is shared between accounts automatically.",
+    );
+    assert.equal(
+      providerNote("claude", 1, [codex]),
+      "Claude is turned off, so these accounts aren't used.",
+    );
   });
 
   it("joins names the way a sentence would", () => {
@@ -191,7 +209,7 @@ describe("routing summary", () => {
     assert.equal(joinNames(["A", "B", "C"]), "A, B and C");
   });
 
-  it("appears once the pool can serve something", () => {
+  it("offers routing once there is something to route to", () => {
     assert.isFalse(isRoutingVisible(status()));
     assert.isTrue(isRoutingVisible(status({ accounts: [account()] })));
     assert.isTrue(
@@ -227,7 +245,7 @@ describe("native parity", () => {
     assert.equal(parityProblemText(fail), "Pool: Not running");
     assert.equal(
       parityProblemText({ id: "sticky", label: "Sticky sessions", state: "fail" }),
-      "Sticky sessions is off in pooled sessions.",
+      "Sticky sessions is off.",
     );
     assert.equal(
       parityProblemText({ id: "x", label: "Codex", state: "warn" }),
@@ -336,7 +354,7 @@ describe("model families", () => {
     );
     assert.equal(
       modelIssueHint({ ...issue, where: "instanceEnv" }),
-      "Edit Claude's environment below",
+      "Edit Claude's environment under More provider settings",
     );
     assert.isNull(modelIssueHint(issue));
   });
@@ -367,13 +385,13 @@ describe("friendlier failures and ordering", () => {
       }),
     );
     assert.deepEqual(failure, {
-      text: "The pool couldn't start. Retrying in 30s.",
+      text: "Account sharing couldn't start. Retrying in 30s.",
       technical,
       logPath: "/state/pool/proxy.log",
     });
     assert.deepEqual(
       poolStartFailure(status({ runtime: { state: "error", version: "7.3.17", message: "boom" } })),
-      { text: "The pool couldn't start.", technical: "boom" },
+      { text: "Account sharing couldn't start.", technical: "boom" },
     );
     assert.isNull(poolStartFailure(status()));
     assert.isNull(
@@ -387,17 +405,17 @@ describe("friendlier failures and ordering", () => {
   });
 
   it("fails the pool check from live state, even when the last check run passed", () => {
-    const failure = { text: "The pool couldn't start.", technical: "spawn EACCES" };
+    const failure = { text: "Account sharing couldn't start.", technical: "spawn EACCES" };
     const passed = [
       { id: "proxy", label: "Pool", state: "ok" as const, detail: "Running on 127.0.0.1:18417" },
       { id: "cache", label: "1-hour cache", state: "ok" as const },
     ];
     assert.deepEqual(withLiveStartFailure(passed, failure), [
-      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+      { id: "proxy", label: "Account sharing", state: "fail", detail: "spawn EACCES" },
       passed[1]!,
     ]);
     assert.deepEqual(withLiveStartFailure([], failure), [
-      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+      { id: "proxy", label: "Account sharing", state: "fail", detail: "spawn EACCES" },
     ]);
     assert.deepEqual(withLiveStartFailure(passed, null), passed);
   });

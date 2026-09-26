@@ -1,12 +1,14 @@
 /**
- * Pool: Claude and Codex through a CLIProxyAPI account pool, at the top of
- * Settings → Providers for the environment the page shows.
+ * The accounts section at the top of Settings → Providers: Claude and Codex
+ * through a CLIProxyAPI account pool, for the environment the page shows. The
+ * UI never says "pool": the user signs in with one or more accounts per
+ * provider and usage is shared between them.
  *
- * Problems first, everything else one line: the header carries the state and
- * the rare actions; accounts are the only always-open part (local pools only);
- * routing and the checks collapse to a sentence each and only appear once
- * the pool serves something. A failing or warning check is shown inline
- * without a click.
+ * Problems first, everything else out of the way: each provider shows its
+ * accounts and one line on how they are used; failing checks show inline; the
+ * header carries a state only when something is off, and the menu holds the
+ * rare actions (routing, checks, a team server, restart). The upstream
+ * provider list folds away under "More provider settings".
  */
 import {
   type EnvironmentId,
@@ -17,9 +19,11 @@ import {
   type PoolRoute,
   type PoolRouteMode,
   type PoolStatus,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
   CheckIcon,
+  ChevronRightIcon,
   CircleDashedIcon,
   CircleXIcon,
   EllipsisIcon,
@@ -65,7 +69,6 @@ import {
   withLiveStartFailure,
   poolProviderDriver,
   routeWaitingReason,
-  routingSummary,
   statusPollDelay,
   withoutCustomModel,
   type HeaderStatus,
@@ -77,6 +80,7 @@ import {
   ProviderInstanceIcon,
   revealInFileExplorerLabelForKind,
   revealInFileExplorerLabelForOs,
+  searchableSetting,
   serverEnvironment,
   SettingsRow,
   SettingsSection,
@@ -84,6 +88,7 @@ import {
   useAtomCommand,
   useEnvironmentSettings,
   useRelativeTimeTick,
+  useSettingsSearchTargetId,
   useUpdateEnvironmentSettings,
   writeTextToClipboard,
 } from "./t3";
@@ -96,20 +101,22 @@ import {
 } from "./usePoolStatus";
 
 const EXTERNAL_EXPLAINER =
-  "Connect to a pool server someone else runs. Sign-ins and quotas live on that server.";
+  "Use accounts someone else signs in on their server. Sign-ins and quotas live on that server.";
 
 const ROUTING_EXPLAINER =
-  "Pool: sessions go through the pool's accounts. Direct: the provider signs in the way it would without the pool. Switching restarts that provider's running sessions.";
+  "These accounts: sessions share the accounts above. Own sign-in: the provider signs in the way it would without T3 Code. Switching restarts that provider's running sessions.";
 
 const ROUTE_OPTIONS = [
-  { value: "pool", label: "Pool" },
-  { value: "direct", label: "Direct" },
+  { value: "pool", label: "These accounts" },
+  { value: "direct", label: "Own sign-in" },
 ] as const satisfies ReadonlyArray<{ value: PoolRouteMode; label: string }>;
 
 export function PoolSettings({
   environmentId,
   environmentLabel,
   readOnly,
+  targetInstanceId,
+  children,
 }: ProviderSettingsExtensionProps) {
   const client = useExtensionClient(PoolExtension, environmentId);
   const pool = usePoolStatus(client, readOnly);
@@ -121,136 +128,203 @@ export function PoolSettings({
   // The external form, opened from the menu before any server is connected.
   const [externalFormOpen, setExternalFormOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
+  const [checksOpen, setChecksOpen] = useState(false);
 
-  if (pool.unsupported) return null;
+  // No accounts here (an official T3 server, or no permission to read them): the upstream page as is.
+  if (pool.unsupported) return children;
   const { status } = pool;
   const runtimeState = status?.runtime.state;
+  const header: HeaderStatus | null = pool.error
+    ? { label: "Could not refresh", tone: "warning", detail: pool.error }
+    : status && poolHeaderStatus(status);
   const routingVisible = status ? isRoutingVisible(status) : false;
+  const parityVisible = status ? isParityVisible(status) : false;
 
-  const runCheck = () =>
+  const runCheck = () => {
+    setChecksOpen(true);
     void actions.run("check", () => client.call("check", {}), "Could not run the checks");
+  };
   const runRestart = () =>
-    void actions.run("restart", () => client.call("restart", {}), "Could not restart the pool");
+    void actions.run("restart", () => client.call("restart", {}), "Could not restart");
+
+  return (
+    <>
+      <div className="flex flex-col gap-2.5">
+        <SettingsSection
+          title="Providers"
+          headerAction={
+            status ? (
+              <div className="flex min-w-0 items-center gap-1.5">
+                {header ? <HeaderStatusLabel header={header} /> : null}
+                <Menu>
+                  <MenuTrigger
+                    render={
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        className="text-muted-foreground hover:text-foreground"
+                        disabled={readOnly}
+                        aria-label="Account actions"
+                      />
+                    }
+                  >
+                    <EllipsisIcon className="size-3.5" />
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="min-w-48">
+                    {routingVisible ? (
+                      <MenuItem onClick={() => setRoutingOpen(true)}>
+                        Sign-in per provider…
+                      </MenuItem>
+                    ) : null}
+                    {parityVisible ? (
+                      <MenuItem disabled={actions.isBusy("check")} onClick={runCheck}>
+                        Run checks
+                      </MenuItem>
+                    ) : null}
+                    {status.source === "local" ? (
+                      <MenuItem onClick={() => setExternalFormOpen(true)}>
+                        Use a team server…
+                      </MenuItem>
+                    ) : null}
+                    {status.source === "local" && runtimeState !== "idle" ? (
+                      <MenuItem disabled={actions.isBusy("restart")} onClick={runRestart}>
+                        Restart account sharing
+                      </MenuItem>
+                    ) : null}
+                  </MenuPopup>
+                </Menu>
+              </div>
+            ) : null
+          }
+        >
+          {status === null ? (
+            pool.error ? (
+              <SettingsRow
+                title="Could not load your accounts"
+                description={pool.error}
+                control={
+                  <Button size="sm" variant="outline" onClick={() => void refresh()}>
+                    Retry
+                  </Button>
+                }
+              />
+            ) : (
+              <div className="px-3 py-3 text-sm text-muted-foreground sm:px-4">Loading…</div>
+            )
+          ) : (
+            <>
+              {readOnly ? (
+                <p className="px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
+                  This session can view {environmentLabel}'s accounts but can't change them.
+                </p>
+              ) : null}
+              {status.source === "external" || externalFormOpen ? (
+                <ExternalRow
+                  key={status.source}
+                  status={status}
+                  client={client}
+                  actions={actions}
+                  readOnly={readOnly}
+                  onClose={() => setExternalFormOpen(false)}
+                />
+              ) : null}
+              {status.source === "local" ? (
+                <PoolAccounts
+                  status={status}
+                  client={client}
+                  actions={actions}
+                  readOnly={readOnly || login.pending}
+                  onAdd={(provider) => void login.start(provider)}
+                />
+              ) : null}
+              {routingVisible && routingOpen ? (
+                <RoutingRow
+                  routes={status.routes}
+                  onDone={() => setRoutingOpen(false)}
+                  client={client}
+                  actions={actions}
+                  readOnly={readOnly}
+                  environmentLabel={environmentLabel}
+                />
+              ) : null}
+              {parityVisible ? (
+                <ParityRow
+                  checks={status.checks}
+                  checkedAt={status.checkedAt ?? null}
+                  checking={actions.isBusy("check")}
+                  open={checksOpen}
+                  onOpenChange={setChecksOpen}
+                  modelIssues={status.modelIssues ?? []}
+                  startFailure={poolStartFailure(status)}
+                  environmentId={environmentId}
+                  readOnly={readOnly}
+                />
+              ) : null}
+            </>
+          )}
+        </SettingsSection>
+        <PoolLoginDialog
+          login={login.login}
+          preparing={runtimeState === "downloading" || runtimeState === "starting"}
+          onRetry={(provider) => void login.start(provider)}
+          onClose={login.close}
+        />
+      </div>
+      <MoreProviderSettings targetInstanceId={targetInstanceId}>{children}</MoreProviderSettings>
+    </>
+  );
+}
+
+/** Settings search entries that live in the upstream sections; a jump to one unfolds them. */
+const UPSTREAM_SEARCH_IDS = new Set(
+  (["providers", "usage-providers", "provider-health-check-interval"] as const).map(
+    (id) => searchableSetting(id).id,
+  ),
+);
+
+/**
+ * The upstream provider list, usage hubs and advanced settings, folded away:
+ * they still hold models, the other providers and each instance's launch
+ * settings. A link to one instance or a settings search into them opens it.
+ */
+function MoreProviderSettings({
+  targetInstanceId,
+  children,
+}: {
+  readonly targetInstanceId: ProviderInstanceId | undefined;
+  readonly children: ReactNode;
+}) {
+  const searchTargetId = useSettingsSearchTargetId();
+  const reason =
+    targetInstanceId ??
+    (searchTargetId !== null && UPSTREAM_SEARCH_IDS.has(searchTargetId) ? searchTargetId : null);
+  const [open, setOpen] = useState(false);
+  // Open once per reason, before the search scroll runs; closing it afterwards sticks.
+  const [openedFor, setOpenedFor] = useState<string | null>(null);
+  if (reason !== null && openedFor !== reason) {
+    setOpenedFor(reason);
+    if (!open) setOpen(true);
+  }
 
   return (
     <div className="flex flex-col gap-2.5">
-      <SettingsSection
-        title="Pool"
-        headerAction={
-          status ? (
-            <div className="flex min-w-0 items-center gap-1.5">
-              <HeaderStatusLabel
-                header={
-                  pool.error
-                    ? { label: "Could not refresh", tone: "warning", detail: pool.error }
-                    : poolHeaderStatus(status)
-                }
-              />
-              <Menu>
-                <MenuTrigger
-                  render={
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="text-muted-foreground hover:text-foreground"
-                      disabled={readOnly}
-                      aria-label="Pool actions"
-                    />
-                  }
-                >
-                  <EllipsisIcon className="size-3.5" />
-                </MenuTrigger>
-                <MenuPopup align="end" className="min-w-44">
-                  {status.source === "local" ? (
-                    <MenuItem onClick={() => setExternalFormOpen(true)}>
-                      Use an external pool…
-                    </MenuItem>
-                  ) : null}
-                  {status.source === "local" ? (
-                    <MenuItem disabled={actions.isBusy("restart")} onClick={runRestart}>
-                      Restart pool
-                    </MenuItem>
-                  ) : null}
-                  <MenuItem disabled={actions.isBusy("check")} onClick={runCheck}>
-                    Run checks
-                  </MenuItem>
-                  {routingVisible ? (
-                    <MenuItem onClick={() => setRoutingOpen(true)}>Routing…</MenuItem>
-                  ) : null}
-                </MenuPopup>
-              </Menu>
-            </div>
-          ) : null
-        }
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className="flex min-h-7 w-fit items-center gap-1.5 rounded-md px-3 text-sm text-foreground/70 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring sm:px-4"
       >
-        {status === null ? (
-          pool.error ? (
-            <SettingsRow
-              title="Could not load the pool"
-              description={pool.error}
-              control={
-                <Button size="sm" variant="outline" onClick={() => void refresh()}>
-                  Retry
-                </Button>
-              }
-            />
-          ) : (
-            <div className="px-3 py-3 text-sm text-muted-foreground sm:px-4">Loading…</div>
-          )
-        ) : (
-          <>
-            {status.source === "external" || externalFormOpen ? (
-              <ExternalRow
-                key={status.source}
-                status={status}
-                client={client}
-                actions={actions}
-                readOnly={readOnly}
-                onClose={() => setExternalFormOpen(false)}
-              />
-            ) : null}
-            {status.source === "local" ? (
-              <PoolAccounts
-                status={status}
-                receivedAt={pool.receivedAt}
-                client={client}
-                actions={actions}
-                readOnly={readOnly || login.pending}
-                onAdd={(provider) => void login.start(provider)}
-              />
-            ) : null}
-            {routingVisible ? (
-              <RoutingRow
-                routes={status.routes}
-                open={routingOpen}
-                onToggle={() => setRoutingOpen((open) => !open)}
-                client={client}
-                actions={actions}
-                readOnly={readOnly}
-                environmentLabel={environmentLabel}
-              />
-            ) : null}
-            {isParityVisible(status) ? (
-              <ParityRow
-                checks={status.checks}
-                checkedAt={status.checkedAt ?? null}
-                checking={actions.isBusy("check")}
-                modelIssues={status.modelIssues ?? []}
-                startFailure={poolStartFailure(status)}
-                environmentId={environmentId}
-                readOnly={readOnly}
-              />
-            ) : null}
-          </>
-        )}
-      </SettingsSection>
-      <PoolLoginDialog
-        login={login.login}
-        preparing={runtimeState === "downloading" || runtimeState === "starting"}
-        onRetry={(provider) => void login.start(provider)}
-        onClose={login.close}
-      />
+        <ChevronRightIcon
+          aria-hidden
+          className={cn(
+            "size-4 shrink-0 text-muted-foreground transition-transform duration-150 motion-reduce:transition-none",
+            open && "rotate-90",
+          )}
+        />
+        More provider settings
+      </button>
+      {open ? <div className="flex flex-col gap-8">{children}</div> : null}
     </div>
   );
 }
@@ -332,7 +406,7 @@ function ExternalRow({
       .run(
         "source",
         () => client.call("setSource", { source: "local" }),
-        "Could not disconnect from the pool server",
+        "Could not disconnect from the team server",
       )
       .then(onClose);
 
@@ -377,7 +451,7 @@ function ExternalRow({
         description={
           unreachable ? (
             <span className="text-destructive-foreground">
-              {external.message?.trim() || "The pool server did not answer."}
+              {external.message?.trim() || "The server did not answer."}
             </span>
           ) : (
             "Sign-ins and quotas live on that server."
@@ -404,7 +478,7 @@ function ExternalRow({
   }
 
   return (
-    <SettingsRow title="External pool" description={EXTERNAL_EXPLAINER}>
+    <SettingsRow title="Team server" description={EXTERNAL_EXPLAINER}>
       <ExternalSourceForm
         status={status}
         readOnly={readOnly}
@@ -461,7 +535,7 @@ function ExternalSourceForm({
           <Input
             id={`${id}-url`}
             size="sm"
-            placeholder="https://pool.example.ts.net:8317"
+            placeholder="https://accounts.example.ts.net:8317"
             value={url}
             disabled={readOnly}
             aria-invalid={urlInvalid || undefined}
@@ -475,7 +549,7 @@ function ExternalSourceForm({
             size="sm"
             type="password"
             autoComplete="off"
-            placeholder={external.hasKey ? "Saved" : "From the pool's owner"}
+            placeholder={external.hasKey ? "Saved" : "From the server's owner"}
             value={key}
             disabled={readOnly}
             onChange={(event) => setKey(event.target.value)}
@@ -502,18 +576,17 @@ function ExternalSourceForm({
 // ---------------------------------------------------------------------------
 // Routing
 
+/** Which Claude and Codex instances use these accounts; opened from the menu. */
 function RoutingRow({
   routes,
-  open,
-  onToggle,
+  onDone,
   client,
   actions,
   readOnly,
   environmentLabel,
 }: {
   readonly routes: readonly PoolRoute[];
-  readonly open: boolean;
-  readonly onToggle: () => void;
+  readonly onDone: () => void;
   readonly client: PoolClient;
   readonly actions: PoolActions;
   readonly readOnly: boolean;
@@ -523,81 +596,76 @@ function RoutingRow({
     void actions.run(
       `route:${route.instanceId}`,
       () => client.call("setRoute", { instanceId: route.instanceId, mode }),
-      `Could not change routing for ${route.displayName}`,
+      `Could not change how ${route.displayName} signs in`,
       mode,
     );
 
   return (
     <SettingsRow
-      title="Routing"
-      description={routingSummary(routes)}
+      title="Sign-in per provider"
+      description={ROUTING_EXPLAINER}
       control={
-        <Button size="xs" variant="ghost-muted" aria-expanded={open} onClick={onToggle}>
-          {open ? "Done" : "Change"}
+        <Button size="xs" variant="ghost-muted" onClick={onDone}>
+          Done
         </Button>
       }
     >
-      {open ? (
-        <div className="space-y-2 pt-2 pb-2">
-          <p className="text-xs text-muted-foreground">{ROUTING_EXPLAINER}</p>
-          {routes.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No Claude or Codex provider is set up on {environmentLabel}.
-            </p>
-          ) : (
-            <div className="space-y-1">
-              {orderRoutes(routes).map((route) => {
-                const key = `route:${route.instanceId}`;
-                const intent = actions.intent(key);
-                const mode = intent === "pool" || intent === "direct" ? intent : route.mode;
-                const reason = intent === undefined ? routeWaitingReason(route) : null;
-                return (
-                  <div key={route.instanceId} className="flex min-h-8 min-w-0 items-center gap-2">
-                    <ProviderInstanceIcon
-                      driverKind={poolProviderDriver(route.provider)}
-                      displayName={route.displayName}
-                      className="size-4"
-                      iconClassName="size-3.5 text-foreground/80"
-                    />
-                    <span className="shrink-0 text-sm text-foreground">{route.displayName}</span>
-                    {reason ? (
-                      <span className="min-w-0 truncate text-xs text-muted-foreground">
-                        {reason}
-                      </span>
-                    ) : null}
-                    <div className="ms-auto shrink-0">
-                      <Select
-                        items={ROUTE_OPTIONS}
-                        value={mode}
-                        disabled={readOnly || actions.isBusy(key)}
-                        onValueChange={(next) => {
-                          if (next === null || next === mode) return;
-                          setRoute(route, next);
-                        }}
+      <div className="space-y-2 pt-2 pb-2">
+        {routes.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            No Claude or Codex provider is set up on {environmentLabel}.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {orderRoutes(routes).map((route) => {
+              const key = `route:${route.instanceId}`;
+              const intent = actions.intent(key);
+              const mode = intent === "pool" || intent === "direct" ? intent : route.mode;
+              const reason = intent === undefined ? routeWaitingReason(route) : null;
+              return (
+                <div key={route.instanceId} className="flex min-h-8 min-w-0 items-center gap-2">
+                  <ProviderInstanceIcon
+                    driverKind={poolProviderDriver(route.provider)}
+                    displayName={route.displayName}
+                    className="size-4"
+                    iconClassName="size-3.5 text-foreground/80"
+                  />
+                  <span className="shrink-0 text-sm text-foreground">{route.displayName}</span>
+                  {reason ? (
+                    <span className="min-w-0 truncate text-xs text-muted-foreground">{reason}</span>
+                  ) : null}
+                  <div className="ms-auto shrink-0">
+                    <Select
+                      items={ROUTE_OPTIONS}
+                      value={mode}
+                      disabled={readOnly || actions.isBusy(key)}
+                      onValueChange={(next) => {
+                        if (next === null || next === mode) return;
+                        setRoute(route, next);
+                      }}
+                    >
+                      <SelectTrigger
+                        size="xs"
+                        className="w-32 min-w-0"
+                        aria-label={`How ${route.displayName} signs in`}
                       >
-                        <SelectTrigger
-                          size="xs"
-                          className="w-24 min-w-0"
-                          aria-label={`${route.displayName} routing`}
-                        >
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectPopup align="end" alignItemWithTrigger={false}>
-                          {ROUTE_OPTIONS.map((option) => (
-                            <SelectItem key={option.value} value={option.value}>
-                              {option.label}
-                            </SelectItem>
-                          ))}
-                        </SelectPopup>
-                      </Select>
-                    </div>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectPopup align="end" alignItemWithTrigger={false}>
+                        {ROUTE_OPTIONS.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectPopup>
+                    </Select>
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      ) : null}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
     </SettingsRow>
   );
 }
@@ -617,10 +685,16 @@ const CHECK_PRESENTATION: Readonly<
   unknown: { icon: CircleDashedIcon, className: "text-muted-foreground", srLabel: "Not checked" },
 };
 
+/**
+ * Failing and warning checks, shown without a click. With nothing wrong the
+ * row only appears when opened (Run checks), with every check listed.
+ */
 function ParityRow({
   checks,
   checkedAt,
   checking,
+  open,
+  onOpenChange,
   modelIssues,
   startFailure,
   environmentId,
@@ -629,14 +703,16 @@ function ParityRow({
   readonly checks: readonly PoolCheck[];
   readonly checkedAt: string | null;
   readonly checking: boolean;
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
   readonly modelIssues: readonly PoolModelIssue[];
   readonly startFailure: PoolStartFailure | null;
   readonly environmentId: EnvironmentId;
   readonly readOnly: boolean;
 }) {
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const liveChecks = withLiveStartFailure(checks, startFailure);
   const problems = parityProblems(liveChecks);
+  if (!open && !checking && problems.length === 0) return null;
 
   const summary =
     checking && !startFailure ? (
@@ -676,9 +752,9 @@ function ParityRow({
         <span className="inline-flex items-center gap-1.5">
           Checks
           <InfoTip label="About checks">
-            Whether a pooled session is as fast and capable as a direct one: the pool is up, each
-            session keeps one account, tool search, the 1-hour cache, the advisor, and each model
-            stays in its own app.
+            Whether a session on these accounts is as fast and capable as a direct one: account
+            sharing is up, each session keeps one account, tool search, the 1-hour cache, the
+            advisor, and each model stays in its own app.
           </InfoTip>
         </span>
       }
@@ -687,14 +763,14 @@ function ParityRow({
         <Button
           size="xs"
           variant="ghost-muted"
-          aria-expanded={detailsOpen}
-          onClick={() => setDetailsOpen((open) => !open)}
+          aria-expanded={open}
+          onClick={() => onOpenChange(!open)}
         >
-          {detailsOpen ? "Hide details" : "Details"}
+          {open ? "Done" : "Details"}
         </Button>
       }
     >
-      {detailsOpen ? (
+      {open ? (
         <div className="space-y-1 pt-2 pb-2">
           {liveChecks.map((check) => (
             <ParityLine

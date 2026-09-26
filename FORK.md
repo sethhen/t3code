@@ -28,7 +28,7 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges an inline `--settings` launch argument into T3's Claude settings                  |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
 | `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool proxy)         |
-| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | renders `ProviderSettingsExtensions` above the provider list                             |
+| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top, may fold the rest) |
 
 Fork-owned paths (new extensions only touch these):
 
@@ -55,11 +55,12 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   ("t3code Safe Storage"), choose **Always Allow**.
 - **First launch on Windows:** if SmartScreen blocks the installer, click **More info → Run
   anyway** (once). PCs with Smart App Control turned on block unsigned apps outright.
-- **Claude and Codex accounts (Pool):** Settings → Providers → Pool → **Add Claude account** /
-  **Add ChatGPT account**, then sign in in the browser. T3 routes Claude and Codex through the
-  pool by itself; nothing else to configure. The first sign-in may show a firewall prompt for
-  `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer works, sign-in uses
-  localhost. Don't also sign the same account into another proxy (CC Switch, EasyCLIProxyAPI):
+- **Claude and Codex accounts:** Settings → Providers → **Add account** next to Claude or Codex
+  (Codex signs in with ChatGPT), then sign in in the browser. Add as many as you like: usage is
+  shared between them automatically, nothing else to configure. The usual provider settings
+  (models, other providers) are under **More provider settings**. The first sign-in may show a
+  firewall prompt for `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer
+  works, sign-in uses localhost. Don't also sign the same account into another proxy (CC Switch, EasyCLIProxyAPI):
   two proxies refreshing one account sign each other out.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
@@ -133,7 +134,7 @@ flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyH
 `/bin/sh` nor `cmd.exe` can expand anything in it. Codex reads the key from an env var.
 Models stay in their own harness: T3 never offers a cross-family model through the pool (pooled
 instances drop cross-family custom models, gateway model discovery is off, Codex uses OpenAI's
-catalog), and the Pool section flags any hand-configured one (a custom model, or a Claude model
+catalog), and Settings → Providers flags any hand-configured one (a custom model, or a Claude model
 alias in the instance env or `~/.claude/settings.json`) as a failing "Model families" check.
 
 **After an upstream merge, a Claude Code update or a CLIProxyAPI bump:**
@@ -141,7 +142,7 @@ alias in the instance env or `~/.claude/settings.json`) as a failing "Model fami
 1. `hostSeams.test.ts` passes (update.sh runs it).
 2. `cd apps/server && POOL_INTEGRATION=1 pnpm exec vp test run src/extensions/pool/controller.integration.test.ts`:
    real proxy download, sign-in link, routing, and a real Claude probe that must report tool search on.
-3. In the app: Settings → Providers → Pool → **Native parity** is all green. A failing **Tool
+3. In the app: Settings → Providers → ⋯ → **Run checks** is all green. A failing **Tool
    search** means Claude Code changed how it treats proxies: search its binary for
    `is not a first-party Anthropic host` to find the new switch.
 4. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
@@ -150,7 +151,7 @@ Known limits: during sign-in the proxy's OAuth callback listeners (54545 Claude,
 all interfaces (CLIProxyAPI has no option to restrict them); on Windows a hard-killed server leaves
 the proxy running until T3 starts again;
 signing in on a remote environment needs a browser on that machine (the OAuth callback is its
-localhost); an External pool shows no accounts or quotas and Codex keeps its built-in catalog.
+localhost); a team server (external pool) shows no accounts and Codex keeps its built-in catalog.
 
 ## Traps
 

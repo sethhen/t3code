@@ -989,16 +989,17 @@ export function EnvironmentProviderSettings({
   };
 
   return (
-    <>
-      {/* t3-ext */}
-      <ProviderSettingsExtensions
-        environmentId={environmentId}
-        environmentLabel={environmentLabel}
-        readOnly={readOnly}
-      />
+    // t3-ext: fork sections on top; they may fold these away and own the device tabs
+    <ProviderSettingsExtensions
+      environmentId={environmentId}
+      environmentLabel={environmentLabel}
+      readOnly={readOnly}
+      targetInstanceId={targetInstanceId}
+      deviceTabs={deviceTabs}
+    >
       <SettingsSection {...searchableSetting("providers")} hideTitle variant="plain">
         <div className="flex min-h-11 min-w-0 items-center gap-2 px-3 sm:px-4">
-          {deviceTabs}
+          {/* t3-ext: device tabs render above, in ProviderSettingsExtensions */}
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-2">
             {readOnly ? (
               <span className="min-w-0 truncate text-xs text-muted-foreground">
@@ -1177,6 +1178,6 @@ export function EnvironmentProviderSettings({
           onOpenChange={setIsAddInstanceDialogOpen}
         />
       ) : null}
-    </>
+    </ProviderSettingsExtensions>
   );
 }

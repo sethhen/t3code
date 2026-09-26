@@ -95,7 +95,7 @@ export const ensureBinary = async (
   const { platform, arch } = options;
   const asset = releaseAssetFor(platform, arch);
   if (!asset) {
-    throw new Error(`The pool doesn't support ${platform} on ${arch} yet.`);
+    throw new Error(`Account sharing doesn't support ${platform} on ${arch} yet.`);
   }
   const versionDir = NodePath.join(binDir, CLIPROXY_VERSION);
   const binaryPath = NodePath.join(versionDir, binaryName(platform));

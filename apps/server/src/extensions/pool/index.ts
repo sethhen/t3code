@@ -10,7 +10,7 @@ const withController = <A>(run: (controller: PoolController) => Promise<A>) =>
   Effect.tryPromise({
     try: async () => {
       const controller = getPoolController();
-      if (!controller) throw new Error("The pool isn't available on this server.");
+      if (!controller) throw new Error("Account sharing isn't available on this server.");
       return run(controller);
     },
     catch: (cause) =>

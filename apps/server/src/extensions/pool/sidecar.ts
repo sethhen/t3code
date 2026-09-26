@@ -166,7 +166,7 @@ export class Sidecar {
     if (this.stopping) return Promise.resolve();
     this.startPromise ??= this.attempt()
       .catch((error: unknown) => {
-        if (!this.stopping) this.fail(`The pool could not start: ${messageOf(error)}.`);
+        if (!this.stopping) this.fail(`Account sharing could not start: ${messageOf(error)}.`);
       })
       .finally(() => {
         this.startPromise = undefined;
@@ -221,8 +221,10 @@ export class Sidecar {
       if (!this.stopping) this.fail(`${reason}. Log: ${paths.logPath}.`);
     };
     process.once("exit", killOnExit);
-    child.once("error", (error) => onGone(`The pool could not start: ${error.message}`));
-    child.once("exit", (code, signal) => onGone(`The pool stopped (${signal ?? `exit ${code}`})`));
+    child.once("error", (error) => onGone(`Account sharing could not start: ${error.message}`));
+    child.once("exit", (code, signal) =>
+      onGone(`Account sharing stopped (${signal ?? `exit ${code}`})`),
+    );
 
     // Only for crash cleanup: a failed write must not take down a healthy proxy.
     if (child.pid) {
