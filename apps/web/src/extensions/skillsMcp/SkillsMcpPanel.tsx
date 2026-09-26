@@ -13,6 +13,7 @@ import type { RightPanelExtensionProps } from "../registry";
 import { ContextStrip } from "./ContextSummary";
 import { type SortMode, contextSummaries, needsUsage } from "./context.logic";
 import type { ListTabProps, ListView, ListViewActions, UsageDays } from "./listControls";
+import { useMcpLogin } from "./login";
 import { McpTab } from "./McpTab";
 import { PluginsTab } from "./PluginsTab";
 import { useOverviewLoader } from "./shared";
@@ -28,6 +29,7 @@ const TABS: readonly { id: Tab; label: string }[] = [
 
 export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
   const { environmentId, cwd, visible } = props;
+  const login = useMcpLogin(props);
   const client = useExtensionClient(SkillsMcpExtension, environmentId);
   const [tab, setTab] = useState<Tab>("mcp");
 
@@ -113,7 +115,7 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
       <ContextStrip summaries={summaries} loading={context.loading} error={context.error} />
       {/* Tabs stay mounted so switching keeps their search, filters and loaded data. */}
       <div className={cn("min-h-0 flex-1 flex-col", tab === "mcp" ? "flex" : "hidden")}>
-        <McpTab {...listProps(visible && tab === "mcp")} />
+        <McpTab {...listProps(visible && tab === "mcp")} onLogin={login} />
       </div>
       <div className={cn("min-h-0 flex-1 flex-col", tab === "skills" ? "flex" : "hidden")}>
         <SkillsTab {...listProps(visible && tab === "skills")} />

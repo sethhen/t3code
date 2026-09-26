@@ -770,28 +770,6 @@ const reconnect = Effect.fn("skillsMcp.mcp.reconnect")(function* (
     : ({ failures: [], message: `Reconnected ${input.name}` } satisfies MutationResult);
 });
 
-/** Browser sign-in can take a while; the CLI exits once the OAuth callback lands. */
-const LOGIN_TIMEOUT = Duration.minutes(5);
-
-const login = Effect.fn("skillsMcp.mcp.login")(function* (
-  clis: Clis,
-  input: Extract<McpMutation, { readonly action: "login" }>,
-) {
-  const failures = yield* forApp(clis, input.app, true, (cli) =>
-    runAgentCliOk(cli, ["mcp", "login", input.name], {
-      timeout: LOGIN_TIMEOUT,
-      timeoutMessage: `Sign-in to ${input.name} wasn't completed (timed out after 5 minutes)`,
-    }),
-  );
-  yield* invalidateAgentProbes;
-  return failures.length > 0
-    ? ({ failures } satisfies MutationResult)
-    : ({
-        failures,
-        message: `Signed in to ${input.name} (browser opened on the machine running T3)`,
-      } satisfies MutationResult);
-});
-
 /**
  * Writes run one at a time and drop the cached probes, so the next list sees
  * them. Writing to an app's config also holds that app's gate: probes spawn the
@@ -828,8 +806,6 @@ const mutateMcpEffect = Effect.fn("skillsMcp.mcp.mutate")(function* (input: McpM
       );
     case "reconnect":
       return yield* reconnect(clis, input);
-    case "login":
-      return yield* login(clis, input);
   }
 });
 

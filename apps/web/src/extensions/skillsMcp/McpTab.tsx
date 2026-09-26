@@ -15,6 +15,7 @@ import { memo, useDeferredValue, useMemo, useState } from "react";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
+import { toastManager } from "~/components/ui/toast";
 import { cn } from "~/lib/utils";
 
 import {
@@ -96,18 +97,30 @@ import {
   useStableActions,
   visibleApps,
 } from "./shared";
+import { consumeLoginRefresh } from "./login";
 
 const EMPTY_SERVERS: readonly McpServerRow[] = [];
 const TOOL_CAP = 40;
-const LOGIN_HINT = "Opens a browser on the machine running T3 to sign in";
+const LOGIN_HINT = "Signs in from a terminal on the machine running T3";
 
-export function McpTab(props: ListTabProps) {
+export function McpTab(
+  props: ListTabProps & {
+    /** Opens a terminal running the app's `mcp login`; resolves to an error message or null. */
+    readonly onLogin: (name: string, app: AgentApp) => Promise<string | null>;
+  },
+) {
   const { client, scopeKey, cwd, active, view, viewActions, context, usage, onChanged } = props;
   const { data, error, loading, reload } = useOverviewLoader<McpOverview>({
     active,
     key: scopeKey,
-    fetch: (refresh) =>
-      client.call("mcp.list", { ...(cwd ? { cwd } : {}), ...(refresh ? { refresh: true } : {}) }),
+    fetch: (refresh) => {
+      // A login finished in a terminal outside the panel: skip the cached probe.
+      const fresh = consumeLoginRefresh() || refresh;
+      return client.call("mcp.list", {
+        ...(cwd ? { cwd } : {}),
+        ...(fresh ? { refresh: true } : {}),
+      });
+    },
   });
   const mutations = useMutations({ data, reload, onChanged });
   const { expanded, toggle } = useExpandedSet();
@@ -171,17 +184,23 @@ export function McpTab(props: ListTabProps) {
     },
     primary: (row: McpServerRow, primary: McpPrimaryAction) => {
       const { id, name } = row;
+      if (primary.kind === "login") {
+        const app = primary.apps[0];
+        if (!app) return;
+        void props.onLogin(name, app).then((problem) => {
+          if (problem) {
+            toastManager.add({
+              type: "error",
+              title: `Could not sign in to ${name}`,
+              description: problem,
+            });
+          }
+        });
+        return;
+      }
       const steps = primary.apps.flatMap((app, index) => {
         const last = index === primary.apps.length - 1;
         if (primary.kind === "reconnect") return [reconnect(row, app)];
-        if (primary.kind === "login") {
-          return [
-            step(
-              { action: "login", name, app },
-              `Could not sign in to ${name} for ${APP_LABEL[app]}`,
-            ),
-          ];
-        }
         if (!id) return [];
         return [
           step(
