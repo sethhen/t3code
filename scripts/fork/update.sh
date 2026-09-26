@@ -270,6 +270,8 @@ if [ -n "${ORIGIN_SHA:-}" ]; then
   [ -z "$NEW_WORKFLOWS" ] ||
     warn "new workflow file(s) will run once on this push, then workflows.sh disables them:"$'\n'"$(sed 's/^/      /' <<<"$NEW_WORKFLOWS")"
 fi
+step "Secret scan (the repo is public)"
+bash scripts/fork/secret-scan.sh || die "secret scan failed; nothing was pushed. Remove the secret from the commits (and rotate it if it was ever pushed)"
 step "Pushing $BRANCH and $TAG to $ORIGIN_REMOTE (publishes a release)"
 run fork_git push "$ORIGIN_REMOTE" "$BRANCH" "refs/tags/$TAG"
 if [ -f scripts/fork/workflows.sh ]; then

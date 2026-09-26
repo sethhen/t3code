@@ -113,6 +113,11 @@ merge and push with `fork_git` (see Traps).
   PATH and the `vp staged` pre-commit hook fails under it.
 - Never keep an unzipped copy of the app outside `/Applications` (e.g. an extracted backup):
   `t3code://` links (sign-in callback) may open that copy instead.
+- **The repo is public: never commit a secret** (API keys, OAuth/refresh tokens, proxy auth files,
+  `.p12`/`.p8`). A pushed secret is leaked even on a branch and even if reverted: rotate it. Three
+  guards: GitHub push protection (known key formats, server-side), `scripts/fork/secret-scan.sh`
+  (gitleaks + `scripts/fork/gitleaks.toml`, run by `update.sh` before pushing; run it yourself before
+  pushing any branch), and the release workflow's secret scan, which blocks publishing.
 - **Never lose or replace the macOS certificate.** Installed Macs only accept updates signed by the
   certificate they were installed with; a new one (including a later move to Developer ID) means
   every Mac reinstalls from the DMG once. The workflow refuses a change unless run manually with

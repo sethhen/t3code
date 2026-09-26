@@ -15,6 +15,8 @@ name: Fork release
 #            runtime (the WSL backend runs it inside the distro)
 #   windows  Windows x64 NSIS installer, Azure Trusted Signing when those
 #            secrets exist
+#   secret_scan  gitleaks over every fork commit (scripts/fork/gitleaks.toml);
+#            the repo is public, so a finding blocks publishing
 #   publish  draft release with every asset, then flipped to Latest
 #
 # Signing secrets live in the "release" environment (main only), which only
@@ -228,6 +230,54 @@ jobs:
             echo "- Windows signed: \`$win_signed\`"
             echo "- Publish GitHub Release: \`$publish\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The repo is public: a pushed secret is already leaked, but this stops it
+  # from shipping and makes the run fail loudly so it gets rotated.
+  # scripts/fork/secret-scan.sh runs the same scan locally before pushing.
+  secret_scan:
+    name: Secret scan
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      # Commits and trees only; git fetches the blobs of the scanned commits
+      # on demand, so the ~400 MB of upstream history is never downloaded.
+      - name: Fetch history
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --filter=blob:none --tags origin "$GITHUB_SHA"
+          if ! git rev-parse --verify --quiet "refs/tags/${BASE_TAG}^{commit}" >/dev/null; then
+            git fetch --quiet --filter=blob:none --no-tags "${GITHUB_SERVER_URL}/${UPSTREAM_REPOSITORY}.git" \
+              "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}"
+          fi
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan fork commits
+        run: |
+          set -euo pipefail
+          git show "$GITHUB_SHA:scripts/fork/gitleaks.toml" > "$RUNNER_TEMP/gitleaks.toml"
+          echo "Scanning ${BASE_TAG}..${GITHUB_SHA}"
+          if ! "$RUNNER_TEMP/gitleaks" git --config "$RUNNER_TEMP/gitleaks.toml" --redact --no-banner -v \
+            --log-opts="${BASE_TAG}..${GITHUB_SHA}" .; then
+            echo "::error title=Secret found::A secret was pushed to this public repo. Revoke/rotate it now (it is already public), then remove it from the code. This run will not publish."
+            exit 1
+          fi
 
   bundle:
     name: Build JS bundle
@@ -785,7 +835,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [plan, mac, windows]
+    needs: [plan, mac, windows, secret_scan]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
