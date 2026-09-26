@@ -473,6 +473,21 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           }),
       );
 
+      it.effect("reports usage as unsupported, not failed, for a custom model provider", () =>
+        Effect.gen(function* () {
+          const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
+            Effect.succeed(
+              makeCodexProbeSnapshot({
+                account: { account: null, requiresOpenaiAuth: false },
+              }),
+            ),
+          );
+
+          assert.strictEqual(status.usageLimits?.unavailable?.reason, "unsupported");
+          assert.deepStrictEqual(status.usageLimits?.windows, []);
+        }),
+      );
+
       it.effect("returns an api key label for codex api key auth", () =>
         Effect.gen(function* () {
           const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
