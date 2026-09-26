@@ -3,8 +3,8 @@
 Public fork (`sethhen/t3code`, remote `origin`) of `pingdotgg/t3code` (remote `upstream`).
 Branch `main` = the newest upstream **stable tag** merged in + the fork's commits. The fork adds
 right-panel "extensions" (Skills & MCP, ...). Every push to `main` runs the "Fork release"
-workflow (`.github/workflows/fork-release.yml`): a signed macOS arm64 DMG and a Windows x64
-installer, versioned `X.Y.Z-wingman.<run>` (X.Y.Z = the upstream release `main` is based on),
+workflow (`.github/workflows/fork-release.yml`): a self-signed macOS arm64 DMG and an
+unsigned Windows x64 installer (no Apple or Microsoft account needed), versioned `X.Y.Z-wingman.<run>` (X.Y.Z = the upstream release `main` is based on),
 published as a GitHub Release that installed fork apps update to.
 
 ## The one rule: only the extension host commit edits upstream files
@@ -41,9 +41,12 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
 - **Install:** download from https://github.com/sethhen/t3code/releases/latest - the `.dmg` on
   an Apple Silicon Mac, the `.exe` on Windows. It replaces official T3 Code and shares its data
   (threads, settings, connections).
-- **First launch:** macOS may ask for Keychain access ("t3code Safe Storage"): choose
-  **Always Allow**. On Windows, if SmartScreen blocks the installer: **More info -> Run anyway**
-  (once).
+- **First launch on a Mac:** macOS says it can't verify the app. Click **Done**, then open
+  System Settings → Privacy & Security, scroll down to "T3 Code (Alpha) was blocked" and click
+  **Open Anyway** (then enter your Mac password). Once. If macOS asks for Keychain access
+  ("t3code Safe Storage"), choose **Always Allow**.
+- **First launch on Windows:** if SmartScreen blocks the installer, click **More info → Run
+  anyway** (once). PCs with Smart App Control turned on block unsigned apps outright.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
@@ -62,7 +65,9 @@ merge and push with `fork_git` (see Traps).
   [Actions](https://github.com/sethhen/t3code/actions). Every push to `main` publishes a release.
 - **Dry run:** run "Fork release" manually (Actions -> Fork release -> Run workflow) with publish
   off. Pushes also run as dry runs while the signing secrets are missing.
-- **Signing setup:** `scripts/fork/SIGNING.md`.
+- **Signing:** macOS builds are signed with the fork's self-signed certificate
+  (`scripts/fork/self-signed-cert.sh`; the key lives in `~/.config/wingman/signing/` and in
+  1Password). Apple Developer ID / Azure signing are optional upgrades: `scripts/fork/SIGNING.md`.
 - **Update T3 Code:**
 
   ```bash
@@ -108,6 +113,10 @@ merge and push with `fork_git` (see Traps).
   PATH and the `vp staged` pre-commit hook fails under it.
 - Never keep an unzipped copy of the app outside `/Applications` (e.g. an extracted backup):
   `t3code://` links (sign-in callback) may open that copy instead.
+- **Never lose or replace the macOS certificate.** Installed Macs only accept updates signed by the
+  certificate they were installed with; a new one (including a later move to Developer ID) means
+  every Mac reinstalls from the DMG once. The workflow refuses a change unless run manually with
+  `allow_mac_signer_change`.
 - **Never rename or recreate `fork-release.yml`.** The version's `.N` is the workflow's run number,
   which restarts at 1 for a new workflow; installed copies would then never see a newer version.
 - A `-nightly` version renames the app to `T3 Code (Nightly)`; fork versions must stay

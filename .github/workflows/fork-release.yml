@@ -8,8 +8,9 @@ name: Fork release
 #   plan     version X.Y.Z-wingman.<run_number> (X.Y.Z = newest stable upstream
 #            tag merged into this commit) and signing mode from secrets
 #   bundle   JS bundle (server + web client + Electron main), built once on Linux
-#   mac      macOS arm64 dmg + zip, Developer ID signed + notarized when the
-#            Apple secrets exist
+#   mac      macOS arm64 dmg + zip, signed with the CSC_LINK certificate
+#            (self-signed by default, scripts/fork/self-signed-cert.sh), and
+#            notarized when the App Store Connect secrets exist too
 #   linux_cli  Linux x64 CLI archive, embedded in the Windows app as the WSL
 #            runtime (the WSL backend runs it inside the distro)
 #   windows  Windows x64 NSIS installer, Azure Trusted Signing when those
@@ -19,9 +20,15 @@ name: Fork release
 # Signing secrets live in the "release" environment (main only), which only
 # plan, mac and windows declare, so upstream workflows never see them.
 #
-# Without the Apple secrets a run is a dry run: unsigned builds, uploaded as
-# workflow artifacts only, never published (an unsigned macOS app cannot
-# install updates, and it would break the feed for signed installs).
+# Without a macOS certificate a run is a dry run: unsigned builds, uploaded as
+# workflow artifacts only, never published. Squirrel.Mac only installs an
+# update that satisfies the running app's designated requirement; a
+# certificate gives a stable one (`certificate root = H"..."` self-signed,
+# Apple team for Developer ID), while ad-hoc builds get a per-build cdhash and
+# could never update. So every release must be signed by the SAME certificate:
+# the mac job refuses a signer change unless allow_mac_signer_change is set.
+# Self-signed builds aren't notarized, so a first install needs "Open Anyway"
+# in System Settings -> Privacy & Security; updates then install normally.
 #
 # Upstream's release-desktop.yml is not reused: a signed macOS build there
 # requires T3's provisioning profile (passkey Associated Domains entitlement),
@@ -40,9 +47,13 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish a GitHub Release (only happens when the macOS signing secrets are configured)
+        description: Publish a GitHub Release (only happens when a macOS certificate is configured)
         type: boolean
         default: true
+      allow_mac_signer_change:
+        description: Publish with a different macOS certificate than the latest release (installed Macs must then reinstall once by hand)
+        type: boolean
+        default: false
 
 concurrency:
   group: fork-release
@@ -68,6 +79,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       base_tag: ${{ steps.version.outputs.base_tag }}
       mac_signed: ${{ steps.signing.outputs.mac_signed }}
+      mac_notarize: ${{ steps.signing.outputs.mac_notarize }}
       win_signed: ${{ steps.signing.outputs.win_signed }}
       publish: ${{ steps.signing.outputs.publish }}
     steps:
@@ -160,12 +172,17 @@ jobs:
               [[ -n "${!name:-}" ]] || printf '%s ' "$name"
             done
           }
-          mac_missing="$(missing CSC_LINK CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER)"
+          mac_missing="$(missing CSC_LINK CSC_KEY_PASSWORD)"
+          notary_missing="$(missing APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER)"
           win_missing="$(missing AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TRUSTED_SIGNING_ENDPOINT \
             AZURE_TRUSTED_SIGNING_ACCOUNT_NAME AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME AZURE_TRUSTED_SIGNING_PUBLISHER_NAME)"
 
           mac_signed=false
           [[ -z "$mac_missing" ]] && mac_signed=true
+          # Notarization needs a Developer ID certificate plus the App Store
+          # Connect key; with only a certificate the build is self-signed.
+          mac_notarize=false
+          [[ "$mac_signed" == true && -z "$notary_missing" ]] && mac_notarize=true
           win_signed=false
           [[ -z "$win_missing" ]] && win_signed=true
           requested=false
@@ -188,10 +205,12 @@ jobs:
           fi
 
           if [[ "$mac_signed" != true ]]; then
-            echo "::warning title=Dry run: macOS signing secrets missing::Add repository secrets ${mac_missing% } to sign, notarize and publish. This run builds unsigned apps as workflow artifacts only and creates no release."
+            echo "::warning title=Dry run: no macOS certificate::Add ${mac_missing% } to the release environment (scripts/fork/self-signed-cert.sh --set-secrets) to sign and publish. This run builds unsigned apps as workflow artifacts only and creates no release."
+          elif [[ "$mac_notarize" != true ]]; then
+            echo "::notice title=macOS build is self-signed::Not notarized, so a first install needs Open Anyway in System Settings. Updates install normally."
           fi
           if [[ "$win_signed" != true ]]; then
-            echo "::warning title=Windows build is unsigned::Add repository secrets ${win_missing% } for Azure Trusted Signing. Unsigned Windows installers are still published (SmartScreen warns on first install)."
+            echo "::notice title=Windows build is unsigned::SmartScreen warns on first install (More info, Run anyway). Updates install normally."
           fi
           if [[ "$mac_signed" == true && "$requested" != true ]]; then
             echo "::notice::publish=false: signed build, artifacts only."
@@ -199,12 +218,13 @@ jobs:
 
           {
             echo "mac_signed=$mac_signed"
+            echo "mac_notarize=$mac_notarize"
             echo "win_signed=$win_signed"
             echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
           {
             echo "### Fork release plan"
-            echo "- macOS signed + notarized: \`$mac_signed\`"
+            echo "- macOS signed: \`$mac_signed\`, notarized: \`$mac_notarize\`"
             echo "- Windows signed: \`$win_signed\`"
             echo "- Publish GitHub Release: \`$publish\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -361,9 +381,12 @@ jobs:
     runs-on: macos-15
     environment: release
     timeout-minutes: 75
+    outputs:
+      signer: ${{ steps.signing.outputs.signer }}
     env:
       VERSION: ${{ needs.plan.outputs.version }}
       SIGNED: ${{ needs.plan.outputs.mac_signed }}
+      NOTARIZE: ${{ needs.plan.outputs.mac_notarize }}
     steps:
       - name: Checkout
         env:
@@ -414,20 +437,27 @@ jobs:
           name: fork-js-bundle
           path: apps
 
-      # Imports the Developer ID certificate into a throwaway keychain and
-      # stores the App Store Connect API key as a notarytool keychain profile.
-      # electron-builder then signs (CSC_NAME + CSC_KEYCHAIN) and notarizes +
-      # staples (APPLE_KEYCHAIN_PROFILE) even though the build script runs
-      # without --signed, which is what keeps T3's passkey entitlements and
-      # provisioning profile out of the fork's app.
-      - name: Prepare macOS signing and notarization
+      # Imports the certificate into a throwaway keychain (plus, with the App
+      # Store Connect key, a notarytool profile). electron-builder then signs
+      # (CSC_NAME + CSC_KEYCHAIN) and notarizes + staples
+      # (APPLE_KEYCHAIN_PROFILE) even though the build script runs without
+      # --signed, which keeps T3's passkey entitlements and provisioning
+      # profile out of the fork's app. electron-builder only lists trusted
+      # identities (find-identity -v), so a self-signed certificate is trusted
+      # for code signing on this runner first (sudo + admin domain: the user
+      # domain would wait for a GUI password prompt).
+      - name: Prepare macOS signing
+        id: signing
         if: env.SIGNED == 'true'
+        timeout-minutes: 10
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          ALLOW_SIGNER_CHANGE: ${{ inputs.allow_mac_signer_change }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/fork-signing.keychain-db"
@@ -437,12 +467,14 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
 
-          # Developer ID intermediates, in case the runner image lacks them.
-          for ca in DeveloperIDG2CA.cer DeveloperIDCA.cer; do
-            if curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ca" "https://www.apple.com/certificateauthority/$ca"; then
-              security import "$RUNNER_TEMP/$ca" -k "$keychain" >/dev/null 2>&1 || true
-            fi
-          done
+          if [[ "$NOTARIZE" == true ]]; then
+            # Developer ID intermediates, in case the runner image lacks them.
+            for ca in DeveloperIDG2CA.cer DeveloperIDCA.cer; do
+              if curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ca" "https://www.apple.com/certificateauthority/$ca"; then
+                security import "$RUNNER_TEMP/$ca" -k "$keychain" >/dev/null 2>&1 || true
+              fi
+            done
+          fi
 
           cert_path="$RUNNER_TEMP/fork-signing.p12"
           printf '%s' "$CSC_LINK" | base64 --decode > "$cert_path"
@@ -456,27 +488,60 @@ jobs:
           done < <(security list-keychains -d user)
           security list-keychains -d user -s "$keychain" "${search_list[@]}"
 
-          identity_line="$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application:' | head -n 1 || true)"
+          identity_line="$(security find-identity -p codesigning "$keychain" | grep -E '^[[:space:]]+[0-9]+\)' | head -n 1 || true)"
           if [[ -z "$identity_line" ]]; then
-            echo "::error::CSC_LINK contains no valid 'Developer ID Application' identity."
+            echo "::error::CSC_LINK contains no code-signing identity."
             exit 1
           fi
           identity_hash="$(awk '{ print $2 }' <<<"$identity_line")"
-          echo "Signing identity: $(sed -n 's/.*"\(.*\)".*/\1/p' <<<"$identity_line")"
+          identity_name="$(sed -n 's/.*"\(.*\)".*/\1/p' <<<"$identity_line")"
+          echo "Signing identity: $identity_name ($identity_hash)"
+          if [[ "$NOTARIZE" == true && "$identity_name" != "Developer ID Application:"* ]]; then
+            echo "::error::Notarization needs a Developer ID Application certificate, but CSC_LINK holds '$identity_name'."
+            exit 1
+          fi
+          if ! security find-identity -v -p codesigning "$keychain" | grep -q "$identity_hash"; then
+            echo "Trusting the self-signed certificate for code signing on this runner."
+            cert_pem="$RUNNER_TEMP/fork-signing.pem"
+            security find-certificate -c "$identity_name" -p "$keychain" > "$cert_pem"
+            sudo security authorizationdb write com.apple.trust-settings.admin allow >/dev/null
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert_pem"
+            if ! security find-identity -v -p codesigning "$keychain" | grep -q "$identity_hash"; then
+              echo "::error::The certificate is still not a valid code-signing identity after trusting it."
+              exit 1
+            fi
+          fi
 
-          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-          printf '%s' "$APPLE_API_KEY" > "$key_path"
-          xcrun notarytool store-credentials t3code-fork-notary \
-            --key "$key_path" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
-            --keychain "$keychain"
-          rm -f "$key_path"
+          # Installed Macs only accept updates signed by the certificate they
+          # were signed with (Developer ID: the same Apple team).
+          latest_signer="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null |
+            sed -n 's/.*mac-signer: \([0-9A-F]\{40\}\).*/\1/p' | head -n 1 || true)"
+          if [[ -n "$latest_signer" && "$latest_signer" != "$identity_hash" ]]; then
+            if [[ "$ALLOW_SIGNER_CHANGE" != true ]]; then
+              echo "::error title=macOS certificate changed::The latest release was signed by $latest_signer, this run by $identity_hash. Installed Macs would refuse the update (unless both are Developer ID certificates of the same team). Restore the old certificate, or run Fork release manually with allow_mac_signer_change and have every Mac reinstall from the DMG once."
+              exit 1
+            fi
+            echo "::warning title=macOS certificate changed::Allowed by allow_mac_signer_change; installed Macs must reinstall from the DMG."
+          fi
+          echo "signer=$identity_hash" >> "$GITHUB_OUTPUT"
 
           {
             echo "CSC_NAME=$identity_hash"
             echo "CSC_KEYCHAIN=$keychain"
-            echo "APPLE_KEYCHAIN=$keychain"
-            echo "APPLE_KEYCHAIN_PROFILE=t3code-fork-notary"
           } >> "$GITHUB_ENV"
+
+          if [[ "$NOTARIZE" == true ]]; then
+            key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            printf '%s' "$APPLE_API_KEY" > "$key_path"
+            xcrun notarytool store-credentials t3code-fork-notary \
+              --key "$key_path" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --keychain "$keychain"
+            rm -f "$key_path"
+            {
+              echo "APPLE_KEYCHAIN=$keychain"
+              echo "APPLE_KEYCHAIN_PROFILE=t3code-fork-notary"
+            } >> "$GITHUB_ENV"
+          fi
 
       - name: Build desktop artifact
         env:
@@ -515,14 +580,32 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$app"
           details="$(codesign -dv --verbose=2 "$app" 2>&1)"
           grep -E '^(Authority|TeamIdentifier|Timestamp|flags)=' <<<"$details" || true
-          grep -q 'Authority=Developer ID Application:' <<<"$details" || { echo "::error::App is not Developer ID signed"; exit 1; }
           grep -q '(runtime)' <<<"$details" || { echo "::error::Hardened runtime is off"; exit 1; }
           if codesign -d --entitlements - "$app" 2>/dev/null | grep -q 'associated-domains'; then
             echo "::error::App carries the Associated Domains entitlement, which needs T3's provisioning profile"
             exit 1
           fi
-          xcrun stapler validate "$app"
-          spctl --assess --type execute --verbose=4 "$app"
+          # Squirrel.Mac installs an update only if it satisfies this; it must
+          # name the certificate, not a per-build cdhash.
+          requirement="$(codesign -d -r- "$app" 2>&1 | sed -n 's/^designated => //p')"
+          echo "Designated requirement: $requirement"
+          [[ "$requirement" == *certificate* ]] || { echo "::error::No certificate-based designated requirement"; exit 1; }
+          if [[ "$NOTARIZE" == true ]]; then
+            grep -q 'Authority=Developer ID Application:' <<<"$details" || { echo "::error::App is not Developer ID signed"; exit 1; }
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=4 "$app"
+          else
+            # No Team ID: with hardened runtime, library validation would kill
+            # any executable that loads Electron Framework without this.
+            for code in "$app" "$app"/Contents/Frameworks/*.app; do
+              if ! codesign -d --entitlements - --xml "$code" 2>/dev/null | grep -q 'com.apple.security.cs.disable-library-validation'; then
+                echo "::error::$(basename "$code") lacks com.apple.security.cs.disable-library-validation"
+                exit 1
+              fi
+            done
+            echo "Self-signed (not notarized). Gatekeeper, expected to reject until Open Anyway:"
+            spctl --assess --type execute -vv "$app" 2>&1 || true
+          fi
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -712,6 +795,7 @@ jobs:
     env:
       VERSION: ${{ needs.plan.outputs.version }}
       WIN_SIGNED: ${{ needs.plan.outputs.win_signed }}
+      MAC_SIGNER: ${{ needs.mac.outputs.signer }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -767,11 +851,11 @@ jobs:
             release-assets/latest-mac.yml release-assets/latest.yml)
           gh release create "$tag" --draft --target "$GITHUB_SHA" \
             --title "T3 Code $VERSION" --generate-notes "${files[@]}"
-          # The plan job reads this marker to stop an unsigned Windows build
-          # from following a signed one.
+          # Markers the next run checks: no unsigned Windows build after a
+          # signed one, no change of macOS certificate.
           notes="$RUNNER_TEMP/notes.md"
           gh release view "$tag" --json body --jq .body > "$notes"
-          printf '\n<!-- windows-signed: %s -->\n' "$WIN_SIGNED" >> "$notes"
+          printf '\n<!-- windows-signed: %s -->\n<!-- mac-signer: %s -->\n' "$WIN_SIGNED" "$MAC_SIGNER" >> "$notes"
           gh release edit "$tag" --notes-file "$notes" --draft=false --prerelease=false --latest
 
           url="$(gh release view "$tag" --json url --jq .url)"

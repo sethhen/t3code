@@ -1,14 +1,32 @@
 # Code signing for the fork (macOS + Windows)
 
 The fork ships desktop builds to the team through GitHub Releases on `sethhen/t3code` with
-auto-update. Auto-update needs signed builds: on macOS electron-updater (Squirrel.Mac) only
-installs an update whose signature satisfies the running app's designated requirement, and on
-Windows a signed build pins the publisher name that every later update must match.
+auto-update, **without any Apple or Microsoft account**:
 
-The fork keeps bundle id `com.t3tools.t3code`, which is registered to T3's Apple team, so it can't
-have a provisioning profile or the Associated Domains (passkey) entitlement. It uses plain
-**Developer ID signing + notarization**, and Windows uses **Azure Artifact Signing** (formerly
-Azure Trusted Signing), the only Windows signer the upstream pipeline supports.
+- **macOS: self-signed.** `scripts/fork/self-signed-cert.sh --set-secrets` created the fork's own
+  code-signing certificate and stored it as `CSC_LINK` + `CSC_KEY_PASSWORD` in the `release`
+  environment. Auto-update works because electron-updater (Squirrel.Mac) only installs an update
+  that satisfies the installed app's designated requirement,
+  `identifier "com.t3tools.t3code" and certificate root = H"<sha1>"`, and every build signed with
+  that certificate satisfies it. A fully unsigned (ad-hoc) build gets a per-build requirement and
+  could never update. Not notarized, so the first install needs **Open Anyway** in System Settings →
+  Privacy & Security (FORK.md).
+- **Windows: unsigned.** SmartScreen warns on the first install. Updates install normally:
+  electron-updater only verifies the publisher of signed builds.
+- **The certificate key is irreplaceable:** `~/.config/wingman/signing/t3code-fork-macos.p12` and
+  `t3code-fork-macos.password`. Keep both in 1Password. With a different certificate, installed Macs
+  refuse updates until reinstalled by hand, so the workflow blocks a certificate change unless
+  "Fork release" is run manually with `allow_mac_signer_change`.
+
+The bundle id stays `com.t3tools.t3code` (registered to T3's Apple team), so fork builds never carry
+T3's provisioning profile or the Associated Domains (passkey) entitlement.
+
+## Optional upgrades
+
+Only needed to remove the first-install warnings. Moving macOS to **Developer ID + notarization**
+changes the certificate, so every Mac reinstalls from the DMG once. Moving Windows to **Azure
+Artifact Signing** is seamless (a signed build installs over an unsigned one), but after that every
+Windows release must be signed.
 
 |                                              | Seth's hands-on time | Lead time                                          | Cost                                       |
 | -------------------------------------------- | -------------------- | -------------------------------------------------- | ------------------------------------------ |
@@ -17,7 +35,7 @@ Azure Trusted Signing), the only Windows signer the upstream pipeline supports.
 | Azure Artifact Signing (organisation)        | ~1–2 h               | a few days, longer if Microsoft asks for documents | US$9.99/month Basic (billed in AUD, ~A$15) |
 | Pipeline changes (Claude)                    | none                 | ~1 session once the secrets exist                  | Actions minutes are free on a public repo  |
 
-## Checklist
+### Upgrade checklist
 
 **Seth does** (the secrets must never pass through chat):
 
@@ -31,21 +49,9 @@ Azure Trusted Signing), the only Windows signer the upstream pipeline supports.
        The `.p12` is the only copy of the certificate's private key. Apple keeps no copy of the `.p8`.
 8. [ ] Add calendar reminders for the expiry dates listed in section 4.
 
-**Already built** (`.github/workflows/fork-release.yml`, runs on every push to `main`):
-
-- macOS arm64 is built without T3's `--signed` mode, so the passkey entitlement and provisioning
-  profile never enter the build. electron-builder still signs it with the Developer ID certificate
-  (`CSC_NAME` + a throwaway keychain), notarizes and staples it (a `notarytool` keychain profile), and
-  applies its default hardened-runtime entitlements. A verify step blocks publishing unless the app is
-  Developer ID signed, notarized, free of Associated Domains, and its feed points at `sethhen/t3code`.
-- Windows x64 is signed with Azure when all seven Azure secrets exist; otherwise it ships unsigned
-  with a warning.
-- Until the five Apple secrets exist, every run is a dry run: unsigned builds as workflow artifacts,
-  no release.
-
-**Claude does** once the secrets exist: re-run "Fork release", check the first signed release
-(section 3 and `publisherName` in `app-update.yml`), and walk teammates through the one manual
-DMG install. After that, updates arrive in the app.
+**The workflow already handles both upgrades:** with the three App Store Connect secrets next to a
+Developer ID `CSC_LINK`, the mac job notarizes and staples; with the seven Azure secrets, the
+Windows job signs.
 
 ## 1. macOS: Developer ID + notarization
 
