@@ -286,7 +286,7 @@ export interface PoolStartFailure {
   readonly text: string;
   /** The proxy's own words, for the hover and Details. */
   readonly technical: string;
-  /** `proxy.log`, when the message names it. */
+  /** The proxy's log file, as the server reports it (never parsed from the message). */
   readonly logPath?: string;
 }
 
@@ -298,7 +298,7 @@ export function poolStartFailure(status: PoolStatus): PoolStartFailure | null {
   if (status.source !== "local" || status.runtime.state !== "error") return null;
   const technical = status.runtime.message?.trim() || "The pool stopped.";
   const retry = /Retrying in (\d+)s/.exec(technical)?.[1];
-  const logPath = /Log: (.+?proxy\.log)/.exec(technical)?.[1];
+  const logPath = status.runtime.logPath;
   return {
     text: retry ? `The pool couldn't start. Retrying in ${retry}s.` : "The pool couldn't start.",
     technical,

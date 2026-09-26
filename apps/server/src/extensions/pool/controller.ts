@@ -71,6 +71,7 @@ import {
   type PoolPaths,
   type PoolState,
   savePoolState,
+  keyFilePath,
 } from "./state.ts";
 
 /** The pool's entry in `settings.usageLimitSources`, so its quotas show on the usage page. */
@@ -226,15 +227,24 @@ export class PoolController {
     const state = this.state;
     const modeFor = (instanceId: string): PoolRouteMode =>
       state.routes[instanceId] ?? defaultRouteMode(instanceId);
-    const keyHelper = { path: this.deps.paths.clientKeyPath, platform: this.deps.platform };
+    const keyHelperFor = (baseUrl: string) => ({
+      path: keyFilePath(this.deps.paths, baseUrl),
+      platform: this.deps.platform,
+    });
     if (state.source === "external") {
       const endpoint =
         state.external.url && state.external.key
           ? { baseUrl: state.external.url.replace(/\/+$/, ""), key: state.external.key }
           : undefined;
-      return { claude: endpoint, codex: endpoint, modeFor, keyHelper };
+      return {
+        claude: endpoint,
+        codex: endpoint,
+        modeFor,
+        keyHelper: keyHelperFor(endpoint?.baseUrl ?? ""),
+      };
     }
     const endpoint = { baseUrl: this.localBaseUrl, key: state.clientKey };
+    const keyHelper = keyHelperFor(endpoint.baseUrl);
     const serves = (provider: PoolProvider) =>
       this.accounts.some((account) => account.provider === provider && !account.disabled);
     return {
@@ -261,10 +271,16 @@ export class PoolController {
       const context = this.routingContext();
       const signature = this.routingSignature(context);
       if (signature === this.signature) return;
-      await this.writeClientKey(context.claude?.key ?? context.codex?.key);
+      const endpoint = context.claude ?? context.codex;
+      if (endpoint) await this.writeClientKey(context.keyHelper.path, endpoint.key);
       await this.deps.reconcile();
       // Committed only once both landed, so a failure is retried by the next change.
       this.signature = signature;
+      // Other pools' keys go only now: until the reconcile lands, sessions still aimed at the
+      // previous pool keep reading that pool's own key, never the new one.
+      await this.pruneKeyFiles(endpoint ? context.keyHelper.path : undefined).catch((error) =>
+        this.deps.log("Couldn't remove old pool keys", error),
+      );
       void this.runChecks();
     });
     this.routingQueue = run.then(
@@ -274,15 +290,23 @@ export class PoolController {
     return run;
   }
 
-  /** The key file `apiKeyHelper` prints (0600; the key never goes on a command line). */
-  private async writeClientKey(key: string | undefined) {
-    if (!key) return;
-    const path = this.deps.paths.clientKeyPath;
-    await NodeFSP.mkdir(this.deps.paths.root, { recursive: true, mode: 0o700 });
+  /** A pool's key file for `apiKeyHelper` (0600; the key never goes on a command line). */
+  private async writeClientKey(path: string, key: string) {
+    await NodeFSP.mkdir(this.deps.paths.keysDir, { recursive: true, mode: 0o700 });
     // Temp + rename: a reader never sees a half-written key.
     const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
     await NodeFSP.writeFile(temp, key, { mode: 0o600 });
     await NodeFSP.rename(temp, path);
+  }
+
+  /** Removes every pool key file except `keep` (and the pre-keysDir single file). */
+  private async pruneKeyFiles(keep: string | undefined) {
+    await NodeFSP.rm(this.deps.paths.legacyClientKeyPath, { force: true });
+    const entries = await NodeFSP.readdir(this.deps.paths.keysDir).catch(() => []);
+    for (const entry of entries) {
+      const path = NodePath.join(this.deps.paths.keysDir, entry);
+      if (path !== keep && !entry.endsWith(".tmp")) await NodeFSP.rm(path, { force: true });
+    }
   }
 
   /** Serialised: the change sees the latest state, and memory follows only a successful write. */
@@ -491,6 +515,7 @@ export class PoolController {
         ...base,
         state: "error",
         message: sidecar?.message ?? this.startError ?? "The pool stopped.",
+        logPath: this.deps.paths.logPath,
       };
     }
     if (sidecar?.phase === "starting") return { ...base, state: "starting" };

@@ -128,7 +128,7 @@ through a pool account.
 
 The pool key never goes on a command line (argv shows up in `ps`, traces and resource telemetry):
 flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyHelper` prints the
-0600 file `<stateDir>/pool/client-key`. The helper command holds no path: it reads the file named by
+0600 key file for that pool's address, `<stateDir>/pool/keys/<sha256(url) prefix>`, so a session still aimed at one pool can never read another pool's key (other pools' files are removed once routing has switched). The helper command holds no path: it reads the file named by
 `T3_POOL_KEY_FILE` (`cat "$T3_POOL_KEY_FILE"`, PowerShell `-LiteralPath` on Windows), so neither
 `/bin/sh` nor `cmd.exe` can expand anything in it. Codex reads the key from an env var.
 Models stay in their own harness: T3 never offers a cross-family model through the pool (pooled

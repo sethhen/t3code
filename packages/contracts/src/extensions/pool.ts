@@ -59,6 +59,8 @@ export const PoolRuntime = Schema.Struct({
   /** `127.0.0.1:<port>` once the local proxy listens. */
   endpoint: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
+  /** The local proxy's log file, when it failed (for "Show log"). */
+  logPath: Schema.optional(Schema.String),
 });
 export type PoolRuntime = typeof PoolRuntime.Type;
 

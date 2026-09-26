@@ -32,8 +32,13 @@ export interface PoolPaths {
   readonly binDir: string;
   readonly logPath: string;
   readonly pidPath: string;
-  /** The key T3's Claude sessions read through `apiKeyHelper`, so it never appears in argv. */
-  readonly clientKeyPath: string;
+  /**
+   * Keys T3's Claude sessions read through `apiKeyHelper` (never argv): one 0600 file per
+   * pool address, so a session aimed at pool A can only ever read A's key (see `keyFilePath`).
+   */
+  readonly keysDir: string;
+  /** Pre-keysDir single key file, removed on the next routing change. */
+  readonly legacyClientKeyPath: string;
   /** OpenAI's Codex model catalog, as fetched through a pool account. */
   readonly codexCatalogPath: string;
 }
@@ -48,10 +53,18 @@ export const poolPaths = (stateDir: string): PoolPaths => {
     binDir: NodePath.join(root, "bin"),
     logPath: NodePath.join(root, "proxy.log"),
     pidPath: NodePath.join(root, "proxy.pid"),
-    clientKeyPath: NodePath.join(root, "client-key"),
+    keysDir: NodePath.join(root, "keys"),
+    legacyClientKeyPath: NodePath.join(root, "client-key"),
     codexCatalogPath: NodePath.join(root, "codex-models.json"),
   };
 };
+
+/** The key file for the pool at `baseUrl`: switching pools never rewrites another pool's key. */
+export const keyFilePath = (paths: Pick<PoolPaths, "keysDir">, baseUrl: string) =>
+  NodePath.join(
+    paths.keysDir,
+    NodeCrypto.createHash("sha256").update(baseUrl).digest("hex").slice(0, 16),
+  );
 
 /** Default instances (`claudeAgent`, `codex`) use the pool; extra instances stay direct. */
 export const defaultRouteMode = (instanceId: string): PoolRouteMode =>

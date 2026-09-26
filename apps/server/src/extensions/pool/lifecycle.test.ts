@@ -16,7 +16,7 @@ import { assert, describe, it } from "@effect/vitest";
 
 import { PoolController, type PoolDeps } from "./controller.ts";
 import { Sidecar, isOwnProxy, killStaleProxy } from "./sidecar.ts";
-import { poolPaths, savePoolState, decodePoolState, type PoolPaths } from "./state.ts";
+import { poolPaths, savePoolState, decodePoolState, keyFilePath, type PoolPaths } from "./state.ts";
 import { deriveProviderInstanceConfigMap } from "./t3.ts";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -399,10 +399,43 @@ describe("controller", () => {
       ),
     );
     const saved = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
-      external: { key: string };
+      external: { url: string; key: string };
     };
-    assert.strictEqual(NodeFS.readFileSync(paths.clientKeyPath, "utf8"), saved.external.key);
-    assert.strictEqual((NodeFS.statSync(paths.clientKeyPath).mode & 0o777).toString(8), "600");
+    const keyFile = keyFilePath(paths, saved.external.url);
+    assert.strictEqual(NodeFS.readFileSync(keyFile, "utf8"), saved.external.key);
+    assert.strictEqual((NodeFS.statSync(keyFile).mode & 0o777).toString(8), "600");
+    assert.deepEqual(NodeFS.readdirSync(paths.keysDir), [NodePath.basename(keyFile)]);
+    await pool.shutdown();
+  });
+
+  it("never hands one pool's key to sessions still aimed at another pool", async () => {
+    const paths = poolPaths(tempDir());
+    let failReconcile = false;
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("nothing should start");
+      },
+      reconcile: async () => {
+        if (failReconcile) throw new Error("settings write failed");
+      },
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    const a = "http://pool-a.example.com";
+    const b = "http://pool-b.example.com";
+    await pool.setSource({ source: "external", externalUrl: a, externalKey: "key-a" });
+    failReconcile = true;
+    await pool
+      .setSource({ source: "external", externalUrl: b, externalKey: "key-b" })
+      .catch(() => undefined);
+    // Routing still points sessions at A: A's file must still hold A's key.
+    assert.strictEqual(NodeFS.readFileSync(keyFilePath(paths, a), "utf8"), "key-a");
+    assert.strictEqual(NodeFS.readFileSync(keyFilePath(paths, b), "utf8"), "key-b");
+    failReconcile = false;
+    await pool.setRoute("claudeAgent", "pool");
+    // Once B is applied, A's key is gone.
+    assert.isFalse(NodeFS.existsSync(keyFilePath(paths, a)));
+    assert.strictEqual(NodeFS.readFileSync(keyFilePath(paths, b), "utf8"), "key-b");
     await pool.shutdown();
   });
 

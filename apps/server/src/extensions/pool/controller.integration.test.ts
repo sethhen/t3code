@@ -77,7 +77,11 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
               const instance = (await instanceMap())[
                 instanceId as keyof Awaited<ReturnType<typeof instanceMap>>
               ] as ProviderInstanceConfig | undefined;
-              const env = mergeProviderInstanceEnvironment(instance?.environment, cleanEnv());
+              const env = mergeProviderInstanceEnvironment(instance?.environment, {
+                ...cleanEnv(),
+                // Never the developer's real ~/.claude: the probe authenticates via the pool.
+                CLAUDE_CONFIG_DIR: NodePath.join(stateDir, "claude-config"),
+              });
               const executablePath = claudePath;
               const baseOptions = buildClaudeCapabilitiesProbeQueryOptions({
                 executablePath,

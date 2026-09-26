@@ -353,10 +353,18 @@ describe("friendlier failures and ordering", () => {
   });
 
   it("turns a spawn error into one calm sentence, keeping the proxy's words and the log", () => {
+    // The path in the message is a decoy: Show log uses only the server's logPath.
     const technical =
-      "The pool could not start: spawn /state/pool/bin/7.3.17/cli-proxy-api EACCES. Log: /state/pool/proxy.log. Retrying in 30s.";
+      "The pool could not start: spawn /state/proxy.log-parent/pool/bin/7.3.17/cli-proxy-api EACCES. Log: /state/proxy.log-parent/pool/proxy.log. Retrying in 30s.";
     const failure = poolStartFailure(
-      status({ runtime: { state: "error", version: "7.3.17", message: technical } }),
+      status({
+        runtime: {
+          state: "error",
+          version: "7.3.17",
+          message: technical,
+          logPath: "/state/pool/proxy.log",
+        },
+      }),
     );
     assert.deepEqual(failure, {
       text: "The pool couldn't start. Retrying in 30s.",
