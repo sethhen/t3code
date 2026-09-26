@@ -16,6 +16,9 @@ import {
   isRoutingVisible,
   joinNames,
   modelIssueHint,
+  orderRoutes,
+  poolStartFailure,
+  withLiveStartFailure,
   normalizeExternalUrl,
   orderAccounts,
   parityHeadline,
@@ -336,5 +339,58 @@ describe("model families", () => {
       "Edit Claude's environment below",
     );
     assert.isNull(modelIssueHint(issue));
+  });
+});
+
+describe("friendlier failures and ordering", () => {
+  it("lists Claude before Codex, keeping each provider's own order", () => {
+    const codex = route({ instanceId: "codex", provider: "codex", displayName: "Codex" });
+    const work = route({ instanceId: "claudeAgent_work", displayName: "Claude (Work)" });
+    assert.deepEqual(
+      orderRoutes([codex, route(), work]).map((entry) => entry.instanceId),
+      ["claudeAgent", "claudeAgent_work", "codex"],
+    );
+  });
+
+  it("turns a spawn error into one calm sentence, keeping the proxy's words and the log", () => {
+    const technical =
+      "The pool could not start: spawn /state/pool/bin/7.3.17/cli-proxy-api EACCES. Log: /state/pool/proxy.log. Retrying in 30s.";
+    const failure = poolStartFailure(
+      status({ runtime: { state: "error", version: "7.3.17", message: technical } }),
+    );
+    assert.deepEqual(failure, {
+      text: "The pool couldn't start. Retrying in 30s.",
+      technical,
+      logPath: "/state/pool/proxy.log",
+    });
+    assert.deepEqual(
+      poolStartFailure(status({ runtime: { state: "error", version: "7.3.17", message: "boom" } })),
+      { text: "The pool couldn't start.", technical: "boom" },
+    );
+    assert.isNull(poolStartFailure(status()));
+    assert.isNull(
+      poolStartFailure(
+        status({
+          source: "external",
+          runtime: { state: "error", version: "7.3.17", message: technical },
+        }),
+      ),
+    );
+  });
+
+  it("fails the pool check from live state, even when the last check run passed", () => {
+    const failure = { text: "The pool couldn't start.", technical: "spawn EACCES" };
+    const passed = [
+      { id: "proxy", label: "Pool", state: "ok" as const, detail: "Running on 127.0.0.1:18417" },
+      { id: "cache", label: "1-hour cache", state: "ok" as const },
+    ];
+    assert.deepEqual(withLiveStartFailure(passed, failure), [
+      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+      passed[1]!,
+    ]);
+    assert.deepEqual(withLiveStartFailure([], failure), [
+      { id: "proxy", label: "Pool", state: "fail", detail: "spawn EACCES" },
+    ]);
+    assert.deepEqual(withLiveStartFailure(passed, null), passed);
   });
 });

@@ -93,16 +93,20 @@ export function isRoutingVisible(status: PoolStatus): boolean {
     : status.accounts.length > 0;
 }
 
+/** Claude before Codex, whatever order the instances come in (stable within a provider). */
+export function orderRoutes(routes: readonly PoolRoute[]): PoolRoute[] {
+  return POOL_PROVIDERS.flatMap((provider) =>
+    routes.filter((route) => route.provider === provider),
+  );
+}
+
 /**
  * Routing in one line, e.g. "Claude and Codex use the pool",
  * "Codex uses the pool · Claude is direct", "Claude is waiting for a Claude account".
  */
 export function routingSummary(routes: readonly PoolRoute[]): string {
   if (routes.length === 0) return "No Claude or Codex provider is set up";
-  // Claude before Codex, whatever order the instances come in.
-  routes = POOL_PROVIDERS.flatMap((provider) =>
-    routes.filter((route) => route.provider === provider),
-  );
+  routes = orderRoutes(routes);
   const using = routes.filter((route) => route.mode === "pool" && route.active);
   const waiting = routes.filter((route) => route.mode === "pool" && !route.active);
   const direct = routes.filter((route) => route.mode === "direct");
@@ -275,4 +279,45 @@ export function modelIssueHint(issue: PoolModelIssue): string | null {
   if (issue.where === "claudeSettings") return "Edit ~/.claude/settings.json";
   if (issue.where === "instanceEnv") return `Edit ${issue.displayName}'s environment below`;
   return null;
+}
+
+export interface PoolStartFailure {
+  /** One calm sentence for the checks line. */
+  readonly text: string;
+  /** The proxy's own words, for the hover and Details. */
+  readonly technical: string;
+  /** `proxy.log`, when the message names it. */
+  readonly logPath?: string;
+}
+
+/**
+ * The local proxy failing to start, in words a teammate can act on:
+ * "The pool couldn't start. Retrying in 30s." instead of a spawn error and paths.
+ */
+export function poolStartFailure(status: PoolStatus): PoolStartFailure | null {
+  if (status.source !== "local" || status.runtime.state !== "error") return null;
+  const technical = status.runtime.message?.trim() || "The pool stopped.";
+  const retry = /Retrying in (\d+)s/.exec(technical)?.[1];
+  const logPath = /Log: (.+?proxy\.log)/.exec(technical)?.[1];
+  return {
+    text: retry ? `The pool couldn't start. Retrying in ${retry}s.` : "The pool couldn't start.",
+    technical,
+    ...(logPath ? { logPath } : {}),
+  };
+}
+
+/**
+ * The last check run with the pool's live state on top. Checks can be minutes
+ * old; a pool that has stopped since then fails here too, so the section never
+ * reads "All checks passed" under "Can't start the pool".
+ */
+export function withLiveStartFailure(
+  checks: readonly PoolCheck[],
+  failure: PoolStartFailure | null,
+): PoolCheck[] {
+  if (!failure) return [...checks];
+  const proxy: PoolCheck = { id: "proxy", label: "Pool", state: "fail", detail: failure.technical };
+  return checks.some((check) => check.id === "proxy")
+    ? checks.map((check) => (check.id === "proxy" ? proxy : check))
+    : [proxy, ...checks];
 }

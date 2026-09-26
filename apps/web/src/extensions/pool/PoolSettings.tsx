@@ -4,7 +4,7 @@
  *
  * Problems first, everything else one line: the header carries the state and
  * the rare actions; accounts are the only always-open part (local pools only);
- * routing and native parity collapse to a sentence each and only appear once
+ * routing and the checks collapse to a sentence each and only appear once
  * the pool serves something. A failing or warning check is shown inline
  * without a click.
  */
@@ -27,6 +27,7 @@ import {
   type LucideIcon,
   TriangleAlertIcon,
 } from "lucide-react";
+import { useAtomValue } from "@effect/atom-react";
 import { type ReactNode, useCallback, useId, useState } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -41,6 +42,7 @@ import {
   SelectValue,
 } from "~/components/ui/select";
 import { Spinner } from "~/components/ui/spinner";
+import { toastManager } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 
@@ -53,10 +55,14 @@ import {
   isRoutingVisible,
   modelIssueHint,
   normalizeExternalUrl,
+  orderRoutes,
   parityHeadline,
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
+  poolStartFailure,
+  type PoolStartFailure,
+  withLiveStartFailure,
   poolProviderDriver,
   routeWaitingReason,
   routingSummary,
@@ -69,11 +75,17 @@ import {
   getRelativeTimeState,
   PROVIDER_STATUS_STYLES,
   ProviderInstanceIcon,
+  revealInFileExplorerLabelForKind,
+  revealInFileExplorerLabelForOs,
+  serverEnvironment,
   SettingsRow,
   SettingsSection,
+  shellEnvironment,
+  useAtomCommand,
   useEnvironmentSettings,
   useRelativeTimeTick,
   useUpdateEnvironmentSettings,
+  writeTextToClipboard,
 } from "./t3";
 import {
   type PoolActions,
@@ -225,6 +237,7 @@ export function PoolSettings({
                 checkedAt={status.checkedAt ?? null}
                 checking={actions.isBusy("check")}
                 modelIssues={status.modelIssues ?? []}
+                startFailure={poolStartFailure(status)}
                 environmentId={environmentId}
                 readOnly={readOnly}
               />
@@ -533,7 +546,7 @@ function RoutingRow({
             </p>
           ) : (
             <div className="space-y-1">
-              {routes.map((route) => {
+              {orderRoutes(routes).map((route) => {
                 const key = `route:${route.instanceId}`;
                 const intent = actions.intent(key);
                 const mode = intent === "pool" || intent === "direct" ? intent : route.mode;
@@ -590,7 +603,7 @@ function RoutingRow({
 }
 
 // ---------------------------------------------------------------------------
-// Native parity
+// Checks (native parity)
 
 const CHECK_PRESENTATION: Readonly<
   Record<
@@ -609,6 +622,7 @@ function ParityRow({
   checkedAt,
   checking,
   modelIssues,
+  startFailure,
   environmentId,
   readOnly,
 }: {
@@ -616,49 +630,55 @@ function ParityRow({
   readonly checkedAt: string | null;
   readonly checking: boolean;
   readonly modelIssues: readonly PoolModelIssue[];
+  readonly startFailure: PoolStartFailure | null;
   readonly environmentId: EnvironmentId;
   readonly readOnly: boolean;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const problems = parityProblems(checks);
+  const liveChecks = withLiveStartFailure(checks, startFailure);
+  const problems = parityProblems(liveChecks);
 
-  const summary = checking ? (
-    <span className="inline-flex items-center gap-1.5">
-      <Spinner className="size-3" /> Checking…
-    </span>
-  ) : problems.length > 0 ? (
-    <span className="flex flex-col gap-1">
-      {problems.map((check) =>
-        check.id === "modelFamilies" && modelIssues.length > 0 ? (
-          modelIssues.map((issue) => (
-            <ModelIssueLine
-              key={`${issue.instanceId}:${issue.where}:${issue.setting ?? issue.slug}`}
-              issue={issue}
-              environmentId={environmentId}
-              readOnly={readOnly}
-            />
-          ))
-        ) : (
-          <ParityLine key={check.id} check={check} text={parityProblemText(check)} />
-        ),
-      )}
-    </span>
-  ) : parityHeadline(checks) === "passed" ? (
-    <span>
-      All checks passed · <CheckedAgo iso={checkedAt} />
-    </span>
-  ) : (
-    "Not checked yet"
-  );
+  const summary =
+    checking && !startFailure ? (
+      <span className="inline-flex items-center gap-1.5">
+        <Spinner className="size-3" /> Checking…
+      </span>
+    ) : problems.length > 0 ? (
+      <span className="flex flex-col gap-1">
+        {problems.map((check) =>
+          check.id === "modelFamilies" && modelIssues.length > 0 ? (
+            modelIssues.map((issue) => (
+              <ModelIssueLine
+                key={`${issue.instanceId}:${issue.where}:${issue.setting ?? issue.slug}`}
+                issue={issue}
+                environmentId={environmentId}
+                readOnly={readOnly}
+              />
+            ))
+          ) : check.id === "proxy" && startFailure ? (
+            <StartFailureLine key={check.id} failure={startFailure} environmentId={environmentId} />
+          ) : (
+            <ParityLine key={check.id} check={check} text={parityProblemText(check)} />
+          ),
+        )}
+      </span>
+    ) : parityHeadline(checks) === "passed" ? (
+      <span>
+        All checks passed · <CheckedAgo iso={checkedAt} />
+      </span>
+    ) : (
+      "Not checked yet"
+    );
 
   return (
     <SettingsRow
       title={
         <span className="inline-flex items-center gap-1.5">
-          Native parity
-          <InfoTip label="About native parity">
-            Checks that a pooled session is as fast and capable as a direct one: tool search, the
-            1-hour cache, the advisor, one account per session.
+          Checks
+          <InfoTip label="About checks">
+            Whether a pooled session is as fast and capable as a direct one: the pool is up, each
+            session keeps one account, tool search, the 1-hour cache, the advisor, and each model
+            stays in its own app.
           </InfoTip>
         </span>
       }
@@ -676,7 +696,7 @@ function ParityRow({
     >
       {detailsOpen ? (
         <div className="space-y-1 pt-2 pb-2">
-          {checks.map((check) => (
+          {liveChecks.map((check) => (
             <ParityLine
               key={check.id}
               check={check}
@@ -738,6 +758,83 @@ function ModelIssueLine({
         </Button>
       ) : hint ? (
         <span className="text-muted-foreground">{hint}</span>
+      ) : null}
+    </span>
+  );
+}
+
+/**
+ * The local proxy not starting, in one calm line: the proxy's own words on
+ * hover (and in Details), and "Show log" to reveal `proxy.log` in the file
+ * manager of the machine the pool runs on (or copy its path where T3 can't).
+ */
+function StartFailureLine({
+  failure,
+  environmentId,
+}: {
+  readonly failure: PoolStartFailure;
+  readonly environmentId: EnvironmentId;
+}) {
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const openInEditor = useAtomCommand(shellEnvironment.openInEditor, { reportFailure: false });
+  const canReveal =
+    serverConfig?.shellRevealInFileManager === true &&
+    serverConfig.availableEditors.includes("file-manager");
+  const revealLabel = canReveal
+    ? serverConfig.shellRevealInFileManagerKind === undefined
+      ? revealInFileExplorerLabelForOs(serverConfig.environment.platform.os)
+      : revealInFileExplorerLabelForKind(serverConfig.shellRevealInFileManagerKind)
+    : "Copy the log's path";
+  const { logPath } = failure;
+
+  const copyPath = async (path: string) => {
+    try {
+      await writeTextToClipboard(path, "log path");
+      toastManager.add({ type: "success", title: "Log path copied", description: path });
+    } catch {
+      toastManager.add({ type: "error", title: "Could not copy the log path", description: path });
+    }
+  };
+  const showLog = async () => {
+    if (!logPath) return;
+    if (!canReveal) return copyPath(logPath);
+    const result = await openInEditor({
+      environmentId,
+      input: { cwd: logPath, editor: "file-manager", reveal: true },
+    });
+    if (result._tag === "Failure") await copyPath(logPath);
+  };
+
+  return (
+    <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              tabIndex={0}
+              className="flex min-w-0 cursor-default items-center gap-1.5 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          }
+        >
+          <CircleXIcon aria-hidden className="size-3.5 shrink-0 text-destructive" />
+          <span className="sr-only">Failing: </span>
+          <span className="text-destructive-foreground">{failure.text}</span>
+        </TooltipTrigger>
+        <TooltipPopup side="top" className="max-w-96 break-words">
+          {failure.technical}
+        </TooltipPopup>
+      </Tooltip>
+      {logPath ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button size="xs" variant="outline" onClick={() => void showLog()}>
+                Show log
+              </Button>
+            }
+          />
+          <TooltipPopup side="top">{revealLabel}</TooltipPopup>
+        </Tooltip>
       ) : null}
     </span>
   );

@@ -17,3 +17,10 @@ export { readLocalApi } from "~/localApi";
 export { getRelativeTimeState } from "~/timestampFormat";
 export { useEnvironmentSettings, useUpdateEnvironmentSettings } from "~/hooks/useSettings";
 export { buildProviderInstanceUpdatePatch } from "~/components/settings/SettingsPanels.logic";
+export {
+  revealInFileExplorerLabelForKind,
+  revealInFileExplorerLabelForOs,
+} from "~/components/preview/fileExplorerLabel";
+export { serverEnvironment } from "~/state/server";
+export { shellEnvironment } from "~/state/shell";
+export { useAtomCommand } from "~/state/use-atom-command";
