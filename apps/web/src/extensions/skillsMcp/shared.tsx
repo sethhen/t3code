@@ -1,7 +1,7 @@
 /**
- * Shared plumbing for the Skills & MCP tabs: the visible-only overview loader,
- * background mutations with optimistic values, mutation toasts, and small
- * pieces of row chrome.
+ * Shared plumbing for the Skills & MCP tabs: the overview loader (from
+ * overviewStore), background mutations with optimistic values, mutation
+ * toasts, and small pieces of row chrome.
  */
 import type { AgentApp, AgentAppInfo, MutationResult, SkillsMcpMethods } from "@t3tools/contracts";
 import { AlertCircleIcon, RefreshCwIcon } from "lucide-react";
@@ -13,7 +13,6 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
 } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -42,7 +41,7 @@ import {
   formatRelativeTime,
   type StatusTone,
 } from "./lists.logic";
-import { loadOverview, readOverview, subscribeOverview } from "./overviewStore";
+export { type OverviewState, useOverviewLoader } from "./overviewStore";
 
 export type SkillsMcpClient = ExtensionClient<SkillsMcpMethods>;
 export type Outcome<Value> = ExtensionCallOutcome<Value>;
@@ -113,78 +112,6 @@ export function useExpandedSet(): {
     });
   }, []);
   return { expanded, toggle };
-}
-
-// ---------------------------------------------------------------------------
-// Overview loader
-
-export interface OverviewState<Value> {
-  readonly data: Value | null;
-  readonly error: string | null;
-  readonly loading: boolean;
-  /** Reload now. Superseded responses are dropped; old data stays visible meanwhile. */
-  readonly reload: (refresh?: boolean) => Promise<void>;
-}
-
-/**
- * Shows the last result stored for `name` and `key` (kept across panel mounts)
- * from the moment the loader is `active` (panel visible and tab selected), and
- * loads while active: once per mount and key, then again when the last load is
- * older than `staleMs`. Never fetches while inactive, except for explicit
- * `reload` calls.
- */
-export function useOverviewLoader<Value>(options: {
-  /** The loader's own name; with `key` it names the stored result. */
-  readonly name: string;
-  readonly active: boolean;
-  readonly key: string;
-  readonly fetch: (refresh: boolean) => Promise<Outcome<Value>>;
-  readonly staleMs?: number;
-}): OverviewState<Value> {
-  const { active, staleMs = 15_000 } = options;
-  const key = `${options.name}|${options.key}`;
-  const latest = useRef({ fetch: options.fetch, key });
-  // The key this mount last fetched; a new mount always fetches, so it never
-  // settles for a result from before (MCP sign-in relies on that).
-  const fetchedKey = useRef<string | null>(null);
-
-  useLayoutEffect(() => {
-    latest.current = { fetch: options.fetch, key };
-  });
-
-  const subscribe = useCallback((listener: () => void) => subscribeOverview(key, listener), [key]);
-  const entry = useSyncExternalStore(subscribe, () => readOverview(key));
-
-  const reload = useCallback((refresh = false) => {
-    const { fetch, key: requestKey } = latest.current;
-    return loadOverview(requestKey, () => fetch(refresh));
-  }, []);
-
-  // Stored results show only once this mount asked for them, so hidden tabs
-  // stay light and nothing old (usage) shows before its refresh starts.
-  const [shownKey, setShownKey] = useState<string | null>(null);
-  if (active && shownKey !== key) setShownKey(key);
-  const shown = active || shownKey === key;
-
-  useEffect(() => {
-    if (!active) return;
-    const { request, loadedAt } = readOverview(key);
-    const fresh =
-      fetchedKey.current === key &&
-      (request !== null || (loadedAt !== null && Date.now() - loadedAt <= staleMs));
-    if (fresh) return;
-    fetchedKey.current = key;
-    void reload();
-    // Re-evaluated when the panel becomes visible or the key changes.
-  }, [active, key]);
-
-  return {
-    // The stored value under this loader's own name has its type.
-    data: shown ? (entry.data as Value | null) : null,
-    error: shown ? entry.error : null,
-    loading: shown && (entry.request !== null || entry.loadedAt === null),
-    reload,
-  };
 }
 
 // ---------------------------------------------------------------------------

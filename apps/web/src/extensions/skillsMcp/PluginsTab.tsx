@@ -75,12 +75,15 @@ export function PluginsTab(props: PluginsTabProps) {
   // While browsing, every reload (refresh, after a mutation) includes the
   // marketplaces, so the one snapshot always matches what is shown.
   const market = useRef(false);
+  // Whether this mount's latest load asked for them.
+  const marketRequested = useRef(false);
   const { data, error, loading, reload } = useOverviewLoader<PluginsSnapshot>({
     name: "plugins",
     active,
     key: scopeKey,
     fetch: async () => {
       const includeAvailable = market.current;
+      marketRequested.current = includeAvailable;
       const outcome = await client.call("plugins.list", {
         ...(cwd ? { cwd } : {}),
         ...(includeAvailable ? { includeAvailable } : {}),
@@ -136,14 +139,15 @@ export function PluginsTab(props: PluginsTabProps) {
       action === "uninstall" ? setConfirm(row) : run(action, row),
   });
 
-  // Reads the marketplaces when a snapshot without them is showing, or when a
-  // load in flight may have left without them (a stored snapshot can carry them
-  // while the reopened panel's first load does not); the installed list stays
-  // up meanwhile.
+  // Reads the marketplaces unless the snapshot that will show has them: the
+  // load in flight if there is one (a reopened panel's first load leaves
+  // without them even when its stored snapshot has them), else the current
+  // one. The installed list stays up meanwhile.
   const showMarket = (on: boolean) => {
     setBrowse(on);
     market.current = on;
-    if (on && (!data?.market || loading)) void reload(false);
+    const hasMarket = loading ? marketRequested.current : data?.market;
+    if (on && !hasMarket) void reload(false);
   };
 
   return (
