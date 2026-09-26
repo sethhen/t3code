@@ -51,6 +51,7 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
 
   // Context cost is measured with the lists (it drives the strip and the row chips).
   const context = useOverviewLoader<ContextOverview>({
+    name: "context",
     active: visible,
     key: scopeKey,
     staleMs: 60_000,
@@ -62,6 +63,7 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
   });
   // Usage scans session logs, so it only loads once a sort, filter or chip needs it.
   const usage = useOverviewLoader<UsageReport>({
+    name: "usage",
     active: visible && wantUsage && tab !== "plugins",
     key: `${environmentId ?? ""}|${days}`,
     staleMs: 300_000,

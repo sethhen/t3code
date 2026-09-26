@@ -107,6 +107,7 @@ type Confirm =
 export function SkillsTab(props: ListTabProps) {
   const { client, scopeKey, cwd, active, view, viewActions, context, usage, onChanged } = props;
   const { data, error, loading, reload } = useOverviewLoader<SkillsOverview>({
+    name: "skills",
     active,
     key: scopeKey,
     fetch: () => client.call("skills.list", cwd ? { cwd } : {}),

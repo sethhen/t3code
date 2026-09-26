@@ -76,6 +76,7 @@ export function PluginsTab(props: PluginsTabProps) {
   // marketplaces, so the one snapshot always matches what is shown.
   const market = useRef(false);
   const { data, error, loading, reload } = useOverviewLoader<PluginsSnapshot>({
+    name: "plugins",
     active,
     key: scopeKey,
     fetch: async () => {
@@ -135,12 +136,14 @@ export function PluginsTab(props: PluginsTabProps) {
       action === "uninstall" ? setConfirm(row) : run(action, row),
   });
 
-  // Reads the marketplaces only when a snapshot without them is showing; the
-  // installed list stays up meanwhile.
+  // Reads the marketplaces when a snapshot without them is showing, or when a
+  // load in flight may have left without them (a stored snapshot can carry them
+  // while the reopened panel's first load does not); the installed list stays
+  // up meanwhile.
   const showMarket = (on: boolean) => {
     setBrowse(on);
     market.current = on;
-    if (on && !data?.market) void reload(false);
+    if (on && (!data?.market || loading)) void reload(false);
   };
 
   return (

@@ -13,6 +13,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -41,6 +42,7 @@ import {
   formatRelativeTime,
   type StatusTone,
 } from "./lists.logic";
+import { loadOverview, readOverview, subscribeOverview } from "./overviewStore";
 
 export type SkillsMcpClient = ExtensionClient<SkillsMcpMethods>;
 export type Outcome<Value> = ExtensionCallOutcome<Value>;
@@ -124,76 +126,63 @@ export interface OverviewState<Value> {
   readonly reload: (refresh?: boolean) => Promise<void>;
 }
 
-interface LoaderSnapshot<Value> {
-  readonly key: string;
-  readonly data: Value | null;
-  readonly error: string | null;
-  readonly loadedAt: number | null;
-}
-
 /**
- * Loads while `active` (panel visible and tab selected) when the key changed,
- * nothing is loaded yet, or the last load is older than `staleMs`. Never
- * fetches while inactive, except for explicit `reload` calls.
+ * Shows the last result stored for `name` and `key` (kept across panel mounts)
+ * from the moment the loader is `active` (panel visible and tab selected), and
+ * loads while active: once per mount and key, then again when the last load is
+ * older than `staleMs`. Never fetches while inactive, except for explicit
+ * `reload` calls.
  */
 export function useOverviewLoader<Value>(options: {
+  /** The loader's own name; with `key` it names the stored result. */
+  readonly name: string;
   readonly active: boolean;
   readonly key: string;
   readonly fetch: (refresh: boolean) => Promise<Outcome<Value>>;
   readonly staleMs?: number;
 }): OverviewState<Value> {
-  const { active, key, staleMs = 15_000 } = options;
-  const [snapshot, setSnapshot] = useState<LoaderSnapshot<Value>>({
-    key,
-    data: null,
-    error: null,
-    loadedAt: null,
-  });
-  const [inFlight, setInFlight] = useState<string | null>(null);
+  const { active, staleMs = 15_000 } = options;
+  const key = `${options.name}|${options.key}`;
   const latest = useRef({ fetch: options.fetch, key });
-  const requestId = useRef(0);
-  const pendingKey = useRef<string | null>(null);
+  // The key this mount last fetched; a new mount always fetches, so it never
+  // settles for a result from before (MCP sign-in relies on that).
+  const fetchedKey = useRef<string | null>(null);
 
   useLayoutEffect(() => {
     latest.current = { fetch: options.fetch, key };
   });
 
-  const reload = useCallback(async (refresh = false) => {
+  const subscribe = useCallback((listener: () => void) => subscribeOverview(key, listener), [key]);
+  const entry = useSyncExternalStore(subscribe, () => readOverview(key));
+
+  const reload = useCallback((refresh = false) => {
     const { fetch, key: requestKey } = latest.current;
-    const id = ++requestId.current;
-    pendingKey.current = requestKey;
-    setInFlight(requestKey);
-    const outcome = await fetch(refresh);
-    if (id !== requestId.current) return;
-    pendingKey.current = null;
-    setInFlight(null);
-    setSnapshot((previous) => {
-      const sameKey = previous.key === requestKey;
-      return outcome.ok
-        ? { key: requestKey, data: outcome.value, error: null, loadedAt: Date.now() }
-        : {
-            key: requestKey,
-            data: sameKey ? previous.data : null,
-            error: outcome.message,
-            loadedAt: Date.now(),
-          };
-    });
+    return loadOverview(requestKey, () => fetch(refresh));
   }, []);
 
-  const current = snapshot.key === key;
+  // Stored results show only once this mount asked for them, so hidden tabs
+  // stay light and nothing old (usage) shows before its refresh starts.
+  const [shownKey, setShownKey] = useState<string | null>(null);
+  if (active && shownKey !== key) setShownKey(key);
+  const shown = active || shownKey === key;
+
   useEffect(() => {
     if (!active) return;
-    if (pendingKey.current === key) return;
-    const stale =
-      !current || snapshot.loadedAt === null || Date.now() - snapshot.loadedAt > staleMs;
-    if (stale) void reload();
+    const { request, loadedAt } = readOverview(key);
+    const fresh =
+      fetchedKey.current === key &&
+      (request !== null || (loadedAt !== null && Date.now() - loadedAt <= staleMs));
+    if (fresh) return;
+    fetchedKey.current = key;
+    void reload();
     // Re-evaluated when the panel becomes visible or the key changes.
   }, [active, key]);
 
   return {
-    data: current ? snapshot.data : null,
-    error: current ? snapshot.error : null,
-    loading: inFlight === key || (active && !current),
+    // The stored value under this loader's own name has its type.
+    data: shown ? (entry.data as Value | null) : null,
+    error: shown ? entry.error : null,
+    loading: shown && (entry.request !== null || entry.loadedAt === null),
     reload,
   };
 }

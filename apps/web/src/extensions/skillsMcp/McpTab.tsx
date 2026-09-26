@@ -111,6 +111,7 @@ export function McpTab(
 ) {
   const { client, scopeKey, cwd, active, view, viewActions, context, usage, onChanged } = props;
   const { data, error, loading, reload } = useOverviewLoader<McpOverview>({
+    name: "mcp",
     active,
     key: scopeKey,
     fetch: (refresh) => {
