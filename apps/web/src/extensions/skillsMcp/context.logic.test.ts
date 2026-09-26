@@ -11,24 +11,24 @@ import type {
 import { assert, describe, it } from "vite-plus/test";
 
 import {
+  arrangeRows,
   bareToolName,
   contextSummaries,
   contextSummary,
   deferredChip,
   formatCalls,
   formatTokens,
-  isUnused,
   joinMcpStats,
   joinSkillStats,
-  mcpIsOn,
   needsUsage,
   normalizeName,
-  skillIsOn,
   sortRowsBy,
   statsDetail,
   statsFor,
   tokenChip,
-  unusedTokens,
+  toolChips,
+  unusedCost,
+  unusedRows,
   usageChip,
   usageFootnote,
 } from "./context.logic";
@@ -146,9 +146,10 @@ describe("contextSummary", () => {
     assert.equal(summary.categories.length, 6);
   });
 
-  it("marks estimates and falls back to the category total without a window", () => {
-    const summary = contextSummary("codex", {
+  it("marks Claude's estimate and falls back to the category total without a window", () => {
+    const summary = contextSummary("claude", {
       exact: false,
+      note: "Claude's local estimate",
       baselineTokens: 12_000,
       categories: [
         { name: "Tools", tokens: 10_000, kind: "used" },
@@ -159,7 +160,34 @@ describe("contextSummary", () => {
       memoryFiles: [],
     });
     assert.equal(summary.label, "new thread ~12k");
+    assert.equal(summary.partial, false);
+    assert.equal(summary.note, "Claude's local estimate");
     assert.equal(summary.segments[0]?.share, 0.25);
+  });
+
+  it("labels Codex's partial count without a bar or window", () => {
+    const summary = contextSummary(
+      "codex",
+      appContext({
+        exact: false,
+        note: "MCP tools and skills only",
+        windowTokens: 272_000,
+        baselineTokens: 58_000,
+        categories: [
+          { name: "MCP tools", tokens: 50_000, kind: "used" },
+          { name: "Skills", tokens: 8_000, kind: "used" },
+          { name: "Free space", tokens: 214_000, kind: "free" },
+        ],
+      }),
+    );
+    assert.equal(summary.label, "~58k MCP + skills");
+    assert.deepEqual(
+      summary.categories.map((category) => category.name),
+      ["MCP tools", "Skills"],
+    );
+    assert.equal(summary.partial, true);
+    assert.equal(summary.windowTokens, undefined);
+    assert.deepEqual(summary.segments, []);
   });
 
   it("clamps an overfull window", () => {
@@ -254,15 +282,15 @@ describe("joinMcpStats", () => {
     const github = statsFor(stats, "github");
     assert.equal(github.tokens, 3_200);
     assert.equal(github.deferredTokens, 1_100);
-    assert.equal(github.exact, false);
     assert.deepEqual(github.perAppTokens, {
-      claude: { loaded: 3_200, deferred: 1_100 },
-      codex: { loaded: 2_800, deferred: 0 },
+      claude: { loaded: 3_200, deferred: 1_100, exact: true },
+      codex: { loaded: 2_800, deferred: 0, exact: false },
     });
-    assert.deepEqual(github.tools?.get("create_issue"), { tokens: 2_000, loaded: true });
+    assert.deepEqual(github.tools?.get("create_issue"), {
+      claude: { tokens: 2_000, loaded: true },
+    });
     assert.equal(github.calls, undefined);
     assert.equal(statsFor(stats, "claude.ai Gmail").tokens, 900);
-    assert.equal(statsFor(stats, "claude.ai Gmail").exact, true);
     assert.equal(statsFor(stats, "figma").tokens, 500);
     assert.deepEqual(statsFor(stats, "idle"), {});
     assert.deepEqual(statsFor(stats, "missing"), {});
@@ -320,8 +348,33 @@ describe("joinMcpStats", () => {
     assert.equal(github.calls, 14);
     assert.deepEqual(github.perAppCalls, { claude: 10, codex: 4 });
     assert.equal(github.lastUsedAt, "2026-09-26T09:00:00.000Z");
-    assert.deepEqual(github.tools?.get("create_issue"), { calls: 14 });
-    assert.equal(statsFor(stats, "idle").calls, 0);
+    assert.deepEqual(github.tools?.get("create_issue"), {
+      claude: { calls: 10 },
+      codex: { calls: 4 },
+    });
+    assert.equal(github.unused, undefined);
+    assert.deepEqual(statsFor(stats, "idle").perAppCalls, { claude: 0 });
+    assert.equal(statsFor(stats, "idle").unused, true);
+  });
+
+  it("only flags rows unused when every app they are on in scanned zero calls", () => {
+    const both = server("both", { apps: { claude: entry(), codex: entry() } });
+    const offInCodex = server("half", {
+      apps: { claude: entry(), codex: entry({ enabled: false }) },
+    });
+    const off = server("off", { apps: { claude: entry({ status: "disabled" }) } });
+    const rows = [both, offInCodex, off];
+    const claudeOnly = joinMcpStats(rows, null, usage({}, { error: "no transcripts" }));
+    assert.equal(statsFor(claudeOnly, "both").unused, undefined);
+    assert.equal(statsFor(claudeOnly, "half").unused, true);
+    assert.equal(statsFor(claudeOnly, "off").unused, undefined);
+    const usedInCodex = joinMcpStats(
+      rows,
+      null,
+      usage({}, { mcpServers: [{ name: "both", calls: 2, tools: [] }] }),
+    );
+    assert.equal(statsFor(usedInCodex, "both").unused, undefined);
+    assert.equal(statsFor(joinMcpStats(rows, null, usage()), "both").unused, true);
   });
 
   it("treats a failed scan as unknown", () => {
@@ -357,41 +410,71 @@ describe("joinSkillStats", () => {
     assert.equal(statsFor(stats, "review").calls, 3);
     assert.equal(statsFor(stats, "review").lastUsedAt, "2026-09-20T00:00:00.000Z");
     assert.equal(statsFor(stats, "idle").tokens, undefined);
+    assert.equal(statsFor(stats, "idle").unused, true);
+    assert.equal(statsFor(stats, "review").unused, undefined);
   });
 });
 
 describe("chips", () => {
-  it("formats tokens, deferred and calls", () => {
-    assert.equal(tokenChip({}), null);
-    assert.equal(tokenChip({ tokens: 3_240, exact: true }), "3.2k tok");
-    assert.equal(tokenChip({ tokens: 3_240, exact: false }), "~3.2k tok");
-    assert.equal(deferredChip({ deferredTokens: 0 }), null);
-    assert.equal(deferredChip({ deferredTokens: 1_100 }), "+1.1k deferred");
+  const stats = {
+    perAppTokens: {
+      claude: { loaded: 12_000, deferred: 1_100, exact: false },
+      codex: { loaded: 45_000, deferred: 0, exact: true },
+    },
+    perAppCalls: { claude: 2, codex: 0 },
+    calls: 2,
+  };
+
+  it("keeps apps apart and drops initials for a single app", () => {
+    assert.equal(tokenChip({}, ["claude", "codex"]), null);
+    assert.equal(tokenChip(stats, ["claude", "codex"]), "C 12k · X 45k tok");
+    assert.equal(tokenChip(stats, ["codex"]), "45k tok");
+    assert.equal(deferredChip(stats, ["claude", "codex"]), "C +1.1k deferred");
+    assert.equal(deferredChip(stats, ["codex"]), null);
     assert.equal(usageChip({}, 7), null);
     assert.equal(usageChip({ calls: 14 }, 7), "14 calls · 7d");
     assert.equal(usageChip({ calls: 1 }, 30), "1 call · 30d");
   });
 
-  it("details per app", () => {
+  it("formats one tool per app", () => {
+    const apps = ["claude", "codex"] as const;
     assert.deepEqual(
-      statsDetail(
+      toolChips(
         {
-          perAppTokens: { claude: { loaded: 3_200, deferred: 1_100 } },
-          perAppCalls: { claude: 2, codex: 0 },
+          claude: { tokens: 1_200, loaded: true, calls: 3 },
+          codex: { tokens: 900, loaded: false },
         },
-        7,
+        apps,
       ),
-      ["Claude: 3.2k tok per request, 1.1k deferred, 2 calls in 7d", "Codex: 0 calls in 7d"],
+      { cost: "C 1.2k tok · X 900 deferred", deferredOnly: false, calls: "C 3 calls" },
     );
+    assert.deepEqual(toolChips({ codex: { tokens: 900, loaded: false } }, ["codex"]), {
+      cost: "900 deferred",
+      deferredOnly: true,
+      calls: null,
+    });
+    assert.deepEqual(toolChips(undefined, apps), { cost: null, deferredOnly: false, calls: null });
+  });
+
+  it("details exact numbers per app", () => {
+    assert.deepEqual(statsDetail(stats, 7), [
+      "Claude: ~12,000 tok per request, 1,100 deferred, 2 calls in 7d",
+      "Codex: 45,000 tok per request, 0 calls in 7d",
+    ]);
   });
 });
 
 describe("sorting and the Unused filter", () => {
   const rows = [server("b"), server("a"), server("c"), server("d")];
+  const cost = (claude: number, codex?: number) => ({
+    claude: { loaded: claude, deferred: 0, exact: true },
+    ...(codex === undefined ? {} : { codex: { loaded: codex, deferred: 0, exact: true } }),
+  });
   const stats = new Map([
-    ["a", { tokens: 100, calls: 0 }],
-    ["b", { tokens: 5_000, deferredTokens: 10, calls: 3 }],
-    ["c", { tokens: 5_000, deferredTokens: 20, calls: 3 }],
+    ["a", { tokens: 100, calls: 0, perAppTokens: cost(100), unused: true as const }],
+    ["b", { tokens: 5_000, deferredTokens: 10, calls: 3, perAppTokens: cost(5_000, 200) }],
+    ["c", { tokens: 5_000, deferredTokens: 20, calls: 3, perAppTokens: cost(1_000, 5_000) }],
+    ["d", { perAppTokens: cost(0, 300), unused: true as const }],
   ]);
 
   it("sorts by name, context cost and usage with unknowns last", () => {
@@ -402,26 +485,31 @@ describe("sorting and the Unused filter", () => {
     assert.deepEqual(names("usage"), ["b", "c", "a", "d"]);
   });
 
+  it("keeps the status sections, or flattens into one sorted list", () => {
+    const byStatus = () => [{ id: "mine", label: "Mine", rows: [rows[0]!] }];
+    assert.deepEqual(arrangeRows(rows, "status", stats, byStatus), byStatus());
+    const [flat] = arrangeRows(rows, "context", stats, byStatus);
+    assert.equal(flat?.label, "");
+    assert.deepEqual(
+      flat?.rows.map((row) => row.name),
+      ["c", "b", "a", "d"],
+    );
+  });
+
   it("knows when usage is needed", () => {
     assert.equal(needsUsage("status", false), false);
     assert.equal(needsUsage("context", true), true);
     assert.equal(needsUsage("usage", false), true);
   });
 
-  it("only flags rows that are on and have zero calls", () => {
-    assert.equal(isUnused(true, { calls: 0 }), true);
-    assert.equal(isUnused(true, { calls: 2 }), false);
-    assert.equal(isUnused(true, {}), false);
-    assert.equal(isUnused(false, { calls: 0 }), false);
-    assert.equal(unusedTokens([{ key: "a" }, { key: "b" }, { key: "d" }], stats), 5_100);
-  });
-
-  it("knows whether a row is switched on", () => {
-    assert.equal(mcpIsOn(server("x")), true);
-    assert.equal(mcpIsOn(server("x", { apps: { claude: entry({ status: "disabled" }) } })), false);
-    assert.equal(mcpIsOn(server("x", { apps: { claude: entry({ enabled: false }) } })), false);
-    assert.equal(skillIsOn(skill("x")), true);
-    assert.equal(skillIsOn(skill("x", { apps: { codex: skillEntry({ enabled: false }) } })), false);
+  it("lists unused rows and what they cost per app", () => {
+    const unused = unusedRows(rows, stats);
+    assert.deepEqual(
+      unused.map((row) => row.name),
+      ["a", "d"],
+    );
+    assert.equal(unusedCost(unused, stats, ["claude", "codex"]), "C 100 · X 300 tok");
+    assert.equal(unusedCost([], stats, ["claude"]), null);
   });
 
   it("summarizes the scan", () => {

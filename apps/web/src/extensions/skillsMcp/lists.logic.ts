@@ -134,24 +134,30 @@ export function mcpStatusLabel(entry: McpAppEntry): StatusLabel {
 }
 
 const MCP_SCOPE_ORIGIN: Readonly<Record<McpScope, string>> = {
-  user: "your user config",
-  project: "the project's .mcp.json",
-  local: "Claude's per-project config",
-  plugin: "a plugin",
-  managed: "admin policy",
-  builtin: "T3",
-  unknown: "another config file",
+  user: "Defined in your user config. Import to manage it here.",
+  project: "Defined in .mcp.json (project)",
+  local: "Defined in Claude's per-project config",
+  plugin: "From a plugin",
+  managed: "Set by admin policy",
+  builtin: "Built into T3",
+  unknown: "Defined in another config file",
 };
 
-/** Why an app's enable switch is locked for this row, or null when it can be toggled. */
+/**
+ * Why an app's switch is locked, or null when it can be toggled. For builtin
+ * and unmanaged rows this is where the server is defined (they render as a
+ * read-only state with this as its tooltip); for managed rows it is the rare
+ * transport or store problem.
+ */
 export function mcpToggleBlock(row: McpServerRow, app: AgentApp): string | null {
-  if (row.builtin) return "T3 attaches this server to every session itself.";
+  if (row.builtin) return MCP_SCOPE_ORIGIN.builtin;
   const entry = row.apps[app];
   if (!row.managed) {
     const scope = entry?.scope ?? primaryScope(row);
-    if (scope === "user") return "Not managed yet. Use Import to manage it here.";
-    const source = entry?.source ? ` (${entry.source})` : "";
-    return `Defined by ${MCP_SCOPE_ORIGIN[scope]}${source}; edit it there.`;
+    const source = entry?.source;
+    if (scope === "plugin" && source) return `From plugin ${source.split("@")[0]}`;
+    if (scope === "unknown" && source) return `Defined in ${source}`;
+    return MCP_SCOPE_ORIGIN[scope];
   }
   if (app === "codex" && row.spec?.type === "sse") return "Codex has no SSE transport.";
   if (!row.id) return "This server has no store id.";
@@ -183,13 +189,28 @@ export function groupTools(row: McpServerRow): ToolGroup[] {
   return groups;
 }
 
+/** At most `cap` tools across the groups, in order; each group keeps its full count. */
+export function capToolGroups(
+  groups: readonly ToolGroup[],
+  cap: number,
+): (ToolGroup & { readonly total: number })[] {
+  const shown: (ToolGroup & { readonly total: number })[] = [];
+  let remaining = cap;
+  for (const group of groups) {
+    const tools = group.tools.slice(0, Math.max(0, remaining));
+    remaining -= tools.length;
+    if (tools.length > 0) shown.push({ apps: group.apps, tools, total: group.tools.length });
+  }
+  return shown;
+}
+
 function sameNames(left: readonly McpToolInfo[], right: readonly McpToolInfo[]): boolean {
   if (left.length !== right.length) return false;
   const names = new Set(left.map((tool) => tool.name));
   return right.every((tool) => names.has(tool.name));
 }
 
-const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
+export const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
 
 export interface AttentionIssue {
   readonly app: AgentApp;
@@ -245,20 +266,31 @@ export function mcpToolCount(row: McpServerRow): number {
   return names.size;
 }
 
-/**
- * The one-click fix shown on the row itself. Today that is reconnecting the
- * apps whose server failed or needs auth; a "Log in" action can take the
- * needs-auth case once the contract has one.
- */
+/** The one-click fix shown on the row itself. */
 export interface McpPrimaryAction {
-  readonly kind: "login" | "reconnect";
+  readonly kind: "restore" | "login" | "reconnect";
   readonly label: string;
   readonly apps: readonly AgentApp[];
 }
 
-/** Sign-in beats reconnect: a server waiting on OAuth will not connect until the user logs in. */
+/** Apps a managed server is switched on for whose config has lost the entry. */
+export function mcpDriftApps(row: McpServerRow): AgentApp[] {
+  if (!row.managed || row.builtin || !row.id) return [];
+  return APPS.filter((app) => {
+    const entry = row.apps[app];
+    return entry?.enabled === true && !entry.present && mcpToggleBlock(row, app) === null;
+  });
+}
+
+/**
+ * Restore beats everything (nothing else works while the entry is missing),
+ * then sign-in beats reconnect: a server waiting on OAuth will not connect
+ * until the user logs in.
+ */
 export function mcpPrimaryAction(row: McpServerRow): McpPrimaryAction | null {
   if (row.builtin) return null;
+  const drift = mcpDriftApps(row);
+  if (drift.length > 0) return { kind: "restore", label: "Restore", apps: drift };
   const issues = mcpIssues(row).filter(
     (issue) => issue.label !== "Error" && row.apps[issue.app]?.present,
   );
@@ -539,19 +571,19 @@ export function skillToggleBlock(row: SkillRow, app: AgentApp): string | null {
       case "synced":
         return `Synced by ${APP_LABEL[app]}; manage it there.`;
       default:
-        return "Not managed yet. Adopt it to manage it here.";
+        return entry?.adoptable
+          ? "Not managed yet. Adopt it to manage it here."
+          : `In ${APP_LABEL[app]}'s skills folder; edit it there.`;
     }
   }
   if (!row.id) return "This skill has no store id.";
   return null;
 }
 
-/** The folder `adopt` moves into the store. */
+/** The folder `adopt` moves into the store, when the server says it would accept one. */
 export function skillAdoptPath(row: SkillRow): string | undefined {
   if (row.managed || row.pluginId) return undefined;
-  const candidates = [row.apps.claude, row.apps.codex].filter(defined);
-  const adoptable = candidates.find((entry) => entry.scope === "user" && entry.path);
-  return adoptable?.path;
+  return appEntries(row.apps).find((entry) => entry.adoptable === true && entry.path)?.path;
 }
 
 const REPO_PART = /^[A-Za-z0-9_.-]+$/;
@@ -665,8 +697,27 @@ export function bytesToBase64(bytes: Uint8Array): string {
 // ---------------------------------------------------------------------------
 // Plugins
 
-export function sortPlugins(rows: readonly PluginRow[]): PluginRow[] {
-  return [...rows].sort((left, right) => compareNames(left.name, right.name));
+/** Installed plugins per app, then the installable ones per app; each by name. */
+export function sectionPlugins(
+  installed: readonly PluginRow[],
+  available: readonly PluginRow[],
+): RowSection<PluginRow>[] {
+  const byApp = (rows: readonly PluginRow[], app: AgentApp) =>
+    rows
+      .filter((row) => row.app === app)
+      .sort((left, right) => compareNames(left.name, right.name));
+  return nonEmpty([
+    ...APPS.map((app) => ({
+      id: `installed:${app}`,
+      label: APP_LABEL[app],
+      rows: byApp(installed, app),
+    })),
+    ...APPS.map((app) => ({
+      id: `available:${app}`,
+      label: `Available for ${APP_LABEL[app]}`,
+      rows: byApp(available, app),
+    })),
+  ]);
 }
 
 export function filterPlugins(rows: readonly PluginRow[], query: string) {

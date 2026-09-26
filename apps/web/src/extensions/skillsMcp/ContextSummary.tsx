@@ -1,7 +1,7 @@
 /**
  * The compact "what does a new thread start with" strip at the top of the
- * panel: one line per app with a static stacked bar, expandable to the
- * category and memory-file breakdown.
+ * panel: one line per app with a static stacked bar (none for Codex's partial
+ * count), expandable to the category and memory-file breakdown.
  */
 import { ChevronRightIcon } from "lucide-react";
 import { memo, useState } from "react";
@@ -9,6 +9,8 @@ import { memo, useState } from "react";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "~/components/ui/collapsible";
 import { Spinner } from "~/components/ui/spinner";
 import { cn } from "~/lib/utils";
+
+import { FOCUS_RING, Hint } from "./listControls";
 
 import { type ContextSummary, formatTokens } from "./context.logic";
 import { APP_LABEL } from "./lists.logic";
@@ -67,11 +69,10 @@ function SummaryLine({ summary }: { summary: ContextSummary }) {
         </span>
       ) : (
         <>
-          <StackedBar summary={summary} />
-          <span className="shrink-0 text-muted-foreground tabular-nums">{summary.label}</span>
-          {summary.exact ? null : (
-            <span className="shrink-0 text-muted-foreground/60">estimate</span>
-          )}
+          {summary.partial ? <span className="flex-1" /> : <StackedBar summary={summary} />}
+          <Hint hint={summary.note}>
+            <span className="shrink-0 text-muted-foreground tabular-nums">{summary.label}</span>
+          </Hint>
         </>
       )}
     </div>
@@ -87,9 +88,7 @@ function Breakdown({ summary }: { summary: ContextSummary }) {
         {summary.model ? (
           <span className="truncate text-muted-foreground">{summary.model}</span>
         ) : null}
-        {summary.exact ? null : (
-          <span className="text-muted-foreground/60">estimated from config</span>
-        )}
+        {summary.note ? <span className="text-muted-foreground/60">{summary.note}</span> : null}
       </div>
       <ul className="space-y-0.5">
         {rows.map((category, index) => {
@@ -103,13 +102,15 @@ function Breakdown({ summary }: { summary: ContextSummary }) {
                 dim ? "text-muted-foreground/60" : "text-muted-foreground",
               )}
             >
-              <span
-                aria-hidden
-                className={cn(
-                  "size-2 shrink-0 rounded-[2px]",
-                  fill ?? "border border-muted-foreground/30",
-                )}
-              />
+              {summary.partial ? null : (
+                <span
+                  aria-hidden
+                  className={cn(
+                    "size-2 shrink-0 rounded-[2px]",
+                    fill ?? "border border-muted-foreground/30",
+                  )}
+                />
+              )}
               <span className="min-w-0 flex-1 truncate">
                 {category.name}
                 {category.kind === "deferred" ? " (deferred, loaded on demand)" : null}
@@ -144,8 +145,8 @@ function Breakdown({ summary }: { summary: ContextSummary }) {
 }
 
 /**
- * `error` is a whole-call failure (including "not implemented yet" while the
- * server side lands); it shows as a muted note, never a toast.
+ * `error` is a whole-call failure; it shows as a muted note, never a toast.
+ * A background reload keeps the last numbers (the header refresh icon spins).
  */
 export const ContextStrip = memo(function ContextStrip(props: {
   summaries: readonly ContextSummary[];
@@ -178,7 +179,10 @@ export const ContextStrip = memo(function ContextStrip(props: {
     <Collapsible open={open} onOpenChange={setOpen} className="border-b">
       <CollapsibleTrigger
         aria-label={open ? "Hide context breakdown" : "Show context breakdown"}
-        className="group flex w-full items-start gap-1.5 px-3 py-1.5 text-left hover:bg-accent/40"
+        className={cn(
+          "group flex w-full items-start gap-1.5 px-3 py-1.5 text-left hover:bg-accent/40",
+          FOCUS_RING,
+        )}
       >
         <ChevronRightIcon className="mt-0.5 size-3 shrink-0 text-muted-foreground transition-transform group-data-panel-open:rotate-90 motion-reduce:transition-none" />
         <div className="min-w-0 flex-1 space-y-1">
@@ -186,7 +190,6 @@ export const ContextStrip = memo(function ContextStrip(props: {
             <SummaryLine key={summary.app} summary={summary} />
           ))}
         </div>
-        {loading ? <Spinner className="mt-0.5 size-3 shrink-0 text-muted-foreground" /> : null}
       </CollapsibleTrigger>
       <CollapsiblePanel>
         <div className="space-y-3 px-3 pt-1 pb-2.5 pl-7">

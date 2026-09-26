@@ -27,8 +27,9 @@ import { Input } from "~/components/ui/input";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Spinner } from "~/components/ui/spinner";
 import { Toggle, ToggleGroup } from "~/components/ui/toggle-group";
+import { cn } from "~/lib/utils";
 
-import { SearchField } from "./listControls";
+import { FOCUS_RING, Hint, SearchField } from "./listControls";
 import {
   appUnavailableReason,
   bytesToBase64,
@@ -45,8 +46,7 @@ import {
   type SkillsMcpClient,
   WithReason,
   reportMutation,
-  safeCall,
-  useBusyKeys,
+  useMutations,
 } from "./shared";
 
 type InstallTab = "search" | "repos" | "upload";
@@ -77,7 +77,7 @@ export function SkillInstallDialog(props: SkillInstallDialogProps) {
     claude: appUnavailableReason(apps, "claude") === null,
     codex: appUnavailableReason(apps, "codex") === null,
   }));
-  const busy = useBusyKeys();
+  const busy = useMutations();
   const target: Flags = {
     claude: flags.claude && appUnavailableReason(apps, "claude") === null,
     codex: flags.codex && appUnavailableReason(apps, "codex") === null,
@@ -86,7 +86,7 @@ export function SkillInstallDialog(props: SkillInstallDialogProps) {
 
   const install = (busyKey: string, input: SkillsMutation, name: string, after?: () => void) => {
     busy.run(busyKey, async () => {
-      const outcome = await safeCall(client, "skills.mutate", input);
+      const outcome = await client.call("skills.mutate", input);
       const ok = reportMutation(outcome, {
         failure: `Could not install ${name}`,
         success: `Installed ${name}`,
@@ -186,7 +186,7 @@ export function SkillInstallDialog(props: SkillInstallDialogProps) {
               onUpload={(file) =>
                 busy.run("upload", async () => {
                   const bytes = new Uint8Array(await file.arrayBuffer());
-                  const outcome = await safeCall(client, "skills.mutate", {
+                  const outcome = await client.call("skills.mutate", {
                     action: "installZip",
                     fileName: file.name,
                     dataBase64: bytesToBase64(bytes),
@@ -245,17 +245,15 @@ function SearchPane(props: {
     let cancelled = false;
     setSearching(true);
     const timer = setTimeout(() => {
-      void safeCall(client, "skills.search", { query: trimmed, limit: SEARCH_LIMIT }).then(
-        (outcome) => {
-          if (cancelled) return;
-          setSearching(false);
-          setState(
-            outcome.ok
-              ? { query: trimmed, results: outcome.value, error: null }
-              : { query: trimmed, results: [], error: outcome.message },
-          );
-        },
-      );
+      void client.call("skills.search", { query: trimmed, limit: SEARCH_LIMIT }).then((outcome) => {
+        if (cancelled) return;
+        setSearching(false);
+        setState(
+          outcome.ok
+            ? { query: trimmed, results: outcome.value, error: null }
+            : { query: trimmed, results: [], error: outcome.message },
+        );
+      });
     }, SEARCH_DEBOUNCE_MS);
     return () => {
       cancelled = true;
@@ -346,7 +344,7 @@ function ReposPane(props: {
   const discover = () => {
     const current = ++generation.current;
     setLoading(true);
-    void safeCall(client, "skills.discover", {}).then((outcome) => {
+    void client.call("skills.discover", {}).then((outcome) => {
       if (current !== generation.current) return;
       setLoading(false);
       if (outcome.ok) {
@@ -373,7 +371,7 @@ function ReposPane(props: {
 
   const mutateRepos = (key: string, input: SkillsMutation, failure: string, after?: () => void) =>
     run(key, async () => {
-      const outcome = await safeCall(client, "skills.mutate", input);
+      const outcome = await client.call("skills.mutate", input);
       const ok = reportMutation(outcome, { failure });
       if (outcome.ok) {
         props.onReposChanged();
@@ -496,7 +494,12 @@ function RepoSection(props: {
   return (
     <Collapsible defaultOpen className="border-border/50 border-b last:border-b-0">
       <div className="flex min-h-7 items-center gap-1 px-1">
-        <CollapsibleTrigger className="group flex min-w-0 flex-1 items-center gap-1.5 py-1 text-left">
+        <CollapsibleTrigger
+          className={cn(
+            "group flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left",
+            FOCUS_RING,
+          )}
+        >
           <ChevronRightIcon className="size-3 shrink-0 text-muted-foreground transition-transform group-data-panel-open:rotate-90 motion-reduce:transition-none" />
           <span className="truncate font-medium text-xs">{group.key}</span>
           {group.repo.branch ? (
@@ -535,9 +538,11 @@ function RepoSection(props: {
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-xs">{skill.name}</div>
                     {skill.description ? (
-                      <div className="truncate text-[.65rem] text-muted-foreground">
-                        {skill.description}
-                      </div>
+                      <Hint hint={skill.description}>
+                        <div className="line-clamp-2 text-[.65rem] text-muted-foreground">
+                          {skill.description}
+                        </div>
+                      </Hint>
                     ) : null}
                   </div>
                   <InstallButton

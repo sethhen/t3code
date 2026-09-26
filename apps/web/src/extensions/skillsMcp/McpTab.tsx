@@ -9,49 +9,48 @@ import type {
   McpOverview,
   McpServerRow,
 } from "@t3tools/contracts";
-import { ChevronRightIcon, DownloadIcon, MoreHorizontalIcon, PlusIcon } from "lucide-react";
-import {
-  type ReactNode,
-  memo,
-  useCallback,
-  useDeferredValue,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { DownloadIcon, MoreHorizontalIcon, PlusIcon } from "lucide-react";
+import { memo, useDeferredValue, useMemo, useState } from "react";
 
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
-import { ScrollArea } from "~/components/ui/scroll-area";
 import { cn } from "~/lib/utils";
 
 import {
+  arrangeRows,
   bareToolName,
   deferredChip,
-  formatCalls,
-  formatTokens,
-  isUnused,
   joinMcpStats,
-  mcpIsOn,
   type RowStats,
-  sortRowsBy,
   statsDetail,
   statsFor,
   tokenChip,
-  unusedTokens,
+  toolChips,
+  unusedCost,
+  unusedRows,
   usageChip,
-  usageFootnote,
 } from "./context.logic";
 import {
+  AppCell,
   Chip,
+  ColumnHeader,
+  CountLabel,
+  ExpandButton,
   FacetMenu,
+  FOCUS_RING,
+  Hint,
+  ListBody,
   type ListTabProps,
+  ListRow,
   RefreshButton,
+  RefreshFailed,
   SearchField,
+  Sections,
   SortMenu,
   UsageControls,
+  UsageFootnote,
+  UsageStatus,
 } from "./listControls";
 import {
   ALL_FACET,
@@ -60,7 +59,9 @@ import {
   countAttention,
   countImportable,
   filterMcpServers,
+  capToolGroups,
   groupTools,
+  type McpPrimaryAction,
   mcpCheckedAt,
   mcpFacetMatches,
   mcpFacets,
@@ -71,331 +72,157 @@ import {
   mcpToggleBlock,
   mcpToolCount,
   primaryScope,
-  type RowSection,
   resolveFacet,
   sectionMcpServers,
 } from "./lists.logic";
 import { describeSpec } from "./mcpForm.logic";
 import { McpServerDialog } from "./McpServerDialog";
 import {
+  APPS,
   AppNotices,
-  AppSwitch,
   CheckedAgo,
   ConfirmDialog,
   EmptyState,
-  ListPlaceholder,
-  LoadError,
+  type Mutations,
+  type Opened,
   RowSpinner,
-  SectionLabel,
   StatusDot,
   WithReason,
-  reportMutation,
-  safeCall,
-  useBusyKeys,
+  closed,
+  reopen,
+  useExpandedSet,
+  useMutations,
   useOverviewLoader,
+  useStableActions,
+  visibleApps,
 } from "./shared";
 
-const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
 const EMPTY_SERVERS: readonly McpServerRow[] = [];
-
-type McpRowAction =
-  | { readonly type: "expand"; readonly row: McpServerRow }
-  | {
-      readonly type: "set-enabled";
-      readonly row: McpServerRow;
-      readonly app: AgentApp;
-      readonly enabled: boolean;
-    }
-  | { readonly type: "edit"; readonly row: McpServerRow }
-  | { readonly type: "delete"; readonly row: McpServerRow }
-  | { readonly type: "reconnect"; readonly row: McpServerRow; readonly apps: readonly AgentApp[] }
-  | { readonly type: "login"; readonly row: McpServerRow; readonly apps: readonly AgentApp[] }
-  | { readonly type: "project"; readonly row: McpServerRow; readonly enabled: boolean };
-
-interface MutationStep {
-  readonly input: McpMutation;
-  readonly labels: { readonly failure: string; readonly success?: string };
-}
-
-interface DialogState {
-  readonly key: number;
-  readonly open: boolean;
-  readonly row: McpServerRow | null;
-}
+const TOOL_CAP = 40;
+const LOGIN_HINT = "Opens a browser on the machine running T3 to sign in";
 
 export function McpTab(props: ListTabProps) {
   const { client, scopeKey, cwd, active, view, viewActions, context, usage, onChanged } = props;
-  const overview = useOverviewLoader<McpOverview>({
+  const { data, error, loading, reload } = useOverviewLoader<McpOverview>({
     active,
     key: scopeKey,
     fetch: (refresh) =>
-      safeCall(client, "mcp.list", {
-        ...(cwd ? { cwd } : {}),
-        ...(refresh ? { refresh: true } : {}),
-      }),
+      client.call("mcp.list", { ...(cwd ? { cwd } : {}), ...(refresh ? { refresh: true } : {}) }),
   });
-  const { data, error, loading, reload } = overview;
-  const busy = useBusyKeys();
-  const runBusy = busy.run;
+  const mutations = useMutations({ data, reload, onChanged });
+  const { expanded, toggle } = useExpandedSet();
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [facetChoice, setFacetChoice] = useState(ALL_FACET);
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
-  const [dialog, setDialog] = useState<DialogState | null>(null);
+  const [dialog, setDialog] = useState<Opened<McpServerRow | null> | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<McpServerRow | null>(null);
 
   const all = data?.servers ?? EMPTY_SERVERS;
-  const apps = data?.apps;
+  const columns = useMemo(() => visibleApps(data?.apps, all), [data, all]);
   const stats = useMemo(() => joinMcpStats(all, context, usage), [all, context, usage]);
   const facets = useMemo(() => mcpFacets(all), [all]);
   const facet = resolveFacet(facets, facetChoice);
   const attention = useMemo(() => countAttention(all), [all]);
   const importable = useMemo(() => countImportable(all), [all]);
-  const unusedRows = useMemo(
-    () =>
-      usage ? all.filter((row) => isUnused(mcpIsOn(row), statsFor(stats, row.key))) : EMPTY_SERVERS,
+  const unused = useMemo(
+    () => (usage ? unusedRows(all, stats) : EMPTY_SERVERS),
     [all, stats, usage],
-  );
-  const unusedCost = useMemo(() => unusedTokens(unusedRows, stats), [unusedRows, stats]);
-  const matched = useMemo(
-    () => filterMcpServers(all, deferredQuery).filter((row) => mcpFacetMatches(row, facet)),
-    [all, deferredQuery, facet],
   );
   const unusedOnly = view.unusedOnly && usage !== null;
   const shown = useMemo(
     () =>
-      unusedOnly
-        ? matched.filter((row) => isUnused(mcpIsOn(row), statsFor(stats, row.key)))
-        : matched,
-    [matched, unusedOnly, stats],
-  );
-  const sort = view.sort;
-  const sections = useMemo<RowSection<McpServerRow>[]>(() => {
-    if (sort === "status") return sectionMcpServers(shown);
-    return [{ id: "sorted", label: "", rows: sortRowsBy(shown, sort, stats) }];
-  }, [shown, sort, stats]);
-  const columns = useMemo<readonly AgentApp[]>(
-    () =>
-      APPS.filter(
-        (app) =>
-          (apps ?? []).some((info) => info.app === app && info.available) ||
-          all.some((row) => row.apps[app]?.present),
+      filterMcpServers(all, deferredQuery).filter(
+        (row) =>
+          mcpFacetMatches(row, facet) &&
+          mutations.optimistic(row.key) !== false &&
+          (!unusedOnly || stats.get(row.key)?.unused === true),
       ),
-    [apps, all],
+    [all, deferredQuery, facet, mutations, unusedOnly, stats],
+  );
+  const sections = useMemo(
+    () => arrangeRows(shown, view.sort, stats, sectionMcpServers),
+    [shown, view.sort, stats],
   );
 
-  const mutate = useCallback(
-    (
-      busyKey: string,
-      steps: readonly MutationStep[],
-      options: { optimistic?: boolean; refresh?: boolean } = {},
-    ) => {
-      runBusy(
-        busyKey,
-        async () => {
-          let changed = false;
-          for (const step of steps) {
-            const outcome = await safeCall(client, "mcp.mutate", step.input);
-            reportMutation(outcome, step.labels);
-            if (outcome.ok) changed = true;
-          }
-          await reload(options.refresh ?? false);
-          if (changed) onChanged();
-        },
-        options.optimistic,
+  const step = (input: McpMutation, failure: string, success?: string) => ({
+    call: () => client.call("mcp.mutate", input),
+    labels: { failure, ...(success ? { success } : {}) },
+  });
+  const reconnect = (row: McpServerRow, app: AgentApp) =>
+    step(
+      { action: "reconnect", name: row.name, app, ...(cwd ? { cwd } : {}) },
+      `Could not reconnect ${row.name} in ${APP_LABEL[app]}`,
+    );
+  const actions = useStableActions({
+    expand: toggle,
+    toggle: (row: McpServerRow, app: AgentApp, enabled: boolean) => {
+      if (!row.id) return;
+      const verb = enabled ? "enable" : "disable";
+      mutations.mutate(
+        `${row.key}:${app}`,
+        [
+          step(
+            { action: "setEnabled", id: row.id, app, enabled },
+            `Could not ${verb} ${row.name} for ${APP_LABEL[app]}`,
+          ),
+        ],
+        enabled,
       );
     },
-    [runBusy, client, reload, onChanged],
-  );
-
-  const handleAction = (action: McpRowAction) => {
-    const { row } = action;
-    switch (action.type) {
-      case "expand":
-        setExpanded((previous) => {
-          const next = new Set(previous);
-          if (next.has(row.key)) next.delete(row.key);
-          else next.add(row.key);
-          return next;
-        });
-        return;
-      case "set-enabled": {
-        if (!row.id) return;
-        const verb = action.enabled ? "enable" : "disable";
-        mutate(
-          `${row.key}:${action.app}`,
-          [
-            {
-              input: { action: "setEnabled", id: row.id, app: action.app, enabled: action.enabled },
-              labels: { failure: `Could not ${verb} ${row.name} for ${APP_LABEL[action.app]}` },
-            },
-          ],
-          { optimistic: action.enabled },
-        );
-        return;
-      }
-      case "edit":
-        setDialog((previous) => ({ key: (previous?.key ?? 0) + 1, open: true, row }));
-        return;
-      case "delete":
-        setConfirmDelete(row);
-        return;
-      case "reconnect":
-        mutate(
-          row.key,
-          action.apps.map((app) => ({
-            input: { action: "reconnect", name: row.name, app, ...(cwd ? { cwd } : {}) },
-            labels: { failure: `Could not reconnect ${row.name} in ${APP_LABEL[app]}` },
-          })),
-          { refresh: true },
-        );
-        return;
-      case "login":
-        mutate(
-          row.key,
-          action.apps.map((app) => ({
-            input: { action: "login", name: row.name, app },
-            labels: {
-              failure: `Could not sign in to ${row.name} for ${APP_LABEL[app]}`,
-              success: `Signed in to ${row.name}`,
-            },
-          })),
-          { refresh: true },
-        );
-        return;
-      case "project": {
-        if (!cwd) return;
-        mutate(
-          row.key,
-          [
-            {
-              input: { action: "setProjectEnabled", name: row.name, cwd, enabled: action.enabled },
-              labels: {
-                failure: `Could not ${action.enabled ? "enable" : "disable"} ${row.name} for this project`,
-              },
-            },
-          ],
-          { refresh: true },
-        );
-        return;
-      }
-    }
-  };
-  const actionRef = useRef(handleAction);
-  useLayoutEffect(() => {
-    actionRef.current = handleAction;
+    primary: (row: McpServerRow, primary: McpPrimaryAction) => {
+      const { id, name } = row;
+      const steps = primary.apps.flatMap((app, index) => {
+        const last = index === primary.apps.length - 1;
+        if (primary.kind === "reconnect") return [reconnect(row, app)];
+        if (primary.kind === "login") {
+          return [
+            step(
+              { action: "login", name, app },
+              `Could not sign in to ${name} for ${APP_LABEL[app]}`,
+            ),
+          ];
+        }
+        if (!id) return [];
+        return [
+          step(
+            { action: "setEnabled", id, app, enabled: true },
+            `Could not restore ${name} in ${APP_LABEL[app]}`,
+            last ? `Restored ${name}` : undefined,
+          ),
+        ];
+      });
+      mutations.mutate(row.key, steps);
+    },
+    reconnect: (row: McpServerRow, app: AgentApp) =>
+      mutations.mutate(row.key, [reconnect(row, app)]),
+    project: (row: McpServerRow, enabled: boolean) => {
+      if (!cwd) return;
+      mutations.mutate(row.key, [
+        step(
+          { action: "setProjectEnabled", name: row.name, cwd, enabled },
+          `Could not ${enabled ? "enable" : "disable"} ${row.name} for this project`,
+        ),
+      ]);
+    },
+    edit: (row: McpServerRow) => setDialog((previous) => reopen(previous, row)),
+    remove: (row: McpServerRow) => setConfirmDelete(row),
   });
-  const onAction = useCallback((action: McpRowAction) => actionRef.current(action), []);
 
-  const openAdd = () =>
-    setDialog((previous) => ({ key: (previous?.key ?? 0) + 1, open: true, row: null }));
-  const runImport = () =>
-    mutate("import", [
-      {
-        input: { action: "import" },
-        labels: { failure: "Could not import servers", success: "Imported servers" },
-      },
-    ]);
-  const refresh = () => {
-    void reload(true);
-    props.onRefreshContext();
-  };
+  const openAdd = () => setDialog((previous) => reopen(previous, null));
   const clearFilters = () => {
     setQuery("");
     setFacetChoice(ALL_FACET);
     if (view.unusedOnly) viewActions.setUnusedOnly(false);
   };
-
   const liveProbeNotes = data
     ? APPS.flatMap((app) => {
         const probe = data.liveProbe[app];
-        const info = data.apps.find((entry) => entry.app === app);
-        if (probe.ok || info?.available === false) return [];
+        if (probe.ok || appUnavailableReason(data.apps, app)) return [];
         return [
           `${APP_LABEL[app]} live status unavailable${probe.error ? `: ${probe.error}` : ""}`,
         ];
       })
     : [];
-
-  let body: ReactNode;
-  if (data === null) {
-    body = error ? (
-      <LoadError message={error} onRetry={() => void reload(true)} />
-    ) : (
-      <ListPlaceholder rows={6} />
-    );
-  } else if (all.length === 0) {
-    body = (
-      <EmptyState
-        title="No MCP servers"
-        description="Add a server to make its tools available in Claude and Codex."
-      >
-        <Button size="xs" variant="outline" onClick={openAdd}>
-          <PlusIcon />
-          Add server
-        </Button>
-      </EmptyState>
-    );
-  } else if (shown.length === 0) {
-    body = (
-      <EmptyState title="No matches" description="Nothing matches the current search and filters.">
-        <Button size="xs" variant="outline" onClick={clearFilters}>
-          Clear filters
-        </Button>
-      </EmptyState>
-    );
-  } else {
-    body = (
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="@container/mcp-list pb-2">
-          <div className="flex items-center gap-1.5 border-b px-2 py-1 text-[.65rem] text-muted-foreground">
-            <span className="min-w-0 flex-1 pl-4.5">Server</span>
-            {columns.map((app) => (
-              <span key={app} className="w-12 shrink-0 text-center">
-                {APP_LABEL[app]}
-              </span>
-            ))}
-            <span className="w-6 shrink-0" />
-          </div>
-          {sections.map((section) => (
-            <section key={section.id}>
-              {section.label ? (
-                <SectionLabel className="px-2">
-                  {section.label} · {section.rows.length}
-                </SectionLabel>
-              ) : null}
-              <ul>
-                {section.rows.map((row) => (
-                  <McpRow
-                    key={row.key}
-                    row={row}
-                    stats={statsFor(stats, row.key)}
-                    days={view.days}
-                    showUsage={view.showUsage}
-                    expanded={expanded.has(row.key)}
-                    apps={data.apps}
-                    columns={columns}
-                    canProject={cwd !== null}
-                    busyRow={busy.isBusy(row.key)}
-                    busyClaude={busy.isBusy(`${row.key}:claude`)}
-                    busyCodex={busy.isBusy(`${row.key}:codex`)}
-                    optimisticClaude={busy.optimistic(`${row.key}:claude`)}
-                    optimisticCodex={busy.optimistic(`${row.key}:codex`)}
-                    onAction={onAction}
-                  />
-                ))}
-              </ul>
-            </section>
-          ))}
-          {usage && view.showUsage ? (
-            <div className="px-2 pt-3 text-[.65rem] text-muted-foreground/70">
-              Call counts: {usageFootnote(usage)}
-            </div>
-          ) : null}
-        </div>
-      </ScrollArea>
-    );
-  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -408,21 +235,28 @@ export function McpTab(props: ListTabProps) {
           />
           <FacetMenu facets={facets} value={facet} total={all.length} onChange={setFacetChoice} />
           <SortMenu view={view} actions={viewActions} />
-          <RefreshButton refreshing={loading} onClick={refresh} label="Refresh MCP servers" />
+          <RefreshButton
+            refreshing={loading}
+            onClick={() => {
+              void reload(true);
+              props.onRefreshContext();
+            }}
+            label="Refresh MCP servers"
+          />
           <Button size="xs" variant="outline" onClick={openAdd}>
             <PlusIcon />
             Add
           </Button>
         </div>
         <div className="flex min-h-5 items-center gap-2 text-[.7rem] text-muted-foreground">
-          <span className="shrink-0 tabular-nums">
-            {shown.length === all.length ? all.length : `${shown.length} of ${all.length}`}{" "}
-            {all.length === 1 ? "server" : "servers"}
-          </span>
+          <CountLabel shown={shown.length} total={all.length} noun={["server", "servers"]} />
           {attention > 0 && facet !== "attention" ? (
             <button
               type="button"
-              className="shrink-0 text-warning-foreground hover:underline"
+              className={cn(
+                "shrink-0 rounded-sm text-warning-foreground hover:underline",
+                FOCUS_RING,
+              )}
               onClick={() => setFacetChoice("attention")}
             >
               {attention} need{attention === 1 ? "s" : ""} attention
@@ -434,23 +268,26 @@ export function McpTab(props: ListTabProps) {
               <Button
                 size="micro"
                 variant="ghost"
-                disabled={busy.isBusy("import")}
-                onClick={runImport}
+                disabled={mutations.isBusy("import")}
+                onClick={() =>
+                  mutations.mutate("import", [
+                    step({ action: "import" }, "Could not import servers", "Imported servers"),
+                  ])
+                }
               >
                 <DownloadIcon />
                 Import {importable}
               </Button>
             </WithReason>
           ) : null}
-          <span className="min-w-0 flex-1 truncate">
-            {props.usageLoading && view.showUsage ? "Loading usage…" : null}
-            {!props.usageLoading && props.usageError && view.showUsage
-              ? `Usage unavailable: ${props.usageError}`
-              : null}
-            {usage && unusedRows.length > 0 && !props.usageLoading
-              ? `${unusedRows.length} unused${unusedCost > 0 ? ` · ${formatTokens(unusedCost)} tok` : ""}`
-              : null}
-          </span>
+          <UsageStatus
+            view={view}
+            usage={usage}
+            loading={props.usageLoading}
+            error={props.usageError}
+            unused={unused.length}
+            cost={unusedCost(unused, stats, columns)}
+          />
           <UsageControls view={view} actions={viewActions} noun="servers" />
         </div>
         {data ? <AppNotices apps={data.apps} /> : null}
@@ -459,21 +296,57 @@ export function McpTab(props: ListTabProps) {
             {note}
           </div>
         ))}
-        {data && error ? (
-          <div className="truncate text-[.7rem] text-destructive-foreground">
-            Last refresh failed: {error}
-          </div>
-        ) : null}
+        {data && error ? <RefreshFailed error={error} /> : null}
       </div>
-      {body}
+      <ListBody
+        loaded={data !== null}
+        error={error}
+        onRetry={() => void reload(true)}
+        total={all.length}
+        shown={shown.length}
+        onClearFilters={clearFilters}
+        container="@container/mcp-list"
+        empty={
+          <EmptyState
+            title="No MCP servers"
+            description="Add a server to make its tools available in Claude and Codex."
+          >
+            <Button size="xs" variant="outline" onClick={openAdd}>
+              <PlusIcon />
+              Add server
+            </Button>
+          </EmptyState>
+        }
+        after={<UsageFootnote usage={usage} show={view.showUsage} label="Call counts" />}
+      >
+        <ColumnHeader label="Server" columns={columns} />
+        <Sections
+          sections={sections}
+          render={(row) => (
+            <McpRow
+              key={row.key}
+              row={row}
+              stats={statsFor(stats, row.key)}
+              days={view.days}
+              showUsage={view.showUsage}
+              expanded={expanded.has(row.key)}
+              apps={data?.apps ?? []}
+              columns={columns}
+              canProject={cwd !== null}
+              mutations={mutations}
+              actions={actions}
+            />
+          )}
+        />
+      </ListBody>
       {dialog ? (
         <McpServerDialog
           key={dialog.key}
           open={dialog.open}
-          onOpenChange={(open) =>
-            setDialog((previous) => (previous ? { ...previous, open } : previous))
-          }
-          row={dialog.row}
+          onOpenChange={(open) => {
+            if (!open) setDialog(closed);
+          }}
+          row={dialog.value}
           apps={data?.apps ?? []}
           client={client}
           onSaved={() => {
@@ -494,12 +367,12 @@ export function McpTab(props: ListTabProps) {
           const row = confirmDelete;
           setConfirmDelete(null);
           if (!row?.id) return;
-          mutate(row.key, [
-            {
-              input: { action: "delete", id: row.id },
-              labels: { failure: `Could not delete ${row.name}`, success: `Deleted ${row.name}` },
-            },
-          ]);
+          const failure = `Could not delete ${row.name}`;
+          mutations.mutate(
+            row.key,
+            [step({ action: "delete", id: row.id }, failure, `Deleted ${row.name}`)],
+            false,
+          );
         }}
       />
     </div>
@@ -508,6 +381,16 @@ export function McpTab(props: ListTabProps) {
 
 // ---------------------------------------------------------------------------
 // Row
+
+interface McpRowActions {
+  readonly expand: (key: string) => void;
+  readonly toggle: (row: McpServerRow, app: AgentApp, enabled: boolean) => void;
+  readonly primary: (row: McpServerRow, primary: McpPrimaryAction) => void;
+  readonly reconnect: (row: McpServerRow, app: AgentApp) => void;
+  readonly project: (row: McpServerRow, enabled: boolean) => void;
+  readonly edit: (row: McpServerRow) => void;
+  readonly remove: (row: McpServerRow) => void;
+}
 
 interface McpRowProps {
   readonly row: McpServerRow;
@@ -518,157 +401,123 @@ interface McpRowProps {
   readonly apps: readonly AgentAppInfo[];
   readonly columns: readonly AgentApp[];
   readonly canProject: boolean;
-  readonly busyRow: boolean;
-  readonly busyClaude: boolean;
-  readonly busyCodex: boolean;
-  readonly optimisticClaude: boolean | undefined;
-  readonly optimisticCodex: boolean | undefined;
-  readonly onAction: (action: McpRowAction) => void;
+  readonly mutations: Mutations;
+  readonly actions: McpRowActions;
 }
 
 const McpRow = memo(function McpRow(props: McpRowProps) {
-  const { row, stats, expanded, onAction } = props;
-  const issues = mcpIssues(row);
+  const { row, stats, expanded, columns, mutations, actions } = props;
+  const busy = mutations.isBusy(row.key);
+  const issues = expanded ? [] : mcpIssues(row);
   const primary = mcpPrimaryAction(row);
   const toolCount = mcpToolCount(row);
-  const tokens = tokenChip(stats);
-  const deferred = deferredChip(stats);
+  const tokens = tokenChip(stats, columns);
+  const deferred = deferredChip(stats, columns);
   const calls = props.showUsage ? usageChip(stats, props.days) : null;
-  const unused = isUnused(mcpIsOn(row), stats);
+  const detail = statsDetail(stats, props.days).join("\n") || undefined;
   const scope = primaryScope(row);
 
   return (
-    <li className="border-border/50 border-b last:border-b-0">
-      <div className="flex min-h-8 items-center gap-1.5 px-2 py-1 hover:bg-accent/30">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-label={`${expanded ? "Collapse" : "Expand"} ${row.name}`}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-          onClick={() => onAction({ type: "expand", row })}
-        >
-          <ChevronRightIcon
-            className={cn(
-              "size-3 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none",
-              expanded && "rotate-90",
-            )}
-          />
-          <StatusDot tone={mcpRowTone(row)} />
-          <span className="min-w-0 truncate font-medium text-xs">{row.name}</span>
-          {toolCount > 0 ? (
-            <Chip className="hidden @xs/mcp-list:inline">
-              {toolCount} {toolCount === 1 ? "tool" : "tools"}
-            </Chip>
+    <ListRow
+      below={
+        <>
+          {issues.length > 0 ? (
+            <div className="-mt-1 space-y-px px-2 pb-1 pl-8">
+              {issues.map((issue) => (
+                <div
+                  key={issue.app}
+                  className={cn(
+                    "truncate text-[.7rem]",
+                    issue.tone === "destructive"
+                      ? "text-destructive-foreground"
+                      : "text-warning-foreground",
+                  )}
+                >
+                  {APP_LABEL[issue.app]}: {issue.label}
+                  {issue.message ? ` · ${issue.message}` : ""}
+                </div>
+              ))}
+            </div>
           ) : null}
-          {tokens ? <Chip className="hidden @xs/mcp-list:inline">{tokens}</Chip> : null}
-          {deferred ? (
-            <Chip dim className="hidden @sm/mcp-list:inline">
-              {deferred}
-            </Chip>
-          ) : null}
-          {calls ? (
-            <Chip className={cn("hidden @sm/mcp-list:inline", unused && "text-warning-foreground")}>
-              {calls}
-            </Chip>
-          ) : null}
-          {scope !== "user" && !row.builtin ? (
-            <Badge size="sm" variant="outline" className="shrink-0">
-              {scope}
-            </Badge>
-          ) : null}
-          {row.builtin ? (
-            <Badge size="sm" variant="info" className="shrink-0">
-              built in
-            </Badge>
-          ) : null}
-        </button>
-        {primary ? (
+          {expanded ? <McpRowDetails row={row} stats={stats} days={props.days} /> : null}
+        </>
+      }
+    >
+      <ExpandButton expanded={expanded} name={row.name} onClick={() => actions.expand(row.key)}>
+        <StatusDot tone={mcpRowTone(row)} />
+        <span className="min-w-0 truncate font-medium text-xs">{row.name}</span>
+        {toolCount > 0 ? (
+          <Chip className="hidden @xs/mcp-list:inline">
+            {toolCount} {toolCount === 1 ? "tool" : "tools"}
+          </Chip>
+        ) : null}
+        {tokens ? (
+          <Chip hint={detail} className="hidden @xs/mcp-list:inline">
+            {tokens}
+          </Chip>
+        ) : null}
+        {deferred ? (
+          <Chip dim hint={detail} className="hidden @sm/mcp-list:inline">
+            {deferred}
+          </Chip>
+        ) : null}
+        {calls ? (
+          <Chip
+            hint={detail}
+            className={cn("hidden @sm/mcp-list:inline", stats.unused && "text-warning-foreground")}
+          >
+            {calls}
+          </Chip>
+        ) : null}
+        {scope !== "user" && !row.builtin ? (
+          <Badge size="sm" variant="outline" className="shrink-0">
+            {scope}
+          </Badge>
+        ) : null}
+        {row.builtin ? (
+          <Badge size="sm" variant="info" className="shrink-0">
+            built in
+          </Badge>
+        ) : null}
+      </ExpandButton>
+      {primary ? (
+        <WithReason reason={primary.kind === "login" ? LOGIN_HINT : null}>
           <Button
             size="micro"
             variant="warning-outline"
-            disabled={props.busyRow}
-            onClick={() => onAction({ type: primary.kind, row, apps: primary.apps })}
+            disabled={busy}
+            onClick={() => actions.primary(row, primary)}
           >
             {primary.label}
           </Button>
-        ) : null}
-        {props.busyRow ? <RowSpinner /> : null}
-        {props.columns.map((app) => (
-          <AppCell
-            key={app}
-            row={row}
-            app={app}
-            apps={props.apps}
-            busy={props.busyRow || (app === "claude" ? props.busyClaude : props.busyCodex)}
-            optimistic={app === "claude" ? props.optimisticClaude : props.optimisticCodex}
-            onAction={onAction}
-          />
-        ))}
-        <RowMenu row={row} canProject={props.canProject} busy={props.busyRow} onAction={onAction} />
-      </div>
-      {!expanded && issues.length > 0 ? (
-        <div className="-mt-1 space-y-px px-2 pb-1 pl-8">
-          {issues.map((issue) => (
-            <div
-              key={issue.app}
-              className={cn(
-                "truncate text-[.7rem]",
-                issue.tone === "destructive"
-                  ? "text-destructive-foreground"
-                  : "text-warning-foreground",
-              )}
-            >
-              {APP_LABEL[issue.app]}: {issue.label}
-              {issue.message ? ` · ${issue.message}` : ""}
-            </div>
-          ))}
-        </div>
+        </WithReason>
       ) : null}
-      {expanded ? <McpRowDetails row={row} stats={stats} days={props.days} /> : null}
-    </li>
+      {busy ? <RowSpinner /> : null}
+      {columns.map((app) => (
+        <AppCell
+          key={app}
+          app={app}
+          subject={row.name}
+          entry={row.apps[app]}
+          managed={row.managed && !row.builtin}
+          optimistic={mutations.optimistic(`${row.key}:${app}`)}
+          reason={mcpToggleBlock(row, app) ?? appUnavailableReason(props.apps, app)}
+          busy={busy || mutations.isBusy(`${row.key}:${app}`)}
+          onToggle={(enabled) => actions.toggle(row, app, enabled)}
+        />
+      ))}
+      <RowMenu row={row} canProject={props.canProject} busy={busy} actions={actions} />
+    </ListRow>
   );
 });
-
-function AppCell(props: {
-  row: McpServerRow;
-  app: AgentApp;
-  apps: readonly AgentAppInfo[];
-  busy: boolean;
-  optimistic: boolean | undefined;
-  onAction: (action: McpRowAction) => void;
-}) {
-  const { row, app } = props;
-  const entry = row.apps[app];
-  if (!entry && !row.managed) {
-    return <span className="w-12 shrink-0 text-center text-muted-foreground/40 text-xs">–</span>;
-  }
-  const status = entry?.present ? mcpStatusLabel(entry) : null;
-  const block = appUnavailableReason(props.apps, app) ?? mcpToggleBlock(row, app);
-  return (
-    <div className="flex w-12 shrink-0 items-center justify-center gap-1">
-      <WithReason reason={`${APP_LABEL[app]}: ${status?.label ?? "not configured"}`}>
-        <StatusDot tone={status?.tone ?? "muted"} className={cn(!status && "opacity-40")} />
-      </WithReason>
-      <AppSwitch
-        compact
-        app={app}
-        subject={row.name}
-        checked={props.optimistic ?? entry?.enabled ?? false}
-        blockedReason={block}
-        busy={props.busy}
-        onCheckedChange={(enabled) => props.onAction({ type: "set-enabled", row, app, enabled })}
-      />
-    </div>
-  );
-}
 
 function RowMenu(props: {
   row: McpServerRow;
   canProject: boolean;
   busy: boolean;
-  onAction: (action: McpRowAction) => void;
+  actions: McpRowActions;
 }) {
-  const { row, onAction } = props;
+  const { row, actions } = props;
   const editable = row.managed && !row.builtin && row.id !== undefined;
   const reconnectApps = APPS.filter((app) => row.apps[app]?.present && row.apps[app]?.enabled);
   const claude = row.apps.claude;
@@ -690,30 +539,21 @@ function RowMenu(props: {
         <MoreHorizontalIcon />
       </MenuTrigger>
       <MenuPopup align="end" className="w-52">
-        {editable ? (
-          <MenuItem onClick={() => onAction({ type: "edit", row })}>Edit…</MenuItem>
-        ) : null}
+        {editable ? <MenuItem onClick={() => actions.edit(row)}>Edit…</MenuItem> : null}
         {reconnectApps.map((app) => (
-          <MenuItem
-            key={app}
-            disabled={props.busy}
-            onClick={() => onAction({ type: "reconnect", row, apps: [app] })}
-          >
+          <MenuItem key={app} disabled={props.busy} onClick={() => actions.reconnect(row, app)}>
             Reconnect in {APP_LABEL[app]}
           </MenuItem>
         ))}
         {project ? (
-          <MenuItem
-            disabled={props.busy}
-            onClick={() => onAction({ type: "project", row, enabled: projectOff })}
-          >
+          <MenuItem disabled={props.busy} onClick={() => actions.project(row, projectOff)}>
             {projectOff ? "Enable" : "Disable"} for this project (Claude)
           </MenuItem>
         ) : null}
         {editable ? (
           <>
             <MenuSeparator />
-            <MenuItem variant="destructive" onClick={() => onAction({ type: "delete", row })}>
+            <MenuItem variant="destructive" onClick={() => actions.remove(row)}>
               Delete…
             </MenuItem>
           </>
@@ -725,9 +565,11 @@ function RowMenu(props: {
 
 function McpRowDetails(props: { row: McpServerRow; stats: RowStats; days: number }) {
   const { row, stats } = props;
-  const groups = groupTools(row);
+  const [showAll, setShowAll] = useState(false);
+  const groups = capToolGroups(groupTools(row), showAll ? Number.POSITIVE_INFINITY : TOOL_CAP);
   const spec = row.spec ? describeSpec(row.spec) : [];
   const detail = statsDetail(stats, props.days);
+  const toolTotal = groups.reduce((sum, group) => sum + group.total, 0);
   return (
     <div className="space-y-2 px-2 pb-2.5 pl-8 text-[.7rem]">
       <ul className="space-y-0.5">
@@ -735,11 +577,7 @@ function McpRowDetails(props: { row: McpServerRow; stats: RowStats; days: number
           const entry = row.apps[app];
           if (!entry) return null;
           const status = entry.present ? mcpStatusLabel(entry) : null;
-          const meta = [
-            entry.scope,
-            entry.source,
-            entry.serverVersion ? `v${entry.serverVersion}` : undefined,
-          ]
+          const meta = [entry.scope, entry.source, entry.serverVersion && `v${entry.serverVersion}`]
             .filter(Boolean)
             .join(" · ");
           return (
@@ -769,16 +607,21 @@ function McpRowDetails(props: { row: McpServerRow; stats: RowStats; days: number
       {groups.map((group) => (
         <div key={group.apps.join("+")}>
           <div className="pb-0.5 font-medium text-[.65rem] text-muted-foreground uppercase tracking-wider">
-            Tools · {group.apps.map((app) => APP_LABEL[app]).join(" & ")} · {group.tools.length}
+            Tools · {group.apps.map((app) => APP_LABEL[app]).join(" & ")} · {group.total}
           </div>
           <ul className="space-y-px">
             {group.tools.map((tool) => {
-              const stat = stats.tools?.get(bareToolName(tool.name, row.name));
+              const chips = toolChips(
+                stats.tools?.get(bareToolName(tool.name, row.name)),
+                group.apps,
+              );
               return (
                 <li key={tool.name} className="flex min-w-0 items-center gap-1.5">
-                  <span className="shrink-0 font-mono text-[.65rem] text-foreground">
-                    {tool.name}
-                  </span>
+                  <Hint hint={tool.name}>
+                    <span className="min-w-0 max-w-[45%] shrink-0 truncate font-mono text-[.65rem] text-foreground">
+                      {tool.name}
+                    </span>
+                  </Hint>
                   {tool.readOnly ? (
                     <Badge size="sm" variant="outline" className="shrink-0">
                       read-only
@@ -789,26 +632,24 @@ function McpRowDetails(props: { row: McpServerRow; stats: RowStats; days: number
                       destructive
                     </Badge>
                   ) : null}
-                  <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                    {tool.description ? (
-                      <WithReason reason={tool.description}>
-                        <span className="truncate">{tool.description}</span>
-                      </WithReason>
-                    ) : null}
-                  </span>
-                  {stat?.tokens !== undefined ? (
-                    <Chip dim={stat.loaded === false}>
-                      {formatTokens(stat.tokens)}
-                      {stat.loaded === false ? " deferred" : " tok"}
-                    </Chip>
-                  ) : null}
-                  {stat?.calls !== undefined ? <Chip>{formatCalls(stat.calls)}</Chip> : null}
+                  <Hint hint={tool.description}>
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                      {tool.description}
+                    </span>
+                  </Hint>
+                  {chips.cost ? <Chip dim={chips.deferredOnly}>{chips.cost}</Chip> : null}
+                  {chips.calls ? <Chip>{chips.calls}</Chip> : null}
                 </li>
               );
             })}
           </ul>
         </div>
       ))}
+      {toolTotal > TOOL_CAP && !showAll ? (
+        <Button size="micro" variant="ghost" onClick={() => setShowAll(true)}>
+          Show all {toolTotal} tools
+        </Button>
+      ) : null}
       {spec.length > 0 ? (
         <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
           {spec.map((line, index) => (
@@ -827,7 +668,7 @@ function McpRowDetails(props: { row: McpServerRow; stats: RowStats; days: number
               href={row.homepage}
               target="_blank"
               rel="noreferrer"
-              className="mr-1 truncate text-info-foreground hover:underline"
+              className="mr-1 truncate rounded-sm text-info-foreground hover:underline"
             >
               {row.homepage.replace(/^https?:\/\//, "")}
             </a>

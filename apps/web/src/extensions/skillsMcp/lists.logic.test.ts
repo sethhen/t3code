@@ -22,6 +22,7 @@ import {
   formatInstalls,
   formatRelativeTime,
   groupDiscoverable,
+  capToolGroups,
   groupTools,
   matchesQuery,
   mcpCheckedAt,
@@ -36,6 +37,7 @@ import {
   parseRepoInput,
   resolveFacet,
   sectionMcpServers,
+  sectionPlugins,
   sectionSkills,
   skillAdoptPath,
   skillFacetMatches,
@@ -44,7 +46,6 @@ import {
   skillSourceLabel,
   skillToggleBlock,
   sortMcpServers,
-  sortPlugins,
   sortSkills,
 } from "./lists.logic";
 
@@ -161,11 +162,12 @@ describe("MCP rows", () => {
 
   it("explains locked switches", () => {
     const byName = (name: string) => rows.find((row) => row.name === name)!;
-    assert.match(mcpToggleBlock(byName("t3-code"), "claude")!, /T3 attaches/);
+    assert.equal(mcpToggleBlock(byName("t3-code"), "claude"), "Built into T3");
     assert.match(mcpToggleBlock(byName("loose"), "codex")!, /Import/);
+    assert.equal(mcpToggleBlock(byName("alpha-plugin"), "claude"), "From plugin vercel");
     assert.equal(
-      mcpToggleBlock(byName("alpha-plugin"), "claude"),
-      "Defined by a plugin (vercel@vercel); edit it there.",
+      mcpToggleBlock(server("p", { apps: { claude: entry({ scope: "project" }) } }), "claude"),
+      "Defined in .mcp.json (project)",
     );
     assert.isNull(mcpToggleBlock(byName("zeta"), "codex"));
     const sse = server("s", {
@@ -200,6 +202,23 @@ describe("MCP rows", () => {
       [["claude"], ["codex"]],
     );
     assert.deepEqual(groupTools(server("z")), []);
+  });
+
+  it("caps tools across groups and drops groups left empty", () => {
+    const tools = (...names: string[]) => names.map((name) => ({ name }));
+    const groups = [
+      { apps: ["claude"] as const, tools: tools("a", "b", "c") },
+      { apps: ["codex"] as const, tools: tools("d", "e") },
+    ];
+    assert.deepEqual(
+      capToolGroups(groups, 4).map((group) => [group.tools.length, group.total]),
+      [
+        [3, 3],
+        [1, 2],
+      ],
+    );
+    assert.equal(capToolGroups(groups, 3).length, 1);
+    assert.equal(capToolGroups(groups, Number.POSITIVE_INFINITY)[1]?.tools.length, 2);
   });
 
   it("reports the oldest live-probe time", () => {
@@ -298,7 +317,7 @@ describe("skills", () => {
       apps: { codex: { present: true, enabled: true, scope: "system", editable: false } },
     });
     assert.equal(skillToggleBlock(system, "codex"), "Built into Codex.");
-    assert.match(skillToggleBlock(skill("u"), "claude")!, /Adopt/);
+    assert.match(skillToggleBlock(skill("u"), "claude")!, /edit it there/);
     assert.isNull(skillToggleBlock(skill("m", { managed: true, id: "m" }), "claude"));
 
     const adoptable = skill("a", {
@@ -309,12 +328,20 @@ describe("skills", () => {
           scope: "user",
           path: "/h/.claude/skills/a",
           editable: false,
+          adoptable: true,
         },
       },
     });
     assert.equal(skillAdoptPath(adoptable), "/h/.claude/skills/a");
+    assert.match(skillToggleBlock(adoptable, "claude")!, /Adopt/);
     assert.isUndefined(skillAdoptPath({ ...adoptable, managed: true }));
     assert.isUndefined(skillAdoptPath(skill("nopath")));
+    const linked = skill("l", {
+      apps: {
+        claude: { present: true, enabled: true, scope: "user", path: "/x", editable: false },
+      },
+    });
+    assert.isUndefined(skillAdoptPath(linked), "only folders the server marks adoptable");
   });
 
   it("parses repositories", () => {
@@ -396,8 +423,15 @@ describe("plugins", () => {
       plugin("Atlas", { marketplace: "official" }),
     ];
     assert.deepEqual(
-      sortPlugins(rows).map((row) => row.name),
-      ["Atlas", "vercel"],
+      sectionPlugins(rows, [
+        plugin("zed", { app: "codex", installed: false }),
+        plugin("beta", { installed: false }),
+      ]).map((section) => [section.label, section.rows.map((row) => row.name)]),
+      [
+        ["Claude", ["Atlas", "vercel"]],
+        ["Available for Claude", ["beta"]],
+        ["Available for Codex", ["zed"]],
+      ],
     );
     assert.deepEqual(
       filterPlugins(rows, "official").map((row) => row.name),
@@ -465,6 +499,29 @@ describe("attention", () => {
       ),
       null,
     );
+  });
+
+  it("restores a managed server an app's config lost, before anything else", () => {
+    const drifted = server("drift", {
+      managed: true,
+      id: "drift",
+      apps: {
+        claude: entry({ status: "failed" }),
+        codex: entry({ present: false, status: "unknown", error: "Missing from Codex config" }),
+      },
+    });
+    assert.deepEqual(mcpPrimaryAction(drifted), {
+      kind: "restore",
+      label: "Restore",
+      apps: ["codex"],
+    });
+    const off = server("off", {
+      managed: true,
+      id: "off",
+      apps: { codex: entry({ present: false, enabled: false, status: "disabled" }) },
+    });
+    assert.equal(mcpPrimaryAction(off), null, "an app that is switched off has not drifted");
+    assert.equal(mcpPrimaryAction({ ...drifted, managed: false })?.kind, "reconnect");
   });
 
   it("colors the row by its worst problem, else its best live state", () => {

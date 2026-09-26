@@ -1,18 +1,19 @@
 /**
- * Shared plumbing for the Skills & MCP tabs: safe calls, the visible-only
- * overview loader, busy/optimistic keys, mutation toasts, and small pieces of
- * row chrome.
+ * Shared plumbing for the Skills & MCP tabs: the visible-only overview loader,
+ * background mutations with optimistic values, mutation toasts, and small
+ * pieces of row chrome.
  */
-import type {
-  AgentApp,
-  AgentAppInfo,
-  ExtensionMethodInput,
-  ExtensionMethodOutput,
-  MutationResult,
-  SkillsMcpMethods,
-} from "@t3tools/contracts";
+import type { AgentApp, AgentAppInfo, MutationResult, SkillsMcpMethods } from "@t3tools/contracts";
 import { AlertCircleIcon, RefreshCwIcon } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -35,26 +36,81 @@ import { cn } from "~/lib/utils";
 import type { ExtensionCallOutcome, ExtensionClient } from "../client";
 import {
   APP_LABEL,
+  APPS,
   appUnavailableReason,
   formatRelativeTime,
   type StatusTone,
 } from "./lists.logic";
 
 export type SkillsMcpClient = ExtensionClient<SkillsMcpMethods>;
-type Method = keyof SkillsMcpMethods & string;
 export type Outcome<Value> = ExtensionCallOutcome<Value>;
 
-/** `client.call` can reject (input encoding runs outside its try); fold that into an outcome. */
-export async function safeCall<Name extends Method>(
-  client: SkillsMcpClient,
-  method: Name,
-  input: ExtensionMethodInput<SkillsMcpMethods, Name>,
-): Promise<Outcome<ExtensionMethodOutput<SkillsMcpMethods, Name>>> {
-  try {
-    return await client.call(method, input);
-  } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) };
-  }
+export { APPS };
+
+/** Apps worth a column: available, or holding at least one row's entry. */
+export function visibleApps(
+  apps: readonly AgentAppInfo[] | undefined,
+  rows: readonly {
+    readonly apps: Partial<Record<AgentApp, { readonly present: boolean } | undefined>>;
+  }[],
+): AgentApp[] {
+  return APPS.filter(
+    (app) =>
+      apps?.some((info) => info.app === app && info.available) ||
+      rows.some((row) => row.apps[app]?.present),
+  );
+}
+
+/** Dialog state; the key remounts the dialog so each opening starts fresh. */
+export interface Opened<Value> {
+  readonly key: number;
+  readonly open: boolean;
+  readonly value: Value;
+}
+
+export function reopen<Value>(previous: Opened<Value> | null, value: Value): Opened<Value> {
+  return { key: (previous?.key ?? 0) + 1, open: true, value };
+}
+
+export function closed<Value>(previous: Opened<Value> | null): Opened<Value> | null {
+  return previous ? { ...previous, open: false } : null;
+}
+
+/**
+ * Handlers with stable identities that always run the latest render's
+ * version, so memoized rows can take them without re-rendering.
+ */
+export function useStableActions<Actions extends Record<string, (...args: never[]) => void>>(
+  actions: Actions,
+): Actions {
+  const ref = useRef(actions);
+  useLayoutEffect(() => {
+    ref.current = actions;
+  });
+  const [stable] = useState(() => {
+    const wrapped: Record<string, (...args: never[]) => void> = {};
+    for (const name of Object.keys(actions)) {
+      wrapped[name] = (...args: never[]) => ref.current[name]?.(...args);
+    }
+    return wrapped as Actions;
+  });
+  return stable;
+}
+
+/** Row keys that are expanded. */
+export function useExpandedSet(): {
+  readonly expanded: ReadonlySet<string>;
+  readonly toggle: (key: string) => void;
+} {
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  const toggle = useCallback((key: string) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
+  return { expanded, toggle };
 }
 
 // ---------------------------------------------------------------------------
@@ -143,42 +199,139 @@ export function useOverviewLoader<Value>(options: {
 }
 
 // ---------------------------------------------------------------------------
-// Busy keys with optional optimistic values
+// Mutations
 
-export interface BusyKeys {
-  readonly isBusy: (key: string) => boolean;
-  /** The value a pending toggle is heading to, if any. */
-  readonly optimistic: (key: string) => boolean | undefined;
-  /** Runs `task` unless `key` is already busy. */
-  readonly run: (key: string, task: () => Promise<unknown>, optimisticValue?: boolean) => void;
+export interface MutationLabels {
+  readonly failure: string;
+  /** Used when the server sends no message of its own. */
+  readonly success?: string;
 }
 
-export function useBusyKeys(): BusyKeys {
-  const [busy, setBusy] = useState<ReadonlyMap<string, boolean | null>>(() => new Map());
+export interface MutationStep {
+  readonly call: () => Promise<Outcome<MutationResult>>;
+  readonly labels: MutationLabels;
+}
+
+interface MutationEntry {
+  readonly running: boolean;
+  readonly value?: boolean | undefined;
+  /** The list data the settled value was set against; fresh data retires it. */
+  readonly settledOn?: unknown;
+}
+
+export interface Mutations {
+  /** True only while the key's own calls run (never during the reload after). */
+  readonly isBusy: (key: string) => boolean;
+  /**
+   * The value a toggle is heading to, held from the click until fresh data
+   * lands. On a row key, `false` means the row is being removed.
+   */
+  readonly optimistic: (key: string) => boolean | undefined;
+  /** Runs `task` unless `key` is already busy. */
+  readonly run: (key: string, task: () => Promise<unknown>) => void;
+  /**
+   * Runs the steps in order, toasting each. Once any call went through, the
+   * list reloads in the background and `onChanged` refreshes context and usage.
+   */
+  readonly mutate: (key: string, steps: readonly MutationStep[], optimistic?: boolean) => void;
+}
+
+/** Runs the steps in order, toasting each; `clean` means every call fully succeeded. */
+async function runSteps(steps: readonly MutationStep[]) {
+  let changed = false;
+  let clean = true;
+  for (const step of steps) {
+    const outcome = await step.call();
+    if (!reportMutation(outcome, step.labels)) clean = false;
+    if (outcome.ok) changed = true;
+  }
+  return { changed, clean };
+}
+
+/**
+ * Per-key mutations for a list. Rows unlock as soon as their calls return and
+ * keep the optimistic value until the reload replaces the data; the loader
+ * drops superseded responses, so an older reload never overwrites a newer one.
+ */
+export function useMutations(
+  options: {
+    readonly data?: unknown;
+    readonly reload?: (refresh?: boolean) => Promise<void>;
+    readonly onChanged?: () => void;
+  } = {},
+): Mutations {
+  const [entries, setEntries] = useState<ReadonlyMap<string, MutationEntry>>(() => new Map());
   const running = useRef(new Set<string>());
+  const latest = useRef(options);
+  useLayoutEffect(() => {
+    latest.current = options;
+  });
+
+  const start = useCallback((key: string, value?: boolean): boolean => {
+    if (running.current.has(key)) return false;
+    running.current.add(key);
+    const { data } = latest.current;
+    setEntries((previous) => {
+      const next = new Map<string, MutationEntry>();
+      for (const [other, entry] of previous) {
+        if (entry.running || entry.settledOn === data) next.set(other, entry);
+      }
+      return next.set(key, { running: true, value });
+    });
+    return true;
+  }, []);
+
+  const settle = useCallback((key: string, entry: MutationEntry | null) => {
+    running.current.delete(key);
+    setEntries((previous) => {
+      const next = new Map(previous);
+      if (entry) next.set(key, entry);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
 
   const run = useCallback(
-    (key: string, task: () => Promise<unknown>, optimisticValue?: boolean) => {
-      if (running.current.has(key)) return;
-      running.current.add(key);
-      setBusy((previous) => new Map(previous).set(key, optimisticValue ?? null));
-      void task().finally(() => {
-        running.current.delete(key);
-        setBusy((previous) => {
-          const next = new Map(previous);
-          next.delete(key);
-          return next;
-        });
-      });
+    (key: string, task: () => Promise<unknown>) => {
+      if (!start(key)) return;
+      void task().finally(() => settle(key, null));
     },
-    [],
+    [start, settle],
   );
 
-  return {
-    isBusy: (key) => busy.has(key),
-    optimistic: (key) => busy.get(key) ?? undefined,
-    run,
-  };
+  const mutate = useCallback(
+    (key: string, steps: readonly MutationStep[], value?: boolean) => {
+      if (!start(key, value)) return;
+      void runSteps(steps).then(
+        ({ changed, clean }) => {
+          const { data, reload, onChanged } = latest.current;
+          const keep = clean && value !== undefined;
+          settle(key, keep ? { running: false, value, settledOn: data } : null);
+          if (changed) {
+            void reload?.(false);
+            onChanged?.();
+          }
+        },
+        () => settle(key, null),
+      );
+    },
+    [start, settle],
+  );
+
+  // Stable between mutation changes, so memoized rows can take it as a prop.
+  const { data } = options;
+  return useMemo(
+    () => ({
+      isBusy: (key) => entries.get(key)?.running === true,
+      optimistic: (key) => {
+        const entry = entries.get(key);
+        return entry && (entry.running || entry.settledOn === data) ? entry.value : undefined;
+      },
+      run,
+      mutate,
+    }),
+    [entries, data, run, mutate],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -196,10 +349,7 @@ function failureLines(result: MutationResult): string {
  * Toasts the outcome of a mutation. Returns true only when the call went
  * through with no per-app failures.
  */
-export function reportMutation(
-  outcome: Outcome<MutationResult>,
-  labels: { readonly failure: string; readonly success?: string },
-): boolean {
+export function reportMutation(outcome: Outcome<MutationResult>, labels: MutationLabels): boolean {
   if (!outcome.ok) {
     toastManager.add({ type: "error", title: labels.failure, description: outcome.message });
     return false;
@@ -292,6 +442,21 @@ export function AppSwitch(props: {
   );
 }
 
+/** Read-only on/off for rows T3 does not manage; the tooltip says where the entry lives. */
+export function AppState(props: { app: AgentApp; enabled: boolean; origin: string | null }) {
+  return (
+    <WithReason reason={props.origin}>
+      <span
+        aria-label={`${APP_LABEL[props.app]} ${props.enabled ? "on" : "off"}`}
+        className="inline-flex items-center gap-1 text-[.65rem] text-muted-foreground"
+      >
+        <StatusDot tone={props.enabled ? "success" : "muted"} />
+        {props.enabled ? "on" : "off"}
+      </span>
+    </WithReason>
+  );
+}
+
 /** Claude/Codex checkboxes for install/adopt/add flows. */
 export function AppCheckboxes(props: {
   value: { readonly claude: boolean; readonly codex: boolean };
@@ -302,7 +467,7 @@ export function AppCheckboxes(props: {
 }) {
   return (
     <div className="flex flex-wrap items-center gap-3">
-      {(["claude", "codex"] as const).map((app) => {
+      {APPS.map((app) => {
         const reason =
           props.blocked?.[app] ?? (props.apps ? appUnavailableReason(props.apps, app) : null);
         return (
@@ -366,9 +531,9 @@ export function ConfirmDialog(props: {
 
 /** One line per app that could not be asked. */
 export function AppNotices({ apps }: { apps: readonly AgentAppInfo[] }) {
-  const reasons = (["claude", "codex"] as const)
-    .map((app) => appUnavailableReason(apps, app))
-    .filter((reason): reason is string => reason !== null);
+  const reasons = APPS.map((app) => appUnavailableReason(apps, app)).filter(
+    (reason): reason is string => reason !== null,
+  );
   if (reasons.length === 0) return null;
   return (
     <div className="space-y-1 border-b bg-warning/5 px-3 py-1.5 text-warning-foreground text-xs">

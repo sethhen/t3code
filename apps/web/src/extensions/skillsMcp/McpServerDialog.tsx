@@ -34,7 +34,7 @@ import {
   specToFormFields,
   toServerName,
 } from "./mcpForm.logic";
-import { AppCheckboxes, reportMutation, safeCall, type SkillsMcpClient } from "./shared";
+import { AppCheckboxes, reportMutation, type SkillsMcpClient } from "./shared";
 
 type PresetState =
   | { readonly status: "idle" }
@@ -97,7 +97,7 @@ export function McpServerDialog(props: {
 
   const loadPresets = async () => {
     setPresets({ status: "loading" });
-    const outcome = await safeCall(client, "mcp.presets", {});
+    const outcome = await client.call("mcp.presets", {});
     setPresets(
       outcome.ok
         ? { status: "ready", presets: outcome.value }
@@ -145,7 +145,7 @@ export function McpServerDialog(props: {
     const name = parsed.value.name;
     setSaving(true);
     setError(null);
-    const outcome = await safeCall(client, "mcp.mutate", parsed.value);
+    const outcome = await client.call("mcp.mutate", parsed.value);
     setSaving(false);
     reportMutation(outcome, {
       failure: row ? `Could not save ${name}` : `Could not add ${name}`,

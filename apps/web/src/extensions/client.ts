@@ -2,6 +2,7 @@
  * Typed client for fork extension methods. Calls ride the generic
  * `extension.call` RPC; results are decoded against the method's output schema
  * so panels work with real types, and failures come back as a plain message.
+ * `call` never rejects.
  */
 import { createEnvironmentRpcCommand } from "@t3tools/client-runtime/state/runtime";
 import {
@@ -87,10 +88,15 @@ export function useExtensionClient<Methods extends ExtensionMethods>(
         } catch (error) {
           return { ok: false, message: `Invalid input: ${String(error)}` };
         }
-        const result = await run({
-          environmentId,
-          input: { extension: spec.id, method, input: payload },
-        });
+        let result: Awaited<ReturnType<typeof run>>;
+        try {
+          result = await run({
+            environmentId,
+            input: { extension: spec.id, method, input: payload },
+          });
+        } catch (error) {
+          return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        }
         if (!AsyncResult.isSuccess(result)) {
           return { ok: false, message: failureMessage(result.cause) };
         }

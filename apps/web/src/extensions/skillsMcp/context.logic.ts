@@ -15,9 +15,7 @@ import type {
   UsageReport,
 } from "@t3tools/contracts";
 
-import { APP_LABEL, compareNames } from "./lists.logic";
-
-const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
+import { APP_LABEL, APPS, compareNames, type RowSection } from "./lists.logic";
 
 // ---------------------------------------------------------------------------
 // Formatting
@@ -50,15 +48,18 @@ export interface ContextSegment {
 
 export interface ContextSummary {
   readonly app: AgentApp;
-  readonly exact: boolean;
+  /** Only part of the thread was counted (Codex: MCP tools and skills), so there is no bar or window. */
+  readonly partial: boolean;
+  /** What an estimate covers, from the server. */
+  readonly note?: string;
   readonly model?: string;
   readonly baselineTokens: number;
   readonly windowTokens?: number;
-  /** "new thread 38k / 200k" (a leading ~ for estimates). */
+  /** "new thread 38k / 200k", "new thread ~38k / 200k" (estimate), "~58k MCP + skills" (partial). */
   readonly label: string;
-  /** Used categories then the compaction buffer; the rest of the bar is free. */
+  /** Used categories then the compaction buffer; the rest of the bar is free. Empty when partial. */
   readonly segments: readonly ContextSegment[];
-  /** Everything reported, including free space and deferred tools, for the breakdown list. */
+  /** Everything reported, including free space (not for a partial count) and deferred tools. */
   readonly categories: readonly ContextCategory[];
   readonly deferredTokens: number;
   readonly memoryFiles: AppContext["memoryFiles"];
@@ -70,6 +71,7 @@ function sum(values: readonly number[]): number {
 }
 
 export function contextSummary(app: AgentApp, context: AppContext): ContextSummary {
+  const partial = app === "codex" && !context.exact;
   const inWindow = context.categories.filter((category) => category.kind !== "deferred");
   const total =
     context.windowTokens && context.windowTokens > 0
@@ -77,7 +79,7 @@ export function contextSummary(app: AgentApp, context: AppContext): ContextSumma
       : Math.max(sum(inWindow.map((category) => category.tokens)), context.baselineTokens, 1);
   let left = 1;
   const segments: ContextSegment[] = [];
-  for (const kind of ["used", "buffer"] as const) {
+  for (const kind of partial ? [] : (["used", "buffer"] as const)) {
     for (const category of context.categories) {
       if (category.kind !== kind || !(category.tokens > 0)) continue;
       const share = Math.min(left, category.tokens / total);
@@ -86,16 +88,21 @@ export function contextSummary(app: AgentApp, context: AppContext): ContextSumma
     }
   }
   const approx = context.exact ? "" : "~";
-  const window = context.windowTokens ? ` / ${formatTokens(context.windowTokens)}` : "";
+  const window = context.windowTokens && !partial ? ` / ${formatTokens(context.windowTokens)}` : "";
   return {
     app,
-    exact: context.exact,
+    partial,
+    ...(context.note ? { note: context.note } : {}),
     ...(context.model ? { model: context.model } : {}),
     baselineTokens: context.baselineTokens,
-    ...(context.windowTokens ? { windowTokens: context.windowTokens } : {}),
-    label: `new thread ${approx}${formatTokens(context.baselineTokens)}${window}`,
+    ...(context.windowTokens && !partial ? { windowTokens: context.windowTokens } : {}),
+    label: partial
+      ? `~${formatTokens(context.baselineTokens)} MCP + skills`
+      : `new thread ${approx}${formatTokens(context.baselineTokens)}${window}`,
     segments,
-    categories: context.categories,
+    categories: partial
+      ? context.categories.filter((category) => category.kind !== "free")
+      : context.categories,
     deferredTokens: sum(
       context.categories.filter((category) => category.kind === "deferred").map((c) => c.tokens),
     ),
@@ -173,23 +180,30 @@ export interface ToolStat {
   readonly calls?: number;
 }
 
-/** Context cost and usage joined onto one row. Unknown parts stay undefined. */
+export interface AppCost {
+  readonly loaded: number;
+  readonly deferred: number;
+  /** False for a local estimate. */
+  readonly exact: boolean;
+}
+
+type PerApp<Value> = Partial<Record<AgentApp, Value>>;
+
+/** Context cost and usage joined onto one row, per app. Unknown parts stay undefined. */
 export interface RowStats {
-  /** Tokens sent with every request: the largest across apps (a thread runs in one app). */
+  /** Largest per-request cost across apps; for sorting only (a thread runs in one app). */
   readonly tokens?: number;
-  /** Tokens kept out of the window until searched for (MCP tool search). */
+  /** Largest deferred cost across apps; for sorting only. */
   readonly deferredTokens?: number;
-  /** False when any contributing app only estimated. */
-  readonly exact?: boolean;
-  readonly perAppTokens?: Partial<
-    Record<AgentApp, { readonly loaded: number; readonly deferred: number }>
-  >;
+  readonly perAppTokens?: PerApp<AppCost>;
   /** Calls in the usage window, summed over apps whose scan worked. */
   readonly calls?: number;
-  readonly perAppCalls?: Partial<Record<AgentApp, number>>;
+  readonly perAppCalls?: PerApp<number>;
   readonly lastUsedAt?: string;
-  /** Per bare tool name (MCP only). */
-  readonly tools?: ReadonlyMap<string, ToolStat>;
+  /** Every app the row is on in was scanned and saw zero calls. */
+  readonly unused?: true;
+  /** Per bare tool name, per app (MCP only). */
+  readonly tools?: ReadonlyMap<string, PerApp<ToolStat>>;
 }
 
 const EMPTY_STATS: RowStats = {};
@@ -210,17 +224,48 @@ function later(left: string | undefined, right: string | undefined): string | un
   return Date.parse(right) > Date.parse(left) ? right : left;
 }
 
-function mergeTool(tools: Map<string, ToolStat>, name: string, patch: ToolStat) {
+function mergeTool(
+  tools: Map<string, PerApp<ToolStat>>,
+  name: string,
+  app: AgentApp,
+  patch: ToolStat,
+) {
   const previous = tools.get(name) ?? {};
-  tools.set(name, {
-    ...previous,
-    ...(patch.tokens !== undefined
+  const current = previous[app] ?? {};
+  const calls = patch.calls === undefined ? {} : { calls: (current.calls ?? 0) + patch.calls };
+  tools.set(name, { ...previous, [app]: { ...current, ...patch, ...calls } });
+}
+
+/** Totals, plus the unused flag, from per-app costs and calls and the apps the row is on in. */
+function finishStats(
+  perAppTokens: PerApp<AppCost>,
+  perAppCalls: PerApp<number>,
+  onApps: readonly AgentApp[],
+  extra: { lastUsedAt?: string | undefined; tools?: RowStats["tools"] },
+): RowStats {
+  const costs = Object.values(perAppTokens);
+  const scanned = Object.values(perAppCalls);
+  const unused = onApps.length > 0 && onApps.every((app) => perAppCalls[app] === 0);
+  return {
+    ...(costs.length > 0
       ? {
-          tokens: Math.max(previous.tokens ?? 0, patch.tokens),
-          loaded: patch.loaded ?? previous.loaded,
+          tokens: Math.max(...costs.map((cost) => cost.loaded)),
+          deferredTokens: Math.max(...costs.map((cost) => cost.deferred)),
+          perAppTokens,
         }
       : {}),
-    ...(patch.calls !== undefined ? { calls: (previous.calls ?? 0) + patch.calls } : {}),
+    ...(scanned.length > 0 ? { calls: sum(scanned), perAppCalls } : {}),
+    ...(unused ? { unused } : {}),
+    ...(extra.lastUsedAt ? { lastUsedAt: extra.lastUsedAt } : {}),
+    ...(extra.tools && extra.tools.size > 0 ? { tools: extra.tools } : {}),
+  };
+}
+
+/** Apps where the server is configured, switched on and not project-disabled. */
+function mcpOnApps(row: McpServerRow): AgentApp[] {
+  return APPS.filter((app) => {
+    const entry = row.apps[app];
+    return entry?.present === true && entry.enabled && entry.status !== "disabled";
   });
 }
 
@@ -230,58 +275,41 @@ function mcpRowStats(
   usage: UsageReport | null,
 ): RowStats {
   const names = mcpNames(row);
-  const tools = new Map<string, ToolStat>();
-  const perAppTokens: Partial<Record<AgentApp, { loaded: number; deferred: number }>> = {};
-  const perAppCalls: Partial<Record<AgentApp, number>> = {};
-  let exact = true;
+  const tools = new Map<string, PerApp<ToolStat>>();
+  const perAppTokens: PerApp<AppCost> = {};
+  const perAppCalls: PerApp<number> = {};
   let lastUsedAt: string | undefined;
-  let costs = 0;
-  let scans = 0;
 
   for (const app of APPS) {
     const appContext = usableContext(context, app);
-    if (appContext && row.apps[app]) {
-      const cost: McpContextCost | undefined = findNamed(appContext.mcpServers, names);
-      if (cost) {
-        costs += 1;
-        exact &&= appContext.exact;
-        perAppTokens[app] = { loaded: cost.loadedTokens, deferred: cost.deferredTokens };
-        for (const tool of cost.tools) {
-          mergeTool(tools, bareToolName(tool.name, cost.name), {
-            tokens: tool.tokens,
-            loaded: tool.loaded,
-          });
-        }
+    const cost: McpContextCost | undefined =
+      appContext && row.apps[app] ? findNamed(appContext.mcpServers, names) : undefined;
+    if (appContext && cost) {
+      perAppTokens[app] = {
+        loaded: cost.loadedTokens,
+        deferred: cost.deferredTokens,
+        exact: appContext.exact,
+      };
+      for (const tool of cost.tools) {
+        mergeTool(tools, bareToolName(tool.name, cost.name), app, {
+          tokens: tool.tokens,
+          loaded: tool.loaded,
+        });
       }
     }
     const appUsage = usableUsage(usage, app);
-    if (appUsage) {
-      scans += 1;
-      const used = findNamed(appUsage.mcpServers, names);
+    const used = appUsage ? findNamed(appUsage.mcpServers, names) : undefined;
+    if (appUsage && (row.apps[app] || used)) {
       perAppCalls[app] = used?.calls ?? 0;
-      if (used) {
-        lastUsedAt = later(lastUsedAt, used.lastUsedAt);
-        for (const tool of used.tools) {
-          mergeTool(tools, bareToolName(tool.name, used.name), { calls: tool.calls });
-        }
+      lastUsedAt = later(lastUsedAt, used?.lastUsedAt);
+      for (const tool of used?.tools ?? []) {
+        mergeTool(tools, bareToolName(tool.name, used?.name ?? row.name), app, {
+          calls: tool.calls,
+        });
       }
     }
   }
-
-  const loaded = Object.values(perAppTokens);
-  return {
-    ...(costs > 0
-      ? {
-          tokens: Math.max(...loaded.map((cost) => cost.loaded)),
-          deferredTokens: Math.max(...loaded.map((cost) => cost.deferred)),
-          exact,
-          perAppTokens,
-        }
-      : {}),
-    ...(scans > 0 ? { calls: sum(Object.values(perAppCalls)), perAppCalls } : {}),
-    ...(lastUsedAt ? { lastUsedAt } : {}),
-    ...(tools.size > 0 ? { tools } : {}),
-  };
+  return finishStats(perAppTokens, perAppCalls, mcpOnApps(row), { lastUsedAt, tools });
 }
 
 function skillRowStats(
@@ -290,33 +318,24 @@ function skillRowStats(
   usage: UsageReport | null,
 ): RowStats {
   const names = skillNames(row);
-  const perAppTokens: Partial<Record<AgentApp, { loaded: number; deferred: number }>> = {};
-  const perAppCalls: Partial<Record<AgentApp, number>> = {};
-  let exact = true;
+  const perAppTokens: PerApp<AppCost> = {};
+  const perAppCalls: PerApp<number> = {};
   let lastUsedAt: string | undefined;
   for (const app of APPS) {
     const appContext = usableContext(context, app);
     const cost = appContext && row.apps[app] ? findNamed(appContext.skills, names) : undefined;
     if (appContext && cost) {
-      exact &&= appContext.exact;
-      perAppTokens[app] = { loaded: cost.tokens, deferred: 0 };
+      perAppTokens[app] = { loaded: cost.tokens, deferred: 0, exact: appContext.exact };
     }
     const appUsage = usableUsage(usage, app);
-    if (appUsage) {
-      const used = findNamed(appUsage.skills, names);
+    const used = appUsage ? findNamed(appUsage.skills, names) : undefined;
+    if (appUsage && (row.apps[app] || used)) {
       perAppCalls[app] = used?.calls ?? 0;
       lastUsedAt = later(lastUsedAt, used?.lastUsedAt);
     }
   }
-  const loaded = Object.values(perAppTokens);
-  const scanned = Object.values(perAppCalls);
-  return {
-    ...(loaded.length > 0
-      ? { tokens: Math.max(...loaded.map((cost) => cost.loaded)), exact, perAppTokens }
-      : {}),
-    ...(scanned.length > 0 ? { calls: sum(scanned), perAppCalls } : {}),
-    ...(lastUsedAt ? { lastUsedAt } : {}),
-  };
+  const onApps = APPS.filter((app) => row.apps[app]?.present && row.apps[app]?.enabled);
+  return finishStats(perAppTokens, perAppCalls, onApps, { lastUsedAt });
 }
 
 function joinRows<Row extends { readonly key: string }>(
@@ -353,18 +372,39 @@ export function statsFor(stats: ReadonlyMap<string, RowStats>, key: string): Row
 }
 
 // ---------------------------------------------------------------------------
-// Chips
+// Chips - one number per app, never mixed
 
-/** "3.2k tok" (or "~3.2k tok" for estimates); null when unknown. */
-export function tokenChip(stats: RowStats): string | null {
-  if (stats.tokens === undefined) return null;
-  return `${stats.exact === false ? "~" : ""}${formatTokens(stats.tokens)} tok`;
+export const APP_INITIAL: Readonly<Record<AgentApp, string>> = { claude: "C", codex: "X" };
+
+/** "C 12k · X 45k" across the shown apps (no initials when only one app shows); null when empty. */
+function perAppText(
+  apps: readonly AgentApp[],
+  text: (app: AgentApp) => string | null | undefined,
+): string | null {
+  const parts = apps.flatMap((app) => {
+    const value = text(app);
+    if (!value) return [];
+    return [apps.length > 1 ? `${APP_INITIAL[app]} ${value}` : value];
+  });
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-/** "+1.1k deferred" when tool search keeps some definitions out of the window. */
-export function deferredChip(stats: RowStats): string | null {
-  if (!stats.deferredTokens) return null;
-  return `+${formatTokens(stats.deferredTokens)} deferred`;
+/** "C 12k · X 45k tok": tokens each request carries, per app. */
+export function tokenChip(stats: RowStats, apps: readonly AgentApp[]): string | null {
+  const text = perAppText(apps, (app) => {
+    const cost = stats.perAppTokens?.[app];
+    return cost ? formatTokens(cost.loaded) : null;
+  });
+  return text ? `${text} tok` : null;
+}
+
+/** "C +1.1k deferred" when tool search keeps definitions out of the window. */
+export function deferredChip(stats: RowStats, apps: readonly AgentApp[]): string | null {
+  const text = perAppText(apps, (app) => {
+    const deferred = stats.perAppTokens?.[app]?.deferred ?? 0;
+    return deferred > 0 ? `+${formatTokens(deferred)}` : null;
+  });
+  return text ? `${text} deferred` : null;
 }
 
 /** "14 calls · 7d"; null until usage is loaded. */
@@ -373,7 +413,29 @@ export function usageChip(stats: RowStats, days: number): string | null {
   return `${formatCalls(stats.calls)} · ${days}d`;
 }
 
-/** Tooltip text: per-app tokens and calls. */
+/** One tool's cost and calls in the given apps: "C 1.2k tok · X 900 deferred", "C 3 calls". */
+export function toolChips(
+  stat: PerApp<ToolStat> | undefined,
+  apps: readonly AgentApp[],
+): { cost: string | null; deferredOnly: boolean; calls: string | null } {
+  const costApps = apps.filter((app) => stat?.[app]?.tokens !== undefined);
+  return {
+    cost: perAppText(apps, (app) => {
+      const tool = stat?.[app];
+      if (tool?.tokens === undefined) return null;
+      return `${formatTokens(tool.tokens)} ${tool.loaded === false ? "deferred" : "tok"}`;
+    }),
+    deferredOnly: costApps.length > 0 && costApps.every((app) => stat?.[app]?.loaded === false),
+    calls: perAppText(apps, (app) => {
+      const calls = stat?.[app]?.calls;
+      return calls === undefined ? null : formatCalls(calls);
+    }),
+  };
+}
+
+const exactNumber = (value: number) => Math.round(value).toLocaleString("en-US");
+
+/** Tooltip and detail lines with exact numbers: "Claude: ~3,214 tok per request, 1,100 deferred, 2 calls in 7d". */
 export function statsDetail(stats: RowStats, days: number): string[] {
   const lines: string[] = [];
   for (const app of APPS) {
@@ -381,8 +443,8 @@ export function statsDetail(stats: RowStats, days: number): string[] {
     const calls = stats.perAppCalls?.[app];
     const parts: string[] = [];
     if (cost) {
-      parts.push(`${formatTokens(cost.loaded)} tok per request`);
-      if (cost.deferred > 0) parts.push(`${formatTokens(cost.deferred)} deferred`);
+      parts.push(`${cost.exact ? "" : "~"}${exactNumber(cost.loaded)} tok per request`);
+      if (cost.deferred > 0) parts.push(`${exactNumber(cost.deferred)} deferred`);
     }
     if (calls !== undefined) parts.push(`${formatCalls(calls)} in ${days}d`);
     if (parts.length > 0) lines.push(`${APP_LABEL[app]}: ${parts.join(", ")}`);
@@ -412,7 +474,8 @@ const descending = (left: number | undefined, right: number | undefined): number
 
 /**
  * Flat order for the name / context / usage sorts (the status sort keeps its
- * sections). Unknown values sink to the bottom.
+ * sections). Context cost uses each row's most expensive app. Unknown values
+ * sink to the bottom.
  */
 export function sortRowsBy<Row extends { readonly key: string; readonly name: string }>(
   rows: readonly Row[],
@@ -435,29 +498,38 @@ export function sortRowsBy<Row extends { readonly key: string; readonly name: st
   });
 }
 
-/** Switched on for at least one app. */
-export function mcpIsOn(row: McpServerRow): boolean {
-  return APPS.some((app) => {
-    const entry = row.apps[app];
-    return entry !== undefined && entry.enabled && entry.status !== "disabled";
-  });
+/** The status sort keeps the tab's own sections; any other sort is one flat list. */
+export function arrangeRows<Row extends { readonly key: string; readonly name: string }>(
+  rows: readonly Row[],
+  mode: SortMode,
+  stats: ReadonlyMap<string, RowStats>,
+  byStatus: (rows: readonly Row[]) => RowSection<Row>[],
+): RowSection<Row>[] {
+  if (mode === "status") return byStatus(rows);
+  return [{ id: "sorted", label: "", rows: sortRowsBy(rows, mode, stats) }];
 }
 
-export function skillIsOn(row: SkillRow): boolean {
-  return APPS.some((app) => row.apps[app]?.enabled === true);
+/** Rows the Unused filter keeps (empty until usage is loaded). */
+export function unusedRows<Row extends { readonly key: string }>(
+  rows: readonly Row[],
+  stats: ReadonlyMap<string, RowStats>,
+): Row[] {
+  return rows.filter((row) => statsFor(stats, row.key).unused === true);
 }
 
-/** On somewhere, and usage says zero calls. False while usage is unknown. */
-export function isUnused(on: boolean, stats: RowStats): boolean {
-  return on && stats.calls === 0;
-}
-
-/** Tokens the unused rows cost a new thread (largest app per row), for the filter summary. */
-export function unusedTokens(
+/** What the unused rows cost a new thread, per app: "C 12k · X 8k tok". */
+export function unusedCost(
   rows: readonly { readonly key: string }[],
   stats: ReadonlyMap<string, RowStats>,
-): number {
-  return sum(rows.map((row) => statsFor(stats, row.key).tokens ?? 0));
+  apps: readonly AgentApp[],
+): string | null {
+  const total = (app: AgentApp) =>
+    sum(rows.map((row) => statsFor(stats, row.key).perAppTokens?.[app]?.loaded ?? 0));
+  const text = perAppText(apps, (app) => {
+    const tokens = total(app);
+    return tokens > 0 ? formatTokens(tokens) : null;
+  });
+  return text ? `${text} tok` : null;
 }
 
 /** "Scanned 412 sessions" style footnote for the usage window. */

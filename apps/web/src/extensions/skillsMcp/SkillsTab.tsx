@@ -11,17 +11,8 @@ import type {
   SkillsMutation,
   SkillsOverview,
 } from "@t3tools/contracts";
-import { ChevronRightIcon, MoreHorizontalIcon, PlusIcon } from "lucide-react";
-import {
-  type ReactNode,
-  memo,
-  useCallback,
-  useDeferredValue,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { ChevronRightIcon, InfoIcon, MoreHorizontalIcon, PlusIcon } from "lucide-react";
+import { memo, useDeferredValue, useMemo, useState } from "react";
 
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
@@ -36,31 +27,40 @@ import {
   DialogTitle,
 } from "~/components/ui/dialog";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
-import { ScrollArea } from "~/components/ui/scroll-area";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 
 import {
-  formatTokens,
-  isUnused,
+  arrangeRows,
   joinSkillStats,
   type RowStats,
-  skillIsOn,
-  sortRowsBy,
   statsDetail,
   statsFor,
   tokenChip,
-  unusedTokens,
+  unusedCost,
+  unusedRows,
   usageChip,
-  usageFootnote,
 } from "./context.logic";
 import {
+  AppCell,
   Chip,
+  ColumnHeader,
+  CountLabel,
+  ExpandButton,
   FacetMenu,
+  FOCUS_RING,
+  Hint,
+  ListBody,
   type ListTabProps,
+  ListRow,
   RefreshButton,
+  RefreshFailed,
   SearchField,
+  Sections,
   SortMenu,
   UsageControls,
+  UsageFootnote,
+  UsageStatus,
 } from "./listControls";
 import {
   ALL_FACET,
@@ -68,7 +68,6 @@ import {
   appUnavailableReason,
   filterSkills,
   formatRelativeTime,
-  type RowSection,
   resolveFacet,
   sectionSkills,
   skillAdoptPath,
@@ -78,357 +77,146 @@ import {
   skillToggleBlock,
 } from "./lists.logic";
 import {
+  APPS,
   AppCheckboxes,
   AppNotices,
-  AppSwitch,
   CheckedAgo,
   ConfirmDialog,
   EmptyState,
-  ListPlaceholder,
-  LoadError,
+  type Mutations,
+  type Opened,
   RowSpinner,
-  SectionLabel,
   WithReason,
-  reportMutation,
-  safeCall,
-  useBusyKeys,
+  closed,
+  reopen,
+  useExpandedSet,
+  useMutations,
   useOverviewLoader,
+  useStableActions,
+  visibleApps,
 } from "./shared";
 import { SkillInstallDialog } from "./SkillInstallDialog";
 
-const APPS = ["claude", "codex"] as const satisfies readonly AgentApp[];
 const EMPTY_SKILLS: readonly SkillRow[] = [];
-
-type SkillRowAction =
-  | { readonly type: "expand"; readonly row: SkillRow }
-  | {
-      readonly type: "set-enabled";
-      readonly row: SkillRow;
-      readonly app: AgentApp;
-      readonly enabled: boolean;
-    }
-  | { readonly type: "update"; readonly row: SkillRow }
-  | { readonly type: "uninstall"; readonly row: SkillRow }
-  | { readonly type: "adopt"; readonly row: SkillRow };
-
-interface MutationStep {
-  readonly input: SkillsMutation;
-  readonly labels: { readonly failure: string; readonly success?: string };
-}
+const SOURCE_PREFIX = { github: "GitHub ", zip: "Zip ", plugin: "Plugin ", local: "" } as const;
 
 type Confirm =
   | { readonly kind: "uninstall"; readonly row: SkillRow }
   | { readonly kind: "delete-backup"; readonly backup: SkillBackup };
 
-interface Opened<Value> {
-  readonly key: number;
-  readonly open: boolean;
-  readonly value: Value;
-}
-
-function reopen<Value>(previous: Opened<Value> | null, value: Value): Opened<Value> {
-  return { key: (previous?.key ?? 0) + 1, open: true, value };
-}
-
 export function SkillsTab(props: ListTabProps) {
   const { client, scopeKey, cwd, active, view, viewActions, context, usage, onChanged } = props;
-  const overview = useOverviewLoader<SkillsOverview>({
+  const { data, error, loading, reload } = useOverviewLoader<SkillsOverview>({
     active,
     key: scopeKey,
-    fetch: () => safeCall(client, "skills.list", cwd ? { cwd } : {}),
+    fetch: () => client.call("skills.list", cwd ? { cwd } : {}),
   });
-  const { data, error, loading, reload } = overview;
-  const busy = useBusyKeys();
-  const runBusy = busy.run;
+  const mutations = useMutations({ data, reload, onChanged });
+  const { expanded, toggle } = useExpandedSet();
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [facetChoice, setFacetChoice] = useState(ALL_FACET);
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [adopt, setAdopt] = useState<Opened<SkillRow> | null>(null);
   const [install, setInstall] = useState<Opened<null> | null>(null);
 
   const all = data?.skills ?? EMPTY_SKILLS;
+  const columns = useMemo(() => visibleApps(data?.apps, all), [data, all]);
   const stats = useMemo(() => joinSkillStats(all, context, usage), [all, context, usage]);
   const facets = useMemo(() => skillFacets(all), [all]);
   const facet = resolveFacet(facets, facetChoice);
   const updates = useMemo(() => all.filter((row) => row.updateAvailable && row.id).length, [all]);
   const installedNames = useMemo(() => new Set(all.map((row) => row.name.toLowerCase())), [all]);
-  const unusedRows = useMemo(
-    () =>
-      usage
-        ? all.filter((row) => isUnused(skillIsOn(row), statsFor(stats, row.key)))
-        : EMPTY_SKILLS,
+  const unused = useMemo(
+    () => (usage ? unusedRows(all, stats) : EMPTY_SKILLS),
     [all, stats, usage],
-  );
-  const unusedCost = useMemo(() => unusedTokens(unusedRows, stats), [unusedRows, stats]);
-  const matched = useMemo(
-    () => filterSkills(all, deferredQuery).filter((row) => skillFacetMatches(row, facet)),
-    [all, deferredQuery, facet],
   );
   const unusedOnly = view.unusedOnly && usage !== null;
   const shown = useMemo(
     () =>
-      unusedOnly
-        ? matched.filter((row) => isUnused(skillIsOn(row), statsFor(stats, row.key)))
-        : matched,
-    [matched, unusedOnly, stats],
-  );
-  const sort = view.sort;
-  const sections = useMemo<RowSection<SkillRow>[]>(() => {
-    if (sort === "status") return sectionSkills(shown);
-    return [{ id: "sorted", label: "", rows: sortRowsBy(shown, sort, stats) }];
-  }, [shown, sort, stats]);
-  const apps = data?.apps;
-  const columns = useMemo<readonly AgentApp[]>(
-    () =>
-      APPS.filter(
-        (app) =>
-          (apps ?? []).some((info) => info.app === app && info.available) ||
-          all.some((row) => row.apps[app]?.present),
+      filterSkills(all, deferredQuery).filter(
+        (row) =>
+          skillFacetMatches(row, facet) &&
+          mutations.optimistic(row.key) !== false &&
+          (!unusedOnly || stats.get(row.key)?.unused === true),
       ),
-    [apps, all],
+    [all, deferredQuery, facet, mutations, unusedOnly, stats],
+  );
+  const sections = useMemo(
+    () => arrangeRows(shown, view.sort, stats, sectionSkills),
+    [shown, view.sort, stats],
   );
 
-  const mutate = useCallback(
-    (busyKey: string, steps: readonly MutationStep[], optimistic?: boolean) => {
-      runBusy(
-        busyKey,
-        async () => {
-          let changed = false;
-          for (const step of steps) {
-            const outcome = await safeCall(client, "skills.mutate", step.input);
-            reportMutation(outcome, step.labels);
-            if (outcome.ok) changed = true;
-          }
-          await reload(false);
-          if (changed) onChanged();
-        },
-        optimistic,
+  const step = (input: SkillsMutation, failure: string, success?: string) => ({
+    call: () => client.call("skills.mutate", input),
+    labels: { failure, ...(success ? { success } : {}) },
+  });
+  const actions = useStableActions({
+    expand: toggle,
+    toggle: (row: SkillRow, app: AgentApp, enabled: boolean) => {
+      if (!row.id) return;
+      const verb = enabled ? "enable" : "disable";
+      mutations.mutate(
+        `${row.key}:${app}`,
+        [
+          step(
+            { action: "setEnabled", id: row.id, app, enabled },
+            `Could not ${verb} ${row.name} for ${APP_LABEL[app]}`,
+          ),
+        ],
+        enabled,
       );
     },
-    [runBusy, client, reload, onChanged],
-  );
-
-  const handleAction = (action: SkillRowAction) => {
-    const { row } = action;
-    switch (action.type) {
-      case "expand":
-        setExpanded((previous) => {
-          const next = new Set(previous);
-          if (next.has(row.key)) next.delete(row.key);
-          else next.add(row.key);
-          return next;
-        });
-        return;
-      case "set-enabled": {
-        if (!row.id) return;
-        const verb = action.enabled ? "enable" : "disable";
-        mutate(
-          `${row.key}:${action.app}`,
-          [
-            {
-              input: { action: "setEnabled", id: row.id, app: action.app, enabled: action.enabled },
-              labels: { failure: `Could not ${verb} ${row.name} for ${APP_LABEL[action.app]}` },
-            },
-          ],
-          action.enabled,
-        );
-        return;
-      }
-      case "update":
-        if (!row.id) return;
-        mutate(row.key, [
-          {
-            input: { action: "update", id: row.id },
-            labels: { failure: `Could not update ${row.name}`, success: `Updated ${row.name}` },
-          },
-        ]);
-        return;
-      case "uninstall":
-        setConfirm({ kind: "uninstall", row });
-        return;
-      case "adopt":
-        setAdopt((previous) => reopen(previous, row));
-        return;
-    }
-  };
-  const actionRef = useRef(handleAction);
-  useLayoutEffect(() => {
-    actionRef.current = handleAction;
+    update: (row: SkillRow) => {
+      if (!row.id) return;
+      mutations.mutate(row.key, [
+        step(
+          { action: "update", id: row.id },
+          `Could not update ${row.name}`,
+          `Updated ${row.name}`,
+        ),
+      ]);
+    },
+    uninstall: (row: SkillRow) => setConfirm({ kind: "uninstall", row }),
+    adopt: (row: SkillRow) => setAdopt((previous) => reopen(previous, row)),
   });
-  const onAction = useCallback((action: SkillRowAction) => actionRef.current(action), []);
 
   const openInstall = () => setInstall((previous) => reopen(previous, null));
-  const checkUpdates = () =>
-    mutate("check-updates", [
-      { input: { action: "checkUpdates" }, labels: { failure: "Could not check for updates" } },
-    ]);
-  const updateAll = () =>
-    mutate("update-all", [
-      {
-        input: { action: "update" },
-        labels: { failure: "Some skills could not be updated", success: "Skills updated" },
-      },
-    ]);
-  const refresh = () => {
-    void reload(true);
-    props.onRefreshContext();
-  };
   const clearFilters = () => {
     setQuery("");
     setFacetChoice(ALL_FACET);
     if (view.unusedOnly) viewActions.setUnusedOnly(false);
   };
+  const backupStep = (backup: SkillBackup, restore: boolean) =>
+    restore
+      ? step(
+          { action: "restoreBackup", backupId: backup.id },
+          `Could not restore ${backup.skillName}`,
+          `Restored ${backup.skillName}`,
+        )
+      : step(
+          { action: "deleteBackup", backupId: backup.id },
+          `Could not delete the ${backup.skillName} backup`,
+        );
   const runConfirm = () => {
     const target = confirm;
     setConfirm(null);
-    if (!target) return;
-    if (target.kind === "uninstall") {
-      const { row } = target;
-      if (!row.id) return;
-      mutate(row.key, [
-        {
-          input: { action: "uninstall", id: row.id },
-          labels: {
-            failure: `Could not uninstall ${row.name}`,
-            success: `Uninstalled ${row.name}`,
-          },
-        },
-      ]);
+    if (target?.kind === "delete-backup") {
+      mutations.mutate(`backup:${target.backup.id}`, [backupStep(target.backup, false)]);
       return;
     }
-    const { backup } = target;
-    mutate(`backup:${backup.id}`, [
-      {
-        input: { action: "deleteBackup", backupId: backup.id },
-        labels: { failure: `Could not delete the ${backup.skillName} backup` },
-      },
-    ]);
+    const row = target?.row;
+    if (!row?.id) return;
+    const steps = [
+      step(
+        { action: "uninstall", id: row.id },
+        `Could not uninstall ${row.name}`,
+        `Uninstalled ${row.name}`,
+      ),
+    ];
+    mutations.mutate(row.key, steps, false);
   };
-  const restoreBackup = (backup: SkillBackup) =>
-    mutate(`backup:${backup.id}`, [
-      {
-        input: { action: "restoreBackup", backupId: backup.id },
-        labels: {
-          failure: `Could not restore ${backup.skillName}`,
-          success: `Restored ${backup.skillName}`,
-        },
-      },
-    ]);
-
-  let body: ReactNode;
-  if (data === null) {
-    body = error ? (
-      <LoadError message={error} onRetry={() => void reload(true)} />
-    ) : (
-      <ListPlaceholder rows={6} />
-    );
-  } else {
-    let list: ReactNode;
-    if (all.length === 0) {
-      list = (
-        <EmptyState
-          title="No skills"
-          description="Install one from skills.sh, a GitHub repository or a zip file."
-        >
-          <Button size="xs" variant="outline" onClick={openInstall}>
-            <PlusIcon />
-            Install skill
-          </Button>
-        </EmptyState>
-      );
-    } else if (shown.length === 0) {
-      list = (
-        <EmptyState
-          title="No matches"
-          description="Nothing matches the current search and filters."
-        >
-          <Button size="xs" variant="outline" onClick={clearFilters}>
-            Clear filters
-          </Button>
-        </EmptyState>
-      );
-    } else {
-      list = (
-        <>
-          <div className="flex items-center gap-1.5 border-b px-2 py-1 text-[.65rem] text-muted-foreground">
-            <span className="min-w-0 flex-1 pl-4.5">Skill</span>
-            {columns.map((app) => (
-              <span key={app} className="w-9 shrink-0 text-center">
-                {APP_LABEL[app]}
-              </span>
-            ))}
-            <span className="w-6 shrink-0" />
-          </div>
-          {sections.map((section) => (
-            <section key={section.id}>
-              {section.label ? (
-                <SectionLabel className="px-2">
-                  {section.label} · {section.rows.length}
-                </SectionLabel>
-              ) : null}
-              <ul>
-                {section.rows.map((row) => (
-                  <SkillRowView
-                    key={row.key}
-                    row={row}
-                    stats={statsFor(stats, row.key)}
-                    days={view.days}
-                    showUsage={view.showUsage}
-                    expanded={expanded.has(row.key)}
-                    apps={data.apps}
-                    columns={columns}
-                    busyRow={busy.isBusy(row.key)}
-                    busyClaude={busy.isBusy(`${row.key}:claude`)}
-                    busyCodex={busy.isBusy(`${row.key}:codex`)}
-                    optimisticClaude={busy.optimistic(`${row.key}:claude`)}
-                    optimisticCodex={busy.optimistic(`${row.key}:codex`)}
-                    onAction={onAction}
-                  />
-                ))}
-              </ul>
-            </section>
-          ))}
-          {usage && view.showUsage ? (
-            <div className="px-2 pt-3 text-[.65rem] text-muted-foreground/70">
-              Use counts: {usageFootnote(usage)}
-            </div>
-          ) : null}
-        </>
-      );
-    }
-    body = (
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="@container/skill-list pb-3">
-          {list}
-          <Backups
-            backups={data.backups}
-            isBusy={(id) => busy.isBusy(`backup:${id}`)}
-            onRestore={restoreBackup}
-            onDelete={(backup) => setConfirm({ kind: "delete-backup", backup })}
-          />
-          <StorageFooter storageDir={data.storageDir} appDirs={data.appDirs} />
-        </div>
-      </ScrollArea>
-    );
-  }
-
-  const confirmCopy =
-    confirm?.kind === "uninstall"
-      ? {
-          title: `Uninstall ${confirm.row.name}?`,
-          description:
-            "Removes it from Claude and Codex. A backup is taken first; restore it any time under Backups.",
-          label: "Uninstall",
-        }
-      : confirm?.kind === "delete-backup"
-        ? {
-            title: `Delete the ${confirm.backup.skillName} backup?`,
-            description: "The backup folder is deleted for good.",
-            label: "Delete backup",
-          }
-        : { title: "", description: "", label: "" };
+  const checking = mutations.isBusy("check-updates") || mutations.isBusy("update-all");
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -437,63 +225,130 @@ export function SkillsTab(props: ListTabProps) {
           <SearchField value={query} onChange={setQuery} placeholder="Search skills" />
           <FacetMenu facets={facets} value={facet} total={all.length} onChange={setFacetChoice} />
           <SortMenu view={view} actions={viewActions} />
-          <RefreshButton refreshing={loading} onClick={refresh} label="Refresh skills" />
+          <RefreshButton
+            refreshing={loading || checking}
+            onClick={() => {
+              void reload(true);
+              props.onRefreshContext();
+            }}
+            label="Refresh skills"
+          />
+          <Menu>
+            <MenuTrigger
+              render={<Button size="icon-xs" variant="ghost" aria-label="More skill actions" />}
+            >
+              <MoreHorizontalIcon />
+            </MenuTrigger>
+            <MenuPopup align="end" className="w-48">
+              <MenuItem
+                disabled={data === null || checking}
+                onClick={() =>
+                  mutations.mutate("check-updates", [
+                    step({ action: "checkUpdates" }, "Could not check for updates"),
+                  ])
+                }
+              >
+                Check for updates
+              </MenuItem>
+              {updates > 0 ? (
+                <MenuItem
+                  disabled={checking}
+                  onClick={() =>
+                    mutations.mutate("update-all", [
+                      step(
+                        { action: "update" },
+                        "Some skills could not be updated",
+                        "Skills updated",
+                      ),
+                    ])
+                  }
+                >
+                  Update all ({updates})
+                </MenuItem>
+              ) : null}
+            </MenuPopup>
+          </Menu>
           <Button size="xs" variant="outline" onClick={openInstall}>
             <PlusIcon />
             Install
           </Button>
         </div>
         <div className="flex min-h-5 items-center gap-2 text-[.7rem] text-muted-foreground">
-          <span className="shrink-0 tabular-nums">
-            {shown.length === all.length ? all.length : `${shown.length} of ${all.length}`}{" "}
-            {all.length === 1 ? "skill" : "skills"}
-          </span>
+          <CountLabel shown={shown.length} total={all.length} noun={["skill", "skills"]} />
           {data ? <CheckedAgo iso={data.checkedAt} visible={active} /> : null}
-          <Button
-            size="micro"
-            variant="ghost"
-            disabled={data === null || busy.isBusy("check-updates")}
-            onClick={checkUpdates}
-          >
-            {busy.isBusy("check-updates") ? <RowSpinner /> : null}
-            Check for updates
-          </Button>
-          {updates > 0 ? (
-            <Button
-              size="micro"
-              variant="warning-outline"
-              disabled={busy.isBusy("update-all")}
-              onClick={updateAll}
-            >
-              Update all ({updates})
-            </Button>
-          ) : null}
-          <span className="min-w-0 flex-1 truncate">
-            {props.usageLoading && view.showUsage ? "Loading usage…" : null}
-            {!props.usageLoading && props.usageError && view.showUsage
-              ? `Usage unavailable: ${props.usageError}`
-              : null}
-            {usage && unusedRows.length > 0 && !props.usageLoading
-              ? `${unusedRows.length} unused${unusedCost > 0 ? ` · ${formatTokens(unusedCost)} tok` : ""}`
-              : null}
-          </span>
+          {data ? <StorageInfo storageDir={data.storageDir} appDirs={data.appDirs} /> : null}
+          <UsageStatus
+            view={view}
+            usage={usage}
+            loading={props.usageLoading}
+            error={props.usageError}
+            unused={unused.length}
+            cost={unusedCost(unused, stats, columns)}
+          />
           <UsageControls view={view} actions={viewActions} noun="skills" />
         </div>
         {data ? <AppNotices apps={data.apps} /> : null}
-        {data && error ? (
-          <div className="truncate text-[.7rem] text-destructive-foreground">
-            Last refresh failed: {error}
-          </div>
-        ) : null}
+        {data && error ? <RefreshFailed error={error} /> : null}
       </div>
-      {body}
+      <ListBody
+        loaded={data !== null}
+        error={error}
+        onRetry={() => void reload(true)}
+        total={all.length}
+        shown={shown.length}
+        onClearFilters={clearFilters}
+        container="@container/skill-list"
+        empty={
+          <EmptyState
+            title="No skills"
+            description="Install one from skills.sh, a GitHub repository or a zip file."
+          >
+            <Button size="xs" variant="outline" onClick={openInstall}>
+              <PlusIcon />
+              Install skill
+            </Button>
+          </EmptyState>
+        }
+        after={
+          <>
+            <UsageFootnote usage={usage} show={view.showUsage} label="Use counts" />
+            <Backups
+              backups={data?.backups ?? []}
+              mutations={mutations}
+              onRestore={(backup) =>
+                mutations.mutate(`backup:${backup.id}`, [backupStep(backup, true)])
+              }
+              onDelete={(backup) => setConfirm({ kind: "delete-backup", backup })}
+            />
+          </>
+        }
+      >
+        <ColumnHeader label="Skill" columns={columns} />
+        <Sections
+          sections={sections}
+          render={(row) => (
+            <SkillRowView
+              key={row.key}
+              row={row}
+              stats={statsFor(stats, row.key)}
+              days={view.days}
+              showUsage={view.showUsage}
+              expanded={expanded.has(row.key)}
+              apps={data?.apps ?? []}
+              columns={columns}
+              mutations={mutations}
+              actions={actions}
+            />
+          )}
+        />
+      </ListBody>
       {install ? (
         <SkillInstallDialog
           key={install.key}
           open={install.open}
-          onOpenChange={(open) =>
-            setInstall((previous) => (previous ? { ...previous, open } : previous))
-          }
+          onOpenChange={(open) => {
+            if (!open) setInstall(closed);
+          }}
           client={client}
           apps={data?.apps ?? []}
           repos={data?.repos ?? []}
@@ -509,22 +364,21 @@ export function SkillsTab(props: ListTabProps) {
         <AdoptDialog
           key={adopt.key}
           open={adopt.open}
-          onOpenChange={(open) =>
-            setAdopt((previous) => (previous ? { ...previous, open } : previous))
-          }
+          onOpenChange={(open) => {
+            if (!open) setAdopt(closed);
+          }}
           row={adopt.value}
           apps={data?.apps ?? []}
-          onAdopt={(path, flags) =>
-            mutate(adopt.value.key, [
-              {
-                input: { action: "adopt", path, apps: flags },
-                labels: {
-                  failure: `Could not adopt ${adopt.value.name}`,
-                  success: `${adopt.value.name} is now managed`,
-                },
-              },
-            ])
-          }
+          onAdopt={(path, flags) => {
+            const { key, name } = adopt.value;
+            mutations.mutate(key, [
+              step(
+                { action: "adopt", path, apps: flags },
+                `Could not adopt ${name}`,
+                `${name} is now managed`,
+              ),
+            ]);
+          }}
         />
       ) : null}
       <ConfirmDialog
@@ -532,17 +386,71 @@ export function SkillsTab(props: ListTabProps) {
         onOpenChange={(open) => {
           if (!open) setConfirm(null);
         }}
-        title={confirmCopy.title}
-        description={confirmCopy.description}
-        confirmLabel={confirmCopy.label}
+        {...(confirm?.kind === "delete-backup"
+          ? {
+              title: `Delete the ${confirm.backup.skillName} backup?`,
+              description: "The backup folder is deleted for good.",
+              confirmLabel: "Delete backup",
+            }
+          : {
+              title: `Uninstall ${confirm?.row.name ?? "skill"}?`,
+              description:
+                "Removes it from Claude and Codex. A backup is taken first; restore it any time under Backups.",
+              confirmLabel: "Uninstall",
+            })}
         onConfirm={runConfirm}
       />
     </div>
   );
 }
 
+/** The store and app skill folders, behind an info icon instead of a footer. */
+function StorageInfo(props: {
+  storageDir: string;
+  appDirs: { readonly claude: string; readonly codex: string };
+}) {
+  const lines: [string, string][] = [
+    ["Store", props.storageDir],
+    ["Claude", props.appDirs.claude],
+    ["Codex", props.appDirs.codex],
+  ];
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label="Skill folders"
+            className={cn("shrink-0 rounded-sm hover:text-foreground", FOCUS_RING)}
+          />
+        }
+      >
+        <InfoIcon className="size-3" />
+      </TooltipTrigger>
+      <TooltipPopup side="bottom" className="max-w-96">
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-px text-[.7rem]">
+          {lines.map(([label, path]) => (
+            <div key={label} className="contents">
+              <dt className="text-muted-foreground">{label}</dt>
+              <dd className="break-all font-mono">{path}</dd>
+            </div>
+          ))}
+        </dl>
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Row
+
+interface SkillRowActions {
+  readonly expand: (key: string) => void;
+  readonly toggle: (row: SkillRow, app: AgentApp, enabled: boolean) => void;
+  readonly update: (row: SkillRow) => void;
+  readonly uninstall: (row: SkillRow) => void;
+  readonly adopt: (row: SkillRow) => void;
+}
 
 interface SkillRowProps {
   readonly row: SkillRow;
@@ -552,12 +460,8 @@ interface SkillRowProps {
   readonly expanded: boolean;
   readonly apps: readonly AgentAppInfo[];
   readonly columns: readonly AgentApp[];
-  readonly busyRow: boolean;
-  readonly busyClaude: boolean;
-  readonly busyCodex: boolean;
-  readonly optimisticClaude: boolean | undefined;
-  readonly optimisticCodex: boolean | undefined;
-  readonly onAction: (action: SkillRowAction) => void;
+  readonly mutations: Mutations;
+  readonly actions: SkillRowActions;
 }
 
 function skillScope(row: SkillRow): string | null {
@@ -566,113 +470,90 @@ function skillScope(row: SkillRow): string | null {
 }
 
 const SkillRowView = memo(function SkillRowView(props: SkillRowProps) {
-  const { row, stats, expanded, onAction } = props;
-  const tokens = tokenChip(stats);
+  const { row, stats, expanded, columns, mutations, actions } = props;
+  const busy = mutations.isBusy(row.key);
+  const tokens = tokenChip(stats, columns);
   const calls = props.showUsage ? usageChip(stats, props.days) : null;
-  const unused = isUnused(skillIsOn(row), stats);
+  const detail = statsDetail(stats, props.days).join("\n") || undefined;
   const scope = skillScope(row);
-  const source = skillSourceLabel(row);
+  const plugin = skillSourceLabel(row)?.kind === "plugin";
 
   return (
-    <li className="border-border/50 border-b last:border-b-0">
-      <div className="flex min-h-8 items-center gap-1.5 px-2 py-1 hover:bg-accent/30">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-label={`${expanded ? "Collapse" : "Expand"} ${row.name}`}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-          onClick={() => onAction({ type: "expand", row })}
-        >
-          <ChevronRightIcon
-            className={cn(
-              "size-3 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none",
-              expanded && "rotate-90",
-            )}
-          />
-          <span className="max-w-[60%] shrink-0 truncate font-medium text-xs">{row.name}</span>
-          {row.description ? (
+    <ListRow below={expanded ? <SkillDetails row={row} stats={stats} days={props.days} /> : null}>
+      <ExpandButton expanded={expanded} name={row.name} onClick={() => actions.expand(row.key)}>
+        <span className="max-w-[60%] shrink-0 truncate font-medium text-xs">{row.name}</span>
+        {row.description ? (
+          <Hint hint={row.description}>
             <span className="hidden min-w-0 flex-1 truncate text-[.7rem] text-muted-foreground @xs/skill-list:inline">
               {row.description}
             </span>
-          ) : (
-            <span className="flex-1" />
-          )}
-          {tokens ? <Chip className="hidden @xs/skill-list:inline">{tokens}</Chip> : null}
-          {calls ? (
-            <Chip
-              className={cn("hidden @sm/skill-list:inline", unused && "text-warning-foreground")}
-            >
-              {calls}
-            </Chip>
-          ) : null}
-          {source?.kind === "plugin" ? (
-            <Badge
-              size="sm"
-              variant="outline"
-              className="hidden shrink-0 @xs/skill-list:inline-flex"
-            >
-              plugin
-            </Badge>
-          ) : null}
-          {scope && source?.kind !== "plugin" ? (
-            <Badge size="sm" variant="outline" className="shrink-0">
-              {scope}
-            </Badge>
-          ) : null}
-          {row.updateAvailable ? (
-            <Badge size="sm" variant="warning" className="shrink-0">
-              update
-            </Badge>
-          ) : null}
-        </button>
-        {row.updateAvailable && row.id ? (
-          <Button
-            size="micro"
-            variant="warning-outline"
-            disabled={props.busyRow}
-            onClick={() => onAction({ type: "update", row })}
-          >
-            Update
-          </Button>
+          </Hint>
+        ) : (
+          <span className="flex-1" />
+        )}
+        {tokens ? (
+          <Chip hint={detail} className="hidden @xs/skill-list:inline">
+            {tokens}
+          </Chip>
         ) : null}
-        {props.busyRow ? <RowSpinner /> : null}
-        {props.columns.map((app) => {
-          const entry = row.apps[app];
-          if (!entry && !row.managed) {
-            return (
-              <span key={app} className="w-9 shrink-0 text-center text-muted-foreground/40 text-xs">
-                –
-              </span>
-            );
-          }
-          const optimistic = app === "claude" ? props.optimisticClaude : props.optimisticCodex;
-          return (
-            <div key={app} className="flex w-9 shrink-0 justify-center">
-              <AppSwitch
-                compact
-                app={app}
-                subject={row.name}
-                checked={optimistic ?? entry?.enabled ?? false}
-                blockedReason={appUnavailableReason(props.apps, app) ?? skillToggleBlock(row, app)}
-                busy={props.busyRow || (app === "claude" ? props.busyClaude : props.busyCodex)}
-                onCheckedChange={(enabled) => onAction({ type: "set-enabled", row, app, enabled })}
-              />
-            </div>
-          );
-        })}
-        <SkillMenu row={row} busy={props.busyRow} onAction={onAction} />
-      </div>
-      {expanded ? <SkillDetails row={row} stats={stats} days={props.days} /> : null}
-    </li>
+        {calls ? (
+          <Chip
+            hint={detail}
+            className={cn(
+              "hidden @sm/skill-list:inline",
+              stats.unused && "text-warning-foreground",
+            )}
+          >
+            {calls}
+          </Chip>
+        ) : null}
+        {plugin ? (
+          <Badge size="sm" variant="outline" className="hidden shrink-0 @xs/skill-list:inline-flex">
+            plugin
+          </Badge>
+        ) : null}
+        {scope && !plugin ? (
+          <Badge size="sm" variant="outline" className="shrink-0">
+            {scope}
+          </Badge>
+        ) : null}
+        {row.updateAvailable ? (
+          <Badge size="sm" variant="warning" className="shrink-0">
+            update
+          </Badge>
+        ) : null}
+      </ExpandButton>
+      {row.updateAvailable && row.id ? (
+        <Button
+          size="micro"
+          variant="warning-outline"
+          disabled={busy}
+          onClick={() => actions.update(row)}
+        >
+          Update
+        </Button>
+      ) : null}
+      {busy ? <RowSpinner /> : null}
+      {columns.map((app) => (
+        <AppCell
+          key={app}
+          app={app}
+          subject={row.name}
+          entry={row.apps[app]}
+          managed={row.managed && !row.pluginId}
+          optimistic={mutations.optimistic(`${row.key}:${app}`)}
+          reason={skillToggleBlock(row, app) ?? appUnavailableReason(props.apps, app)}
+          busy={busy || mutations.isBusy(`${row.key}:${app}`)}
+          onToggle={(enabled) => actions.toggle(row, app, enabled)}
+        />
+      ))}
+      <SkillMenu row={row} busy={busy} actions={actions} />
+    </ListRow>
   );
 });
 
-function SkillMenu(props: {
-  row: SkillRow;
-  busy: boolean;
-  onAction: (action: SkillRowAction) => void;
-}) {
-  const { row, onAction } = props;
+function SkillMenu(props: { row: SkillRow; busy: boolean; actions: SkillRowActions }) {
+  const { row, actions } = props;
   const canUpdate = row.managed && row.id !== undefined && row.source?.type === "github";
   const canUninstall = row.managed && row.id !== undefined;
   const canAdopt = skillAdoptPath(row) !== undefined;
@@ -693,19 +574,19 @@ function SkillMenu(props: {
       </MenuTrigger>
       <MenuPopup align="end" className="w-48">
         {canAdopt ? (
-          <MenuItem disabled={props.busy} onClick={() => onAction({ type: "adopt", row })}>
+          <MenuItem disabled={props.busy} onClick={() => actions.adopt(row)}>
             Adopt…
           </MenuItem>
         ) : null}
         {canUpdate ? (
-          <MenuItem disabled={props.busy} onClick={() => onAction({ type: "update", row })}>
+          <MenuItem disabled={props.busy} onClick={() => actions.update(row)}>
             {row.updateAvailable ? "Update" : "Reinstall latest"}
           </MenuItem>
         ) : null}
         {canUninstall ? (
           <>
             {canAdopt || canUpdate ? <MenuSeparator /> : null}
-            <MenuItem variant="destructive" onClick={() => onAction({ type: "uninstall", row })}>
+            <MenuItem variant="destructive" onClick={() => actions.uninstall(row)}>
               Uninstall…
             </MenuItem>
           </>
@@ -722,24 +603,18 @@ function SkillDetails(props: { row: SkillRow; stats: RowStats; days: number }) {
   const [now] = useState(Date.now);
   const installed = row.installedAt ? formatRelativeTime(row.installedAt, now) : null;
   return (
-    <div className="space-y-1.5 px-2 pb-2.5 pl-6.5 text-[.7rem]">
+    <div className="space-y-2 px-2 pb-2.5 pl-8 text-[.7rem]">
       {row.description ? <p className="text-muted-foreground">{row.description}</p> : null}
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-muted-foreground">
         {source ? (
           <span>
-            {source.kind === "github"
-              ? "GitHub "
-              : source.kind === "zip"
-                ? "Zip "
-                : source.kind === "plugin"
-                  ? "Plugin "
-                  : ""}
+            {SOURCE_PREFIX[source.kind]}
             {source.href ? (
               <a
                 href={source.href}
                 target="_blank"
                 rel="noreferrer"
-                className="text-info-foreground hover:underline"
+                className="rounded-sm text-info-foreground hover:underline"
               >
                 {source.label}
               </a>
@@ -785,11 +660,11 @@ function SkillDetails(props: { row: SkillRow; stats: RowStats; days: number }) {
 }
 
 // ---------------------------------------------------------------------------
-// Backups and footer
+// Backups
 
 function Backups(props: {
   backups: readonly SkillBackup[];
-  isBusy: (id: string) => boolean;
+  mutations: Mutations;
   onRestore: (backup: SkillBackup) => void;
   onDelete: (backup: SkillBackup) => void;
 }) {
@@ -799,7 +674,12 @@ function Backups(props: {
   const sorted = [...backups].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   return (
     <Collapsible className="mt-2 border-t">
-      <CollapsibleTrigger className="group flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-[.7rem] text-muted-foreground hover:bg-accent/30">
+      <CollapsibleTrigger
+        className={cn(
+          "group flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-[.7rem] text-muted-foreground hover:bg-accent/30",
+          FOCUS_RING,
+        )}
+      >
         <ChevronRightIcon className="size-3 shrink-0 transition-transform group-data-panel-open:rotate-90 motion-reduce:transition-none" />
         <span className="font-medium uppercase tracking-wider">Backups · {backups.length}</span>
         <span className="text-muted-foreground/70">
@@ -808,67 +688,45 @@ function Backups(props: {
       </CollapsibleTrigger>
       <CollapsiblePanel>
         <ul className="pb-1">
-          {sorted.map((backup) => (
-            <li
-              key={backup.id}
-              className="flex min-h-7 items-center gap-1.5 px-2 pl-6.5 text-[.7rem]"
-            >
-              <WithReason reason={backup.path}>
-                <span className="min-w-0 truncate font-medium text-foreground">
-                  {backup.skillName}
+          {sorted.map((backup) => {
+            const busy = props.mutations.isBusy(`backup:${backup.id}`);
+            return (
+              <li
+                key={backup.id}
+                className="flex min-h-7 items-center gap-1.5 px-2 pl-6.5 text-[.7rem]"
+              >
+                <WithReason reason={backup.path}>
+                  <span className="min-w-0 truncate font-medium text-foreground">
+                    {backup.skillName}
+                  </span>
+                </WithReason>
+                <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                  {formatRelativeTime(backup.createdAt, now) ?? backup.createdAt}
                 </span>
-              </WithReason>
-              <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                {formatRelativeTime(backup.createdAt, now) ?? backup.createdAt}
-              </span>
-              {props.isBusy(backup.id) ? <RowSpinner /> : null}
-              <Button
-                size="micro"
-                variant="ghost"
-                disabled={props.isBusy(backup.id)}
-                onClick={() => props.onRestore(backup)}
-              >
-                Restore
-              </Button>
-              <Button
-                size="micro"
-                variant="ghost"
-                className="text-destructive-foreground"
-                disabled={props.isBusy(backup.id)}
-                onClick={() => props.onDelete(backup)}
-              >
-                Delete
-              </Button>
-            </li>
-          ))}
+                {busy ? <RowSpinner /> : null}
+                <Button
+                  size="micro"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => props.onRestore(backup)}
+                >
+                  Restore
+                </Button>
+                <Button
+                  size="micro"
+                  variant="ghost"
+                  className="text-destructive-foreground"
+                  disabled={busy}
+                  onClick={() => props.onDelete(backup)}
+                >
+                  Delete
+                </Button>
+              </li>
+            );
+          })}
         </ul>
       </CollapsiblePanel>
     </Collapsible>
-  );
-}
-
-function StorageFooter(props: {
-  storageDir: string;
-  appDirs: { readonly claude: string; readonly codex: string };
-}) {
-  const lines: [string, string][] = [
-    ["Store", props.storageDir],
-    ["Claude", props.appDirs.claude],
-    ["Codex", props.appDirs.codex],
-  ];
-  return (
-    <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-px border-t px-2 pt-2 text-[.65rem] text-muted-foreground/80">
-      {lines.map(([label, path]) => (
-        <div key={label} className="contents">
-          <dt>{label}</dt>
-          <dd className="min-w-0">
-            <WithReason reason={path}>
-              <span className="block truncate font-mono">{path}</span>
-            </WithReason>
-          </dd>
-        </div>
-      ))}
-    </dl>
   );
 }
 

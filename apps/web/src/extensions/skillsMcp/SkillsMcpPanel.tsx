@@ -15,7 +15,7 @@ import { type SortMode, contextSummaries, needsUsage } from "./context.logic";
 import type { ListTabProps, ListView, ListViewActions, UsageDays } from "./listControls";
 import { McpTab } from "./McpTab";
 import { PluginsTab } from "./PluginsTab";
-import { safeCall, useOverviewLoader } from "./shared";
+import { useOverviewLoader } from "./shared";
 import { SkillsTab } from "./SkillsTab";
 
 type Tab = "mcp" | "skills" | "plugins";
@@ -53,7 +53,7 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
     key: scopeKey,
     staleMs: 60_000,
     fetch: (refresh) =>
-      safeCall(client, "context.get", {
+      client.call("context.get", {
         ...(cwd ? { cwd } : {}),
         ...(refresh ? { refresh: true } : {}),
       }),
@@ -63,13 +63,18 @@ export default function SkillsMcpPanel(props: RightPanelExtensionProps) {
     active: visible && wantUsage && tab !== "plugins",
     key: `${environmentId ?? ""}|${days}`,
     staleMs: 300_000,
-    fetch: (refresh) =>
-      safeCall(client, "usage.get", { days, ...(refresh ? { refresh: true } : {}) }),
+    fetch: (refresh) => client.call("usage.get", { days, ...(refresh ? { refresh: true } : {}) }),
   });
 
   const summaries = useMemo(() => contextSummaries(context.data), [context.data]);
   const reloadContext = context.reload;
-  const onChanged = useCallback(() => void reloadContext(false), [reloadContext]);
+  const reloadUsage = usage.reload;
+  const usageLoaded = usage.data !== null;
+  // After a mutation: re-measure in the background; the last numbers stay up meanwhile.
+  const onChanged = useCallback(() => {
+    void reloadContext(false);
+    if (usageLoaded) void reloadUsage(false);
+  }, [reloadContext, reloadUsage, usageLoaded]);
   const onRefreshContext = useCallback(() => void reloadContext(true), [reloadContext]);
 
   const listProps = (active: boolean): ListTabProps => ({
