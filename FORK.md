@@ -15,15 +15,20 @@ fork-owned paths must equal that file list. `scripts/fork/update.sh` blocks othe
 is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 (`git grep -n t3-ext -- apps/server apps/web/src packages/contracts`).
 
-| Host file                                    | What the fork adds                                                   |
-| -------------------------------------------- | -------------------------------------------------------------------- |
-| `packages/contracts/src/rpc.ts`              | `WS_METHODS.extensionCall` (`extension.call`) + `WsExtensionCallRpc` |
-| `packages/contracts/src/index.ts`            | `export * from "./extensions/index.ts"`                              |
-| `apps/server/src/ws.ts`                      | builds the extension registry, handles `extension.call`              |
-| `apps/server/src/auth/RpcAuthorization.ts`   | scope for `extension.call`                                           |
-| `apps/web/src/rightPanelStore.ts`            | `extension` surface kind + `openExtension`                           |
-| `apps/web/src/components/RightPanelTabs.tsx` | extension entries in the add-tab menu, label/icon                    |
-| `apps/web/src/components/ChatView.tsx`       | renders `ExtensionSurface`                                           |
+| Host file                                                              | What the fork adds                                                                       |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `packages/contracts/src/rpc.ts`                                        | `WS_METHODS.extensionCall` (`extension.call`) + `WsExtensionCallRpc`                     |
+| `packages/contracts/src/index.ts`                                      | `export * from "./extensions/index.ts"`                                                  |
+| `apps/server/src/ws.ts`                                                | builds the extension registry, handles `extension.call`                                  |
+| `apps/server/src/auth/RpcAuthorization.ts`                             | scope for `extension.call`                                                               |
+| `apps/web/src/rightPanelStore.ts`                                      | `extension` surface kind + `openExtension`                                               |
+| `apps/web/src/components/RightPanelTabs.tsx`                           | extension entries in the add-tab menu, label/icon                                        |
+| `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`                                                               |
+| `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
+| `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges an inline `--settings` launch argument into T3's Claude settings                  |
+| `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
+| `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool proxy)         |
+| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | renders `ProviderSettingsExtensions` above the provider list                             |
 
 Fork-owned paths (new extensions only touch these):
 
@@ -31,6 +36,9 @@ Fork-owned paths (new extensions only touch these):
 - `apps/server/src/extensions/` - server handlers (`registry.ts`, `index.ts` registers extensions)
 - `apps/web/src/extensions/` - panels (`registry.ts`, `ExtensionSurface.tsx`)
 - `scripts/fork/`, `FORK.md`, `.github/workflows/fork-release.yml`
+
+`apps/server/src/extensions/hostSeams.test.ts` fails by name when a merge drops or moves one of
+these seams; `update.sh` runs it with the other extension tests.
 
 If an extension needs an upstream internal, re-export it from a `t3.ts` inside the extension.
 If upstream moves code a host edit depends on, re-apply it in a new commit whose subject starts
@@ -47,6 +55,12 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   ("t3code Safe Storage"), choose **Always Allow**.
 - **First launch on Windows:** if SmartScreen blocks the installer, click **More info → Run
   anyway** (once). PCs with Smart App Control turned on block unsigned apps outright.
+- **Claude and Codex accounts (Pool):** Settings → Providers → Pool → **Add Claude account** /
+  **Add ChatGPT account**, then sign in in the browser. T3 routes Claude and Codex through the
+  pool by itself; nothing else to configure. The first sign-in may show a firewall prompt for
+  `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer works, sign-in uses
+  localhost. Don't also sign the same account into another proxy (CC Switch, EasyCLIProxyAPI):
+  two proxies refreshing one account sign each other out.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
@@ -93,6 +107,38 @@ merge and push with `fork_git` (see Traps).
   `~/.t3/userdata` (+ the Chromium profile) to `~/Applications/T3 Code backups/`, ad-hoc signs,
   swaps it in and prints the rollback commands. Return to the release builds by installing the
   latest release DMG.
+
+## Pool
+
+`apps/server/src/extensions/pool/` (+ `apps/web/src/extensions/pool/`). T3 downloads a pinned
+CLIProxyAPI (`binary.ts`: version + per-platform SHA-256) into `<stateDir>/pool/`, runs it on
+`127.0.0.1:18417-18499` (never 8317; a taken port moves to the next free one), and stops it with
+the server (a pid file kills a proxy left by a hard kill on the next start). Accounts sign in
+through the proxy's management API. Routing is a runtime overlay on the default Claude and Codex
+instances (`overlay.ts`), never written to the user's Claude or Codex config.
+
+Why each routing setting exists (measured 2026-09-26 against direct Claude Code): behind any
+custom `ANTHROPIC_BASE_URL` Claude Code drops tool search (every MCP schema in every thread),
+fine-grained tool streaming, the global system-prompt cache, the 1h cache and the advisor.
+`_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` + `ENABLE_TOOL_SEARCH` + `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`
+
+- `advisorModel` restore them. They go in flag `--settings` too, because a `settings.json` `env`
+  block outranks the process environment. The proxy pins each session to one account (prompt cache)
+  and gives each subagent its own. Codex gets OpenAI's live model catalog through a pool account.
+
+**After an upstream merge, a Claude Code update or a CLIProxyAPI bump:**
+
+1. `hostSeams.test.ts` passes (update.sh runs it).
+2. `cd apps/server && POOL_INTEGRATION=1 pnpm exec vp test run src/extensions/pool/controller.integration.test.ts`:
+   real proxy download, sign-in link, routing, and a real Claude probe that must report tool search on.
+3. In the app: Settings → Providers → Pool → **Native parity** is all green. A failing **Tool
+   search** means Claude Code changed how it treats proxies: search its binary for
+   `is not a first-party Anthropic host` to find the new switch.
+4. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
+
+Known limits: on Windows a hard-killed server leaves the proxy running until T3 starts again;
+signing in on a remote environment needs a browser on that machine (the OAuth callback is its
+localhost); an External pool shows no accounts or quotas and Codex keeps its built-in catalog.
 
 ## Traps
 
