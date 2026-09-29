@@ -8,6 +8,7 @@
  * @module ClaudeAdapterLive
  */
 
+import * as NodeUtil from "node:util";
 import {
   type CanUseTool,
   query,
@@ -136,8 +137,99 @@ const decodeSessionMessages = Schema.decodeSync(
   ),
 );
 
+type ClaudeHistoryMessage = {
+  readonly type: string;
+  readonly uuid: string;
+  readonly parent_tool_use_id: string | null;
+  readonly message: unknown;
+};
+
+const isClaudeConversationMessage = (message: ClaudeHistoryMessage): boolean =>
+  message.type === "user" || message.type === "assistant";
+
+const isClaudeHumanTurnStart = (message: ClaudeHistoryMessage): boolean => {
+  if (message.type !== "user" || message.parent_tool_use_id !== null) return false;
+  const body = message.message;
+  if (typeof body !== "object" || body === null || !("content" in body)) return false;
+  const content = body.content;
+  return (
+    typeof content === "string" ||
+    (Array.isArray(content) &&
+      content.some(
+        (part: unknown) =>
+          typeof part === "object" &&
+          part !== null &&
+          "type" in part &&
+          part.type !== "tool_result",
+      ))
+  );
+};
+
+const conversationIndexForUuid = (
+  messages: ReadonlyArray<ClaudeHistoryMessage>,
+  uuid: string,
+): number => {
+  let index = -1;
+  for (const message of messages) {
+    if (!isClaudeConversationMessage(message)) continue;
+    index += 1;
+    if (message.uuid === uuid) return index;
+  }
+  return -1;
+};
+
+// Native forks rewrite every UUID. getSessionMessages then rebuilds the
+// parentUuid chain, so system notices and compact metadata can change the
+// raw length without dropping retained user/assistant turns. Align those
+// conversation messages from the truncated end, then remap T3 turn starts.
+const remapClaudeForkTurnBoundaries = (
+  messages: ReadonlyArray<ClaudeHistoryMessage>,
+  forkMessages: ReadonlyArray<ClaudeHistoryMessage>,
+  firstRemoved: number,
+  retainedBoundaries: ReadonlyArray<string | null>,
+): Array<string | null> | undefined => {
+  const retainedConversation = messages.slice(0, firstRemoved).filter(isClaudeConversationMessage);
+  const forkConversation = forkMessages.filter(isClaudeConversationMessage);
+  if (retainedConversation.length === 0) {
+    return retainedBoundaries.every((id) => id === null) ? [...retainedBoundaries] : undefined;
+  }
+  const offset = forkConversation.length - retainedConversation.length;
+  // Forks preserve message bodies. Matching roles alone can mistake a restored
+  // steering message for a retained turn when compaction changes the chain.
+  if (
+    offset < 0 ||
+    retainedConversation.some((message, index) => {
+      const forkMessage = forkConversation[index + offset];
+      return (
+        forkMessage === undefined ||
+        forkMessage.type !== message.type ||
+        !NodeUtil.isDeepStrictEqual(forkMessage.message, message.message)
+      );
+    })
+  ) {
+    return undefined;
+  }
+  const remapped = retainedBoundaries.map((originalId) => {
+    if (originalId === null) return null;
+    const originalIndex = conversationIndexForUuid(messages, originalId);
+    const forkIndex = originalIndex + offset;
+    const forkMessage =
+      originalIndex >= 0 && forkIndex >= 0 ? forkConversation[forkIndex] : undefined;
+    const originalMessage = messages.find((message) => message.uuid === originalId);
+    return forkMessage !== undefined &&
+      originalMessage !== undefined &&
+      forkMessage.type === originalMessage.type
+      ? forkMessage.uuid
+      : null;
+  });
+  return remapped.some((id) => id === null) ? undefined : remapped;
+};
+
 const PROVIDER = ProviderDriverKind.make("claudeAgent");
-type ClaudeTextStreamKind = Extract<RuntimeContentStreamKind, "assistant_text" | "reasoning_text">;
+type ClaudeTextStreamKind = Extract<
+  RuntimeContentStreamKind,
+  "assistant_text" | "reasoning_text" | "reasoning_summary_text"
+>;
 type ClaudeToolResultStreamKind = Extract<
   RuntimeContentStreamKind,
   "command_output" | "file_change_output"
@@ -176,7 +268,6 @@ interface ClaudeTurnState {
    * steered instead (the queued message continues the same turn).
    */
   readonly synthetic?: boolean;
-  readonly items: Array<unknown>;
   readonly assistantTextBlocks: Map<number, AssistantTextBlockState>;
   readonly assistantTextBlockOrder: Array<AssistantTextBlockState>;
   readonly capturedProposedPlanKeys: Set<string>;
@@ -187,6 +278,8 @@ interface ClaudeTurnState {
   authenticationFailureMessage: string | undefined;
   rejectedRateLimitTypes: Set<string>;
   latestAssistantRateLimited: boolean;
+  emittedThinkingText: boolean;
+  readonly thinkingSnapshotIds: Set<string>;
 }
 
 interface AssistantTextBlockState {
@@ -293,6 +386,8 @@ interface ClaudeTaskAgentState {
  * lifetime; oldest entries evict first.
  */
 const PENDING_TASK_MODEL_CAP = 64;
+/** How long Stop waits for Claude to abort a turn before killing the process. */
+const CLAUDE_INTERRUPT_GRACE = "3 seconds";
 
 /**
  * Buffers a subagent snapshot's authoritative model under its
@@ -329,10 +424,11 @@ interface ClaudeSessionContext {
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
-  readonly turns: Array<{
-    id: TurnId;
-    items: Array<unknown>;
-  }>;
+  /** Completed turn ids, reported by readThread and trimmed on rollback.
+   * SDK messages are not kept: rollback reads Claude's own history through
+   * turnStartMessageIds, and a long-lived session would otherwise hold every
+   * message it ever produced. */
+  readonly turns: Array<{ readonly id: TurnId }>;
   readonly inFlightTools: Map<number, ToolInFlight>;
   readonly claudeTasks: Map<string, ClaudeTaskState>;
   readonly taskAgents: Map<string, ClaudeTaskAgentState>;
@@ -360,10 +456,14 @@ interface ClaudeSessionContext {
   lastThreadStartedId: string | undefined;
   /** Limits already announced for the running turn, keyed `window:resetsAt`. */
   announcedUsageLimits: { turnId: string; keys: Set<string> } | undefined;
+  /** Resolved by completeTurn while Stop waits for Claude to abort the turn. */
+  interruptedTurnSettled: Deferred.Deferred<void> | undefined;
   stopped: boolean;
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
+  /** SDK Query.interrupt — present on real queries; optional for test doubles. */
+  readonly interrupt?: () => Promise<unknown>;
   readonly setModel: (model?: string) => Promise<void>;
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
@@ -1630,7 +1730,18 @@ function resultOutcome(
 }
 
 function streamKindFromDeltaType(deltaType: string): ClaudeTextStreamKind {
-  return deltaType.includes("thinking") ? "reasoning_text" : "assistant_text";
+  // Claude never returns the raw chain of thought. A thinking delta is the
+  // API-side summary (or a progress-update sentence) when display is
+  // summarized; map it onto the summary stream so it shares the Codex/Grok
+  // reasoning-summary path rather than looking like a raw trace we do not have.
+  return deltaType.includes("thinking") ? "reasoning_summary_text" : "assistant_text";
+}
+
+function shouldRequestClaudeThinkingSummaries(input: {
+  readonly thinking: boolean | undefined;
+  readonly thinkingDisplay: string | null | undefined;
+}): boolean {
+  return input.thinking !== false && input.thinkingDisplay !== "omitted";
 }
 
 function nativeProviderRefs(
@@ -1647,7 +1758,11 @@ function nativeProviderRefs(
   return {};
 }
 
-function extractAssistantTextBlocks(message: SDKMessage): Array<string> {
+function extractAssistantContentBlocks(
+  message: SDKMessage,
+  blockType: "text" | "thinking",
+  field: "text" | "thinking",
+): Array<string> {
   if (message.type !== "assistant") {
     return [];
   }
@@ -1662,17 +1777,22 @@ function extractAssistantTextBlocks(message: SDKMessage): Array<string> {
     if (!block || typeof block !== "object") {
       continue;
     }
-    const candidate = block as { type?: unknown; text?: unknown };
-    if (
-      candidate.type === "text" &&
-      typeof candidate.text === "string" &&
-      candidate.text.length > 0
-    ) {
-      fragments.push(candidate.text);
+    const candidate = block as { type?: unknown; text?: unknown; thinking?: unknown };
+    const value = field === "thinking" ? candidate.thinking : candidate.text;
+    if (candidate.type === blockType && typeof value === "string" && value.length > 0) {
+      fragments.push(value);
     }
   }
 
   return fragments;
+}
+
+function extractAssistantTextBlocks(message: SDKMessage): Array<string> {
+  return extractAssistantContentBlocks(message, "text", "text");
+}
+
+function extractAssistantThinkingBlocks(message: SDKMessage): Array<string> {
+  return extractAssistantContentBlocks(message, "thinking", "thinking");
 }
 
 function extractContentBlockText(block: unknown): string {
@@ -2063,10 +2183,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
     return {
       threadId,
-      turns: context.turns.map((turn) => ({
-        id: turn.id,
-        items: [...turn.items],
-      })),
+      turns: context.turns.map((turn) => ({ id: turn.id, items: [] })),
     };
   });
 
@@ -2268,6 +2385,70 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
       }
     }
+  });
+
+  const emitReasoningSummaryDelta = Effect.fn("emitReasoningSummaryDelta")(function* (
+    context: ClaudeSessionContext,
+    input: {
+      readonly delta: string;
+      readonly contentIndex?: number;
+      readonly rawMethod: string;
+      readonly rawPayload: SDKMessage;
+    },
+  ) {
+    const turnState = context.turnState;
+    if (!turnState || input.delta.length === 0) {
+      return;
+    }
+    turnState.emittedThinkingText = true;
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "content.delta",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      turnId: turnState.turnId,
+      payload: {
+        streamKind: "reasoning_summary_text",
+        delta: input.delta,
+        ...(input.contentIndex !== undefined ? { contentIndex: input.contentIndex } : {}),
+      },
+      providerRefs: nativeProviderRefs(context),
+      raw: {
+        source: "claude.sdk.message",
+        method: input.rawMethod,
+        payload: input.rawPayload,
+      },
+    });
+  });
+
+  const backfillThinkingFromSnapshot = Effect.fn("backfillThinkingFromSnapshot")(function* (
+    context: ClaudeSessionContext,
+    message: SDKMessage,
+  ) {
+    const turnState = context.turnState;
+    if (!turnState || message.type !== "assistant") {
+      return;
+    }
+    const snapshotId = message.uuid;
+    const alreadyEmitted =
+      turnState.emittedThinkingText || turnState.thinkingSnapshotIds.has(snapshotId);
+    turnState.thinkingSnapshotIds.add(snapshotId);
+    turnState.emittedThinkingText = false;
+    if (alreadyEmitted) {
+      return;
+    }
+
+    for (const [index, delta] of extractAssistantThinkingBlocks(message).entries()) {
+      yield* emitReasoningSummaryDelta(context, {
+        delta,
+        contentIndex: index,
+        rawMethod: "claude/assistant/thinking",
+        rawPayload: message,
+      });
+    }
+    turnState.emittedThinkingText = false;
   });
 
   const ensureThreadId = Effect.fn("ensureThreadId")(function* (
@@ -2631,10 +2812,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       });
     }
 
-    context.turns.push({
-      id: turnState.turnId,
-      items: [...turnState.items],
-    });
+    context.turns.push({ id: turnState.turnId });
 
     yield* emitThreadTokenUsage(context, usageSnapshot, {
       rawMethod: "claude/result",
@@ -2665,6 +2843,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     const updatedAt = yield* nowIso;
     context.turnState = undefined;
+    if (context.interruptedTurnSettled) {
+      yield* Deferred.succeed(context.interruptedTurnSettled, undefined);
+    }
     context.session = {
       ...context.session,
       status: "ready",
@@ -2711,6 +2892,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
     }
 
+    if (event.type === "message_start" && context.turnState && !streamParentToolUseId) {
+      context.turnState.emittedThinkingText = false;
+    }
+
     if (event.type === "message_delta") {
       if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) {
         return;
@@ -2743,18 +2928,17 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           return;
         }
         const streamKind = streamKindFromDeltaType(event.delta.type);
-        const assistantBlockEntry =
-          event.delta.type === "text_delta"
-            ? yield* ensureAssistantTextBlock(context, event.index)
-            : context.turnState.assistantTextBlocks.get(event.index)
-              ? {
-                  blockIndex: event.index,
-                  block: context.turnState.assistantTextBlocks.get(
-                    event.index,
-                  ) as AssistantTextBlockState,
-                }
-              : undefined;
-        if (assistantBlockEntry?.block && event.delta.type === "text_delta") {
+        if (streamKind === "reasoning_summary_text") {
+          yield* emitReasoningSummaryDelta(context, {
+            delta: deltaText,
+            contentIndex: event.index,
+            rawMethod: "claude/stream_event/content_block_delta",
+            rawPayload: message,
+          });
+          return;
+        }
+        const assistantBlockEntry = yield* ensureAssistantTextBlock(context, event.index);
+        if (assistantBlockEntry?.block) {
           assistantBlockEntry.block.emittedTextDelta = true;
         }
         const stamp = yield* makeEventStamp();
@@ -2995,10 +3179,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       return;
     }
 
-    if (context.turnState) {
-      context.turnState.items.push(message.message);
-    }
-
     for (const toolResult of toolResultBlocksFromUserMessage(message)) {
       const toolEntry = Array.from(context.inFlightTools.entries()).find(
         ([, tool]) => tool.itemId === toolResult.toolUseId,
@@ -3198,7 +3378,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         turnId,
         startedAt,
         synthetic: true,
-        items: [],
         assistantTextBlocks: new Map(),
         assistantTextBlockOrder: [],
         capturedProposedPlanKeys: new Set(),
@@ -3209,6 +3388,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         authenticationFailureMessage: undefined,
         rejectedRateLimitTypes: new Set(),
         latestAssistantRateLimited: false,
+        emittedThinkingText: false,
+        thinkingSnapshotIds: new Set(),
       };
       context.session = {
         ...context.session,
@@ -3279,7 +3460,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           cwd: path.resolve(context.session.cwd ?? "."),
         });
       }
-      context.turnState.items.push(message.message);
       if (
         normalizeClaudeActiveTokenUsage(
           message.message.usage,
@@ -3290,6 +3470,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         context.turnState.latestAssistantUsage = message.message.usage;
         context.turnState.compactedSinceLatestAssistantUsage = false;
       }
+      yield* backfillThinkingFromSnapshot(context, message);
       yield* backfillAssistantTextBlocksFromSnapshot(context, message);
     }
 
@@ -4682,6 +4863,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const thinking = thinkingSupported
         ? getModelSelectionBooleanOptionValue(modelSelection, "thinking")
         : undefined;
+      const thinkingDisplayArg = extraArgs["thinking-display"];
+      const requestThinkingSummaries = shouldRequestClaudeThinkingSummaries({
+        thinking,
+        thinkingDisplay: typeof thinkingDisplayArg === "string" ? thinkingDisplayArg : undefined,
+      });
       const ultracode = isClaudeCatalogUltracodeEffort(effort);
       const effectiveEffort = getEffectiveClaudeAgentEffort(
         modelCatalog,
@@ -4704,12 +4890,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const settings = {
         ...launchArgSettings(claudeSettings.launchArgs), // t3-ext
         ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
+        ...(requestThinkingSummaries ? { showThinkingSummaries: true } : {}),
         ...(fastMode ? { fastMode: true } : {}),
         ...(ultracode ? { ultracode: true } : {}),
         ...(claudeSettings.autoCompactWindow
           ? { autoCompactWindow: Number(claudeSettings.autoCompactWindow) }
           : {}),
       };
+      if (requestThinkingSummaries && extraArgs["thinking-display"] === undefined) {
+        extraArgs["thinking-display"] = "summarized";
+      }
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       // The attachments dir grant lets the agent Read/copy pasted images at
       // the paths ProviderService injects into the turn text, without an
@@ -4735,6 +4925,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(effectiveEffort
           ? {
               effort: effectiveEffort as unknown as NonNullable<ClaudeQueryOptions["effort"]>,
+            }
+          : {}),
+        ...(extraArgs["thinking-display"] === "summarized"
+          ? {
+              thinking: {
+                type: "adaptive" as const,
+                display: "summarized" as const,
+              },
             }
           : {}),
         ...(permissionMode ? { permissionMode } : {}),
@@ -4858,6 +5056,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastAssistantUuid: resumeState?.resumeSessionAt,
         lastThreadStartedId: undefined,
         announcedUsageLimits: undefined,
+        interruptedTurnSettled: undefined,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);
@@ -5006,7 +5205,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const turnState: ClaudeTurnState = {
         turnId,
         startedAt: yield* nowIso,
-        items: [],
         assistantTextBlocks: new Map(),
         assistantTextBlockOrder: [],
         capturedProposedPlanKeys: new Set(),
@@ -5017,6 +5215,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         authenticationFailureMessage: undefined,
         rejectedRateLimitTypes: new Set(),
         latestAssistantRateLimited: false,
+        emittedThinkingText: false,
+        thinkingSnapshotIds: new Set(),
       };
 
       const updatedAt = yield* nowIso;
@@ -5088,12 +5288,32 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const interruptTurn: ClaudeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
     function* (threadId, _turnId) {
       const context = yield* requireSession(threadId);
+      yield* settleInterruptedTurn(context);
       // interrupt() can acknowledge while resumed background tasks keep the
       // CLI alive. Stop is a hard session boundary for Claude, so close the
       // query and let the SDK escalate to SIGKILL when graceful exit fails.
       yield* stopSessionInternal(context);
     },
   );
+
+  // Lets Claude abort the running turn through its own path before Stop kills
+  // the process, so the prompt reaches the transcript. Killing a first turn
+  // before Claude writes it leaves a resume cursor for a session Claude never
+  // saved, and every later message fails with "No conversation found".
+  const settleInterruptedTurn = Effect.fn("settleInterruptedTurn")(function* (
+    context: ClaudeSessionContext,
+  ) {
+    const interrupt = context.query.interrupt?.bind(context.query);
+    if (context.stopped || !context.turnState || !interrupt) return;
+    const settled = yield* Deferred.make<void>();
+    context.interruptedTurnSettled = settled;
+    yield* Effect.tryPromise(interrupt).pipe(
+      Effect.ignore,
+      Effect.andThen(Deferred.await(settled)),
+      Effect.timeoutOption(CLAUDE_INTERRUPT_GRACE),
+    );
+    context.interruptedTurnSettled = undefined;
+  });
 
   const readThread: ClaudeAdapterShape["readThread"] = Effect.fn("readThread")(
     function* (threadId) {
@@ -5156,6 +5376,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ) => {
         // SDK history helpers read process.env. Isolate the provider's home instead
         // of changing the server's environment while other providers are running.
+        // @effect-diagnostics-next-line runEffectInsideEffect:off - SDK callback runs outside the fiber; the spawn is self-contained
         const result = await Effect.runPromise(
           spawnAndCollect(
             process.execPath,
@@ -5192,23 +5413,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
       const messages = yield* readHistory(sessionId);
       // Tool results are user-role messages too. Only human prompts begin a turn.
-      const turnStarts = messages.flatMap((message, index) => {
-        if (message.type !== "user" || message.parent_tool_use_id !== null) return [];
-        const body = message.message;
-        if (typeof body !== "object" || body === null || !("content" in body)) return [];
-        const content = body.content;
-        return typeof content === "string" ||
-          (Array.isArray(content) &&
-            content.some(
-              (part: unknown) =>
-                typeof part === "object" &&
-                part !== null &&
-                "type" in part &&
-                part.type !== "tool_result",
-            ))
-          ? [index]
-          : [];
-      });
+      const turnStarts = messages.flatMap((message, index) =>
+        isClaudeHumanTurnStart(message) ? [index] : [],
+      );
       if (messages.length === 0) {
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
@@ -5265,20 +5472,20 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const retainedBoundaries = boundaries.slice(0, retainedCount);
       if (fork) {
         const forkMessages = yield* readHistory(fork.sessionId);
-        if (forkMessages.length !== firstRemoved) {
+        const remappedBoundaries = remapClaudeForkTurnBoundaries(
+          messages,
+          forkMessages,
+          firstRemoved,
+          retainedBoundaries,
+        );
+        if (!remappedBoundaries) {
           return yield* new ProviderAdapterRequestError({
             provider: PROVIDER,
             method: "thread/rollback",
             detail: "Claude fork history did not preserve the retained turn boundaries.",
           });
         }
-        // Native forks replace every UUID while preserving transcript order.
-        for (let index = 0; index < retainedBoundaries.length; index++) {
-          const messageIndex = messages.findIndex(
-            (message) => message.uuid === retainedBoundaries[index],
-          );
-          retainedBoundaries[index] = forkMessages[messageIndex]?.uuid ?? null;
-        }
+        retainedBoundaries.splice(0, retainedBoundaries.length, ...remappedBoundaries);
       }
       yield* stopSessionInternal(context, { emitExitEvent: false });
       yield* startSession({
@@ -5360,7 +5567,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     for (const result of results) {
       if (result._tag === "Failure") {
-        return yield* Effect.fail(result.failure);
+        return yield* result.failure;
       }
     }
   });

@@ -143,6 +143,7 @@ import {
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
 import { hasCloudPublicConfig } from "~/cloud/publicConfig";
+import { RemoveT3ConnectEnvironmentDialog } from "../clerk/RemoveT3ConnectEnvironmentDialog";
 import { useCloudLinkController } from "~/cloud/useCloudLinkController";
 import { authEnvironment } from "~/state/auth";
 import { environmentCatalog } from "~/connection/catalog";
@@ -161,6 +162,7 @@ import {
   type EnvironmentPresentation,
   useEnvironments,
   usePrimaryEnvironment,
+  useRelayEnvironmentDiscovery,
 } from "~/state/environments";
 import { requestConfirmDialog } from "~/confirmDialog";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -755,7 +757,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
           <div className="flex min-h-5 items-center gap-1.5">
             <ConnectionStatusDot
               tooltipText={`Link created at ${formatAccessTimestamp(pairingLink.createdAt)}`}
-              dotClassName="bg-amber-400"
+              dotClassName="bg-warning"
             />
             <h3 className="text-sm font-medium text-foreground">{primaryLabel}</h3>
           </div>
@@ -770,11 +772,11 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
             <AccessScopeSummary scopes={pairingLink.scopes} label="Pairing link scopes" />
           </p>
           {!credential ? (
-            <p className="text-[11px] text-muted-foreground/70">
+            <p className="text-2xs text-muted-foreground/70">
               Create a new link to share from this client.
             </p>
           ) : shareablePairingUrl === null ? (
-            <p className="text-[11px] text-muted-foreground/70">
+            <p className="text-2xs text-muted-foreground/70">
               Copy the token and pair from another client using this backend&apos;s reachable host.
             </p>
           ) : null}
@@ -827,12 +829,11 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
                     : "Clipboard copy is unavailable here. Manually copy this code into another client."}
                 </DialogDescription>
               </DialogHeader>
-              <DialogPanel className="space-y-4">
+              <DialogPanel>
                 <Textarea
                   readOnly
                   value={revealValue}
                   rows={isRevealValueUrl ? 4 : 3}
-                  className="text-xs leading-relaxed"
                   onFocus={(event) => event.currentTarget.select()}
                   onClick={(event) => event.currentTarget.select()}
                 />
@@ -882,7 +883,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
                 role="radiogroup"
                 aria-label="Endpoint the pairing QR code and URL use"
               >
-                <p className="text-[11px] text-muted-foreground/70">Reach this machine via</p>
+                <p className="text-2xs text-muted-foreground/70">Reach this machine via</p>
                 {endpointCopyOptions.map((option) => {
                   const isSelected = option.id === selectedQrOption?.id;
                   return (
@@ -907,7 +908,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
                       >
                         {option.label}
                       </span>
-                      <span className="min-w-0 truncate text-[11px] text-muted-foreground/70">
+                      <span className="min-w-0 truncate text-2xs text-muted-foreground/70">
                         {option.detail}
                       </span>
                     </button>
@@ -919,14 +920,12 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
               <Tooltip>
                 <TooltipTrigger
                   render={
-                    <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">
+                    <code className="min-w-0 flex-1 truncate font-mono text-2xs text-muted-foreground">
                       {qrPairingUrl}
                     </code>
                   }
                 />
-                <TooltipPopup side="top" className="max-w-80 break-all">
-                  {qrPairingUrl}
-                </TooltipPopup>
+                <TooltipPopup side="top">{qrPairingUrl}</TooltipPopup>
               </Tooltip>
               <Button
                 size="xs"
@@ -953,7 +952,7 @@ const PairingLinkListRow = memo(function PairingLinkListRow({
             </div>
           ) : (
             <div className="flex size-[192px] shrink-0 items-center justify-center self-center rounded-xl border border-border/50 p-4 sm:self-start">
-              <p className="text-center text-[11px] text-muted-foreground/70">
+              <p className="text-center text-2xs text-muted-foreground/70">
                 No QR for this endpoint. Another device scanning a loopback link would dial itself;
                 copy the URL for use on this machine instead.
               </p>
@@ -1013,7 +1012,7 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
             />
             <h3 className="text-sm font-medium text-foreground">{primaryLabel}</h3>
             {clientSession.current ? (
-              <span className="text-[10px] text-muted-foreground/80 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
+              <span className="text-3xs text-muted-foreground/80 rounded-md border border-border/50 bg-muted/50 px-1 py-0.5">
                 This device
               </span>
             ) : null}
@@ -1134,7 +1133,7 @@ const AuthorizedClientsHeaderAction = memo(function AuthorizedClientsHeaderActio
               authorized client.
             </DialogDescription>
           </DialogHeader>
-          <DialogPanel className="space-y-5">
+          <DialogPanel>
             <label className="block">
               <span className="mb-1.5 block text-xs font-medium text-foreground">
                 Client label (optional)
@@ -1333,20 +1332,18 @@ const AdvertisedEndpointListRow = memo(function AdvertisedEndpointListRow({
                   </p>
                 }
               />
-              <TooltipPopup side="top" className="max-w-80">
-                {endpoint.httpBaseUrl}
-              </TooltipPopup>
+              <TooltipPopup side="top">{endpoint.httpBaseUrl}</TooltipPopup>
             </Tooltip>
           ) : null}
           {!isAvailable ? (
-            <span className="shrink-0 rounded-md border border-border/70 px-1 py-0.5 text-[10px] text-muted-foreground">
+            <span className="shrink-0 rounded-md border border-border/70 px-1 py-0.5 text-3xs text-muted-foreground">
               Setup required
             </span>
           ) : null}
         </div>
         <div className="ml-auto flex min-h-6 shrink-0 items-center justify-end gap-2">
           {isDefault ? (
-            <span className="rounded-md border border-primary/30 bg-primary/10 px-1 py-0.5 text-[10px] text-primary">
+            <span className="rounded-md border border-primary/30 bg-primary/10 px-1 py-0.5 text-3xs text-primary">
               Default
             </span>
           ) : null}
@@ -1444,7 +1441,8 @@ function savedBackendStatus(environment: EnvironmentPresentation): {
   readonly text: string;
   readonly tone: "muted" | "error";
 } {
-  if (!environment.entry.enabled) return { text: "Off", tone: "muted" };
+  if (!environment.entry.enabled && environment.connection.phase !== "unsupported")
+    return { text: "Off", tone: "muted" };
   const { connection } = environment;
   switch (connection.phase) {
     case "connected":
@@ -1456,6 +1454,9 @@ function savedBackendStatus(environment: EnvironmentPresentation): {
         text: connection.error ? `Reconnecting: ${connection.error}` : "Reconnecting",
         tone: "error",
       };
+    // Not a failure: the machine is fine, this build just cannot talk to it.
+    case "unsupported":
+      return { text: "Client not supported", tone: "muted" };
     case "error":
       return {
         text: connection.error ? `Connection failed: ${connection.error}` : "Connection failed",
@@ -1480,7 +1481,8 @@ function SavedBackendListRow({
   onRemove,
 }: SavedBackendListRowProps) {
   const environmentId = environment.environmentId;
-  const enabled = environment.entry.enabled;
+  const unsupported = environment.connection.phase === "unsupported";
+  const enabled = environment.entry.enabled && !unsupported;
   const isConnected = environment.connection.phase === "connected";
   const isRemoving = removingEnvironmentId === environmentId;
   const errorTraceId = environment.connection.traceId;
@@ -1515,6 +1517,23 @@ function SavedBackendListRow({
     serverUpdateState.status === "running" && serverUpdateState.stage === "resuming";
   const status = savedBackendStatus(environment);
   const serverVersion = environment.serverConfig?.environment.serverVersion ?? null;
+  // A saved T3 Connect machine this device has never reached (unsupported,
+  // or not yet connected) still has a descriptor from relay discovery, so
+  // it can wear its detected glyph instead of the generic server. Discovery
+  // empties its map on every refresh, so hold the last descriptor seen or
+  // the glyph would blink back to the generic one each time.
+  const relayDiscovery = useRelayEnvironmentDiscovery();
+  const discoveredDescriptor = Option.getOrNull(
+    relayDiscovery.environments.get(environmentId)?.status ?? Option.none(),
+  )?.descriptor;
+  const [lastDescriptor, setLastDescriptor] = useState(discoveredDescriptor);
+  if (discoveredDescriptor !== undefined && discoveredDescriptor !== lastDescriptor) {
+    setLastDescriptor(discoveredDescriptor);
+  }
+  const machineKind = resolveEnvironmentMachineKind(
+    environment.serverConfig ??
+      (lastDescriptor === undefined ? null : { environment: lastDescriptor }),
+  );
   const subtitleText = [
     environmentTransportLabel(environment),
     resumingServerUpdate ? "Restarting" : status.text,
@@ -1531,14 +1550,29 @@ function SavedBackendListRow({
     versionMismatch !== null &&
     (serverUpdateState.status === "idle" || serverUpdateState.status === "failed");
 
+  const statusTooltip = `${
+    unsupported
+      ? (environment.connection.error ?? connectionStatusText(environment.connection))
+      : enabled
+        ? connectionStatusText(environment.connection)
+        : "Switched off"
+  }${
+    versionMismatch
+      ? `\nUpdate available: ${versionMismatch.serverVersion} → ${versionMismatch.clientVersion}`
+      : ""
+  }`;
+
   return (
     <EnvironmentRow
-      kind={resolveEnvironmentMachineKind(environment.serverConfig)}
+      kind={machineKind}
       label={environment.label}
       dimmed={!enabled}
       subtitle={
         <Tooltip>
+          {/* The status can change while the tooltip is open, and base-ui only
+              re-measures the popup when the trigger's payload changes. */}
           <TooltipTrigger
+            payload={statusTooltip}
             render={
               <span
                 className={cn(
@@ -1550,11 +1584,8 @@ function SavedBackendListRow({
           >
             {subtitleText}
           </TooltipTrigger>
-          <TooltipPopup side="top" className="max-w-80 whitespace-pre-wrap leading-tight">
-            {enabled ? connectionStatusText(environment.connection) : "Switched off"}
-            {versionMismatch
-              ? `\nUpdate available: ${versionMismatch.serverVersion} → ${versionMismatch.clientVersion}`
-              : ""}
+          <TooltipPopup side="top" className="whitespace-pre-wrap">
+            {statusTooltip}
           </TooltipPopup>
         </Tooltip>
       }
@@ -1584,22 +1615,23 @@ function SavedBackendListRow({
             <Switch
               size="sm"
               checked={enabled}
-              disabled={isRemoving}
+              disabled={isRemoving || unsupported}
               aria-label={`${enabled ? "Switch off" : "Switch on"} ${environment.label}`}
               onCheckedChange={(checked) => onSetEnabled(environmentId, checked)}
             />
           }
         />
-        <TooltipPopup side="top">{enabled ? "Switch off" : "Switch on"}</TooltipPopup>
+        <TooltipPopup side="top">
+          {unsupported ? "Client not supported" : enabled ? "Switch off" : "Switch on"}
+        </TooltipPopup>
       </Tooltip>
       <Menu>
         <MenuTrigger
           render={
             <Button
               type="button"
-              variant="ghost"
+              variant="ghost-muted"
               size="icon-xs"
-              className="text-muted-foreground hover:text-foreground"
               disabled={isRemoving}
               aria-label={`More actions for ${environment.label}`}
             />
@@ -1607,7 +1639,7 @@ function SavedBackendListRow({
         >
           <EllipsisIcon className="size-3.5" />
         </MenuTrigger>
-        <MenuPopup align="end" className="min-w-52">
+        <MenuPopup align="end">
           <EnvironmentIconMenu
             environmentId={environmentId}
             serverConfig={environment.serverConfig}
@@ -2483,18 +2515,8 @@ export function ConnectionsSettings() {
     [setEnvironmentEnabled],
   );
 
-  // Removing forgets the pairing, credentials, and cached threads on this
-  // device. Switching off is the reversible path, so removal always confirms.
-  const handleRemoveSavedBackend = useCallback(
+  const removeSavedBackend = useCallback(
     async (environment: EnvironmentPresentation) => {
-      // Fail closed: no mounted confirm host means no removal.
-      const confirmed = await requestConfirmDialog(
-        `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
-        { variant: "destructive" },
-      );
-      if (confirmed !== true) {
-        return;
-      }
       const environmentId = environment.environmentId;
       setRemovingSavedEnvironmentId(environmentId);
       setSavedBackendError(null);
@@ -2514,6 +2536,28 @@ export function ConnectionsSettings() {
       }
     },
     [removeEnvironment],
+  );
+
+  // Removing forgets the pairing, credentials, and cached threads on this
+  // device. Switching off is the reversible path, so removal always confirms.
+  // T3 Connect environments get their own dialog: removing one here leaves its
+  // account registration, so it points to where that can be deregistered.
+  const [pendingT3ConnectRemoval, setPendingT3ConnectRemoval] =
+    useState<EnvironmentPresentation | null>(null);
+  const handleRemoveSavedBackend = useCallback(
+    async (environment: EnvironmentPresentation) => {
+      if (environment.relayManaged && hasCloudPublicConfig()) {
+        setPendingT3ConnectRemoval(environment);
+        return;
+      }
+      // Fail closed: no mounted confirm host means no removal.
+      const confirmed = await requestConfirmDialog(
+        `Remove ${environment.label} from this device?\nThis forgets its pairing, credentials, and cached threads here. Switch it off instead to keep it saved.`,
+        { variant: "destructive" },
+      );
+      if (confirmed === true) await removeSavedBackend(environment);
+    },
+    [removeSavedBackend],
   );
 
   const visibleDesktopPairingLinks = desktopPairingLinks;
@@ -2637,7 +2681,7 @@ export function ConnectionsSettings() {
         </label>
       </div>
       <div>
-        <span className="mt-1 block text-[11px] text-muted-foreground">
+        <span className="mt-1 block text-2xs text-muted-foreground">
           Paste a full pairing URL here to fill both fields automatically.
         </span>
       </div>
@@ -2710,7 +2754,7 @@ export function ConnectionsSettings() {
                         <AutocompleteItem
                           key={`${target.alias}:${target.hostname}:${target.port ?? ""}`}
                           value={target}
-                          className="h-8 min-h-8 gap-2 whitespace-nowrap"
+                          className="h-8 min-h-8 whitespace-nowrap"
                         >
                           <span className="min-w-0 truncate text-sm font-medium">
                             {target.alias}
@@ -2730,7 +2774,7 @@ export function ConnectionsSettings() {
                     })}
                   </AutocompleteList>
                 ) : (
-                  <AutocompleteEmpty className="break-all px-3 py-2 text-xs">
+                  <AutocompleteEmpty className="break-all">
                     No hosts match "{savedBackendSshHost.trim()}".
                   </AutocompleteEmpty>
                 )}
@@ -3263,16 +3307,15 @@ export function ConnectionsSettings() {
                     render={
                       <Button
                         type="button"
-                        variant="ghost"
+                        variant="ghost-muted"
                         size="icon-xs"
-                        className="text-muted-foreground hover:text-foreground"
                         aria-label="More actions for this machine"
                       />
                     }
                   >
                     <EllipsisIcon className="size-3.5" />
                   </MenuTrigger>
-                  <MenuPopup align="end" className="min-w-52">
+                  <MenuPopup align="end">
                     <EnvironmentIconMenu
                       environmentId={primaryEnvironmentId}
                       serverConfig={primaryServerConfig}
@@ -3388,8 +3431,8 @@ export function ConnectionsSettings() {
                 </AlertDialogTitle>
                 <AlertDialogDescription>
                   {pendingDesktopServerExposureMode === "network-accessible"
-                    ? "T3 Code will restart to expose this environment over the network."
-                    : "T3 Code will restart and limit this environment back to this machine."}
+                    ? "Let your other devices connect to T3 Code over the network. Pair devices to give them access. T3 Code will restart."
+                    : "Devices connected over your local network will disconnect. Existing tunnels, such as T3 Connect or Tailscale HTTPS, keep working. T3 Code will restart."}
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -3397,27 +3440,23 @@ export function ConnectionsSettings() {
                   disabled={isUpdatingDesktopServerExposure}
                   render={<Button variant="outline" disabled={isUpdatingDesktopServerExposure} />}
                 >
-                  Cancel
+                  <span className="[text-box:trim-both_cap_alphabetic]">Cancel</span>
                 </AlertDialogClose>
                 <Button
-                  variant={
-                    pendingDesktopServerExposureMode === "local-only" ? "destructive" : "default"
-                  }
+                  variant="default"
                   onClick={handleConfirmDesktopServerExposureChange}
                   disabled={
                     pendingDesktopServerExposureMode === null || isUpdatingDesktopServerExposure
                   }
                 >
-                  {isUpdatingDesktopServerExposure ? (
-                    <>
-                      <Spinner className="size-3.5" />
-                      Restarting…
-                    </>
-                  ) : pendingDesktopServerExposureMode === "network-accessible" ? (
-                    "Restart and enable"
-                  ) : (
-                    "Restart and disable"
-                  )}
+                  {isUpdatingDesktopServerExposure && <Spinner size="sm" />}
+                  <span className="[text-box:trim-both_cap_alphabetic]">
+                    {isUpdatingDesktopServerExposure
+                      ? "Restarting…"
+                      : pendingDesktopServerExposureMode === "network-accessible"
+                        ? "Restart and enable"
+                        : "Restart and disable"}
+                  </span>
                 </Button>
               </AlertDialogFooter>
             </AlertDialogPopup>
@@ -3474,7 +3513,7 @@ export function ConnectionsSettings() {
                     >
                       {isUpdatingWslBackend ? (
                         <>
-                          <Spinner className="size-3.5" />
+                          <Spinner size="sm" />
                           Applying…
                         </>
                       ) : (
@@ -3488,7 +3527,7 @@ export function ConnectionsSettings() {
                     >
                       {isUpdatingWslBackend ? (
                         <>
-                          <Spinner className="size-3.5" />
+                          <Spinner size="sm" />
                           Applying…
                         </>
                       ) : (
@@ -3509,7 +3548,7 @@ export function ConnectionsSettings() {
                   >
                     {isUpdatingWslBackend ? (
                       <>
-                        <Spinner className="size-3.5" />
+                        <Spinner size="sm" />
                         Applying…
                       </>
                     ) : pendingWslChange?.kind === "disable" ? (
@@ -3558,7 +3597,7 @@ export function ConnectionsSettings() {
                 >
                   {isUpdatingTailscaleServe ? (
                     <>
-                      <Spinner className="size-3.5" />
+                      <Spinner size="sm" />
                       Restarting…
                     </>
                   ) : (
@@ -3583,7 +3622,7 @@ export function ConnectionsSettings() {
                   Tailscale to proxy HTTPS traffic to this backend.
                 </DialogDescription>
               </DialogHeader>
-              <DialogPanel className="space-y-4">
+              <DialogPanel>
                 <label className="block">
                   <span className="text-sm font-medium text-foreground">HTTPS port</span>
                   <Input
@@ -3612,9 +3651,7 @@ export function ConnectionsSettings() {
                       }
                     />
                     {pendingTailscaleServeBaseUrl ? (
-                      <TooltipPopup side="top" className="max-w-80">
-                        {pendingTailscaleServeBaseUrl}
-                      </TooltipPopup>
+                      <TooltipPopup side="top">{pendingTailscaleServeBaseUrl}</TooltipPopup>
                     ) : null}
                   </Tooltip>
                 </div>
@@ -3632,7 +3669,7 @@ export function ConnectionsSettings() {
                 >
                   {isUpdatingTailscaleServe ? (
                     <>
-                      <Spinner className="size-3.5" />
+                      <Spinner size="sm" />
                       Restarting…
                     </>
                   ) : (
@@ -3664,11 +3701,7 @@ export function ConnectionsSettings() {
         headerAction={
           <div className="flex items-center gap-1">
             {savedServerUpdateTargets.length > 0 ? (
-              <ServerUpdatesAction
-                targets={savedServerUpdateTargets}
-                variant="ghost"
-                className="font-normal text-muted-foreground/60 hover:text-muted-foreground"
-              />
+              <ServerUpdatesAction targets={savedServerUpdateTargets} variant="ghost-muted" />
             ) : null}
             <Dialog
               open={addBackendDialogOpen}
@@ -3684,12 +3717,7 @@ export function ConnectionsSettings() {
                   render={
                     <DialogTrigger
                       render={
-                        <Button
-                          size="xs"
-                          variant="ghost"
-                          className="font-normal text-muted-foreground/60 hover:text-muted-foreground"
-                          aria-label="Add environment"
-                        >
+                        <Button size="xs" variant="ghost-muted" aria-label="Add environment">
                           <PlusIcon className="size-3" />
                           <span>Add environment</span>
                         </Button>
@@ -3747,6 +3775,17 @@ export function ConnectionsSettings() {
           savedEnvironments={savedEnvironments}
         />
       </SettingsSection>
+      {hasCloudPublicConfig() ? (
+        <RemoveT3ConnectEnvironmentDialog
+          environmentLabel={pendingT3ConnectRemoval?.label ?? null}
+          onCancel={() => setPendingT3ConnectRemoval(null)}
+          onConfirm={() => {
+            if (!pendingT3ConnectRemoval) return;
+            setPendingT3ConnectRemoval(null);
+            void removeSavedBackend(pendingT3ConnectRemoval);
+          }}
+        />
+      ) : null}
       <LoadBalancingSettings environments={loadBalancingEnvironments} />
       <GitHubRoutingSettings environments={loadBalancingEnvironments} />
     </SettingsPageContainer>

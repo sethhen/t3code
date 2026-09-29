@@ -36,6 +36,7 @@ export interface ProjectSetupScriptRunnerResultStarted {
    * Resolves when the script's shell prints the completion sentinel. The
    * exit code is null when the terminal exited or was closed before the
    * sentinel arrived. Only present when `observeCompletion` was requested.
+   * An exit code of 0 closes the setup shell if it has nothing left running.
    */
   readonly completion?: Effect.Effect<ProjectSetupScriptCompletion>;
 }
@@ -258,7 +259,13 @@ export const make = Effect.gen(function* () {
         }
         if (event.type === "output") {
           lineBuffer += event.data;
-          const lines = lineBuffer.split(/\r?\n/);
+          // A bare carriage return is how installers redraw a progress line in
+          // place; each redraw becomes a short line of its own instead of
+          // being glued into one long one. The wrapper echo is filtered per
+          // segment too, which is why `echoedWrapperLines` is split on the
+          // same `\r`: a line editor repainting the typed command yields the
+          // same segments.
+          const lines = lineBuffer.split(/\r\n|\r|\n/);
           lineBuffer = lines.pop() ?? "";
           // A script that never prints a newline must not grow this forever.
           // The sentinel is always on its own line, so keeping the tail is safe.
@@ -406,6 +413,16 @@ export const make = Effect.gen(function* () {
         Effect.tapError(() => Effect.sync(() => observed?.unsubscribe())),
       );
 
+    // A clean run leaves only an idle prompt behind; its output stays in the
+    // terminal history. A failed run keeps its shell open for a look.
+    const completion = observed?.completion.pipe(
+      Effect.tap(({ exitCode }) =>
+        exitCode === 0
+          ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
+          : Effect.void,
+      ),
+    );
+
     return {
       status: "started",
       scriptId: script.id,
@@ -414,7 +431,7 @@ export const make = Effect.gen(function* () {
       terminalId,
       cwd,
       async: script.async !== false,
-      ...(observed ? { completion: observed.completion } : {}),
+      ...(completion ? { completion } : {}),
     } as const;
   });
 

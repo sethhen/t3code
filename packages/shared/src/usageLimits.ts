@@ -13,6 +13,7 @@ import {
   type ServerProviderSlashCommand,
   isProviderAvailable,
   type ServerProvider,
+  type OrchestrationThreadActivity,
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
   type UsageLimitSourceSnapshots,
@@ -23,6 +24,62 @@ import * as DateTime from "effect/DateTime";
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
+
+export const CHATGPT_USAGE_URL = "https://chatgpt.com/#settings/Usage";
+const CHATGPT_USAGE_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded";
+
+export function usesChatGptSharing(provider: ServerProvider | null | undefined): boolean {
+  return provider?.auth.status === "authenticated" && provider.auth.subscriptionSharing === true;
+}
+
+/** A historical limit must not turn an unrelated current failure into a usage notice. */
+export function isChatGptUsageLimitError(
+  activities: readonly OrchestrationThreadActivity[],
+  error: string | null | undefined,
+): boolean {
+  if (!error) return false;
+  for (let index = activities.length - 1; index >= 0; index--) {
+    const activity = activities[index]!;
+    if (activity.kind !== "runtime.error") continue;
+    const payload = activity.payload;
+    return (
+      typeof payload === "object" &&
+      payload !== null &&
+      "code" in payload &&
+      payload.code === CHATGPT_USAGE_LIMIT_CODE &&
+      "message" in payload &&
+      payload.message === error
+    );
+  }
+  return false;
+}
+
+export const CURSOR_USAGE_WINDOWS = [
+  {
+    id: "totalPercentUsed",
+    label: "Overall",
+    description: "Combined usage across both allowances, not a third quota.",
+  },
+  {
+    id: "autoPercentUsed",
+    label: "Cursor Models",
+    description: "Grok and Composer use this first. Auto can use either pool.",
+  },
+  {
+    id: "apiPercentUsed",
+    label: "Other Models",
+    description: "Claude, GPT, and Gemini use this pool. Grok and Composer fall back here.",
+  },
+] as const;
+
+export function cursorUsageWindowDetails(id: string) {
+  return CURSOR_USAGE_WINDOWS.find((window) => window.id === id);
+}
+
+function cursorUsageWindowRank(id: string): number {
+  const rank = CURSOR_USAGE_WINDOWS.findIndex((window) => window.id === id);
+  return rank < 0 ? CURSOR_USAGE_WINDOWS.length : rank;
+}
 
 /**
  * Providers that belong on the Limits view: enabled, installed, and one whose
@@ -51,6 +108,33 @@ export type LimitPresentations = ReadonlyMap<
     } | null;
   }
 >;
+
+/** One destination per service, even when several accounts or environments use it. */
+export function collectExternalUsageLinks(presentations: LimitPresentations) {
+  const links = new Map<
+    string,
+    {
+      readonly label: string;
+      readonly url: string;
+      readonly message: string | undefined;
+      readonly accounts: readonly string[];
+    }
+  >();
+  for (const presentation of presentations.values()) {
+    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
+      const external = provider.usageLimits?.externalUsage;
+      if (external && provider.auth.status === "authenticated") {
+        const account = `${provider.displayName ?? provider.instanceId} on ${presentation.entry.target.label}`;
+        links.set(external.url, {
+          ...external,
+          message: provider.usageLimits?.unavailable?.message,
+          accounts: [...new Set([...(links.get(external.url)?.accounts ?? []), account])],
+        });
+      }
+    }
+  }
+  return [...links.values()];
+}
 
 function accountKey(driver: ServerProvider["driver"], email: string | undefined): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
@@ -280,6 +364,17 @@ export interface LimitPool {
   readonly driver: ServerProvider["driver"];
   readonly accounts: readonly LimitAccount[];
   readonly windows: readonly LimitPoolWindow[];
+}
+
+/** Show Cursor's two usable pools instead of a combined percentage when both are available. */
+export function displayLimitWindows(pool: LimitPool) {
+  if (pool.driver !== "cursor") return pool.windows;
+  const hasAuto = pool.windows.some((window) => window.id === "autoPercentUsed");
+  const hasApi = pool.windows.some((window) => window.id === "apiPercentUsed");
+  const hasBothPools = hasAuto && hasApi;
+  return pool.windows
+    .filter((window) => !hasBothPools || window.id !== "totalPercentUsed")
+    .sort((left, right) => cursorUsageWindowRank(left.id) - cursorUsageWindowRank(right.id));
 }
 
 const WINDOW_KIND_ORDER: Record<ServerProviderUsageWindow["kind"], number> = {
