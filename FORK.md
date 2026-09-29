@@ -29,6 +29,7 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
 | `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool proxy)         |
 | `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top, may fold the rest) |
+| `apps/server/src/provider/Layers/CodexProvider.ts`                     | skips the usage read for a Codex without a ChatGPT sign-in (pooled Codex), + its test    |
 
 Fork-owned paths (new extensions only touch these):
 

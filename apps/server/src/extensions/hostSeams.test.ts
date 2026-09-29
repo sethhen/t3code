@@ -45,6 +45,16 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "<ProviderSettingsExtensions",
     "fork sections at the top of Settings → Providers",
   ],
+  [
+    "apps/server/src/provider/Layers/CodexProvider.ts",
+    "codexHasNoSubscriptionUsage(accountResponse)",
+    "no usage read for a pooled Codex (custom model_provider)",
+  ],
+  [
+    "apps/server/src/provider/Layers/CodexProvider.ts",
+    "codexHasNoSubscriptionUsage(snapshot.account)",
+    "unsupported (not failed) usage for a pooled Codex",
+  ],
 ];
 
 describe("fork host seams", () => {

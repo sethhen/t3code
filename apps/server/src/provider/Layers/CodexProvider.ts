@@ -147,6 +147,7 @@ function codexAccountEmail(account: CodexSchema.V2GetAccountResponse["account"])
  * `account/rateLimits/read` otherwise (JSON-RPC -32600): an API key, Bedrock,
  * or a custom `model_provider`, which reports no account and needs no OpenAI
  * auth. A signed-out CLI is not one of these; it may still sign in.
+ * t3-ext: the pool runs Codex on a custom `model_provider`.
  */
 function codexHasNoSubscriptionUsage(response: CodexSchema.V2GetAccountResponse): boolean {
   return response.account ? response.account.type !== "chatgpt" : !response.requiresOpenaiAuth;
@@ -451,7 +452,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
       requestAllCodexModels(client),
       // Usage is an enrichment: a failure or a slow answer degrades to "no
       // usage this probe" rather than costing the account and models.
-      codexHasNoSubscriptionUsage(accountResponse)
+      codexHasNoSubscriptionUsage(accountResponse) // t3-ext
         ? Effect.succeed(undefined)
         : client.request("account/rateLimits/read", undefined).pipe(
             Effect.map((response): CodexRateLimitsProbe => ({
@@ -667,7 +668,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
 
   const snapshot = probeResult.success.value;
   const accountStatus = accountProbeStatus(snapshot.account);
-  const usageLimits = codexHasNoSubscriptionUsage(snapshot.account)
+  const usageLimits = codexHasNoSubscriptionUsage(snapshot.account) // t3-ext
     ? makeUnavailableUsageLimits({
         checkedAt,
         reason: "unsupported",

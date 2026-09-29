@@ -473,6 +473,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           }),
       );
 
+      // t3-ext: a pooled Codex (custom model_provider) has no subscription usage
       it.effect("reports usage as unsupported, not failed, for a custom model provider", () =>
         Effect.gen(function* () {
           const status = yield* checkCodexProviderStatus(defaultCodexSettings, () =>
