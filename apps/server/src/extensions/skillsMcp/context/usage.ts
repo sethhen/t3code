@@ -405,7 +405,7 @@ const scanFile = (stat: FileStat, previous: FileEntry | undefined, path: Path.Pa
       let position = base?.offset ?? 0;
       let offset = position;
       let pending: NodeBuffer.Buffer[] = [];
-      yield* handle.seek(position, "start");
+      yield* handle.seek(BigInt(position), "start");
 
       while (position < stat.size) {
         const read = Number(
