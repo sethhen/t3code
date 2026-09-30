@@ -43,6 +43,7 @@ import {
   fetchCodexCatalog,
   listAuthFiles,
   loginStatus,
+  planRank,
   poolProviderOf,
   probeClientKey,
   readRouting,
@@ -176,6 +177,8 @@ export class PoolController {
   /** Claude plan labels by auth file name, and when to read each again. */
   private claudePlans = new Map<string, { readonly plan?: string; readonly nextAt: number }>();
   private fetchingPlans: Promise<void> | undefined;
+  /** The plan each account last showed, so a failed usage read doesn't blank it or move its row. */
+  private shownPlans = new Map<string, string>();
   private unregisterOverlay: (() => void) | undefined;
   private closed = false;
   /** Bumped by every stop; a start that began under an older generation must not spawn. */
@@ -577,13 +580,16 @@ export class PoolController {
       (await this.deps.usageAccounts().catch(() => [])).map((account) => [account.id, account]),
     );
     const now = Date.now();
+    const shownPlans = new Map<string, string>();
     const accounts = this.accounts.flatMap((file): PoolAccount[] => {
       const provider = poolProviderOf(file.provider);
       if (!provider) return [];
       const reading = usage.get(file.name);
       const plan =
         (provider === "claude" ? this.claudePlans.get(file.name)?.plan : undefined) ??
-        reading?.plan;
+        reading?.plan ??
+        this.shownPlans.get(file.name);
+      if (plan) shownPlans.set(file.name, plan);
       return [
         {
           id: file.name,
@@ -595,6 +601,9 @@ export class PoolController {
         },
       ];
     });
+    this.shownPlans = shownPlans;
+    // Stable: accounts on the same plan keep the proxy's order.
+    accounts.sort((a, b) => planRank(b.plan) - planRank(a.plan));
     const context = this.routingContext();
     const routes = describeRoutes(await this.deps.instanceMap(), context, (provider) =>
       this.state.source === "external"

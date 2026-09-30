@@ -11,7 +11,7 @@ import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, ProviderDriverKind } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 
 import { PoolController, type PoolDeps } from "./controller.ts";
@@ -331,6 +331,45 @@ describe("controller", () => {
       assert.match(String(failure), /Unknown account/);
     }
     assert.strictEqual(installs, before, "the guard runs before any start");
+    await pool.shutdown();
+  });
+
+  it("lists accounts highest plan first and keeps a plan through a failed read", async () => {
+    const paths = poolPaths(tempDir());
+    NodeFS.mkdirSync(paths.authDir, { recursive: true });
+    const plans: Record<string, string> = {
+      "codex-plus.json": "ChatGPT Plus Subscription",
+      "codex-pro.json": "ChatGPT Pro 20x Subscription",
+      "codex-prolite.json": "ChatGPT Pro 5x Subscription",
+    };
+    for (const name of Object.keys(plans)) {
+      NodeFS.writeFileSync(NodePath.join(paths.authDir, name), JSON.stringify({ type: "codex" }));
+    }
+    let proReadFails = false;
+    const { deps } = fakeDeps(paths, {
+      installBinary: async () => {
+        throw new Error("offline");
+      },
+      usageAccounts: async () =>
+        Object.entries(plans).map(([id, plan]) => ({
+          id,
+          driver: ProviderDriverKind.make("codex"),
+          ...(proReadFails && id === "codex-pro.json" ? {} : { plan }),
+          usageLimits: { checkedAt: "2026-09-30T00:00:00.000Z", windows: [] },
+        })),
+    });
+    const pool = new PoolController(deps);
+    await pool.init();
+    const listed = async () =>
+      (await pool.status()).accounts.map((account) => `${account.id} ${account.plan}`);
+    const expected = [
+      "codex-pro.json ChatGPT Pro 20x Subscription",
+      "codex-prolite.json ChatGPT Pro 5x Subscription",
+      "codex-plus.json ChatGPT Plus Subscription",
+    ];
+    assert.deepEqual(await listed(), expected);
+    proReadFails = true;
+    assert.deepEqual(await listed(), expected);
     await pool.shutdown();
   });
 

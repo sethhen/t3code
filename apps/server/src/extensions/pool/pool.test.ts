@@ -9,9 +9,16 @@ import { assert, describe, it } from "@effect/vitest";
 
 import { RELEASE_ASSETS, binaryName, ensureBinary } from "./binary.ts";
 import { renderProxyConfig } from "./config.ts";
-import { accountStatusOf, claudePlanLabel, decodeAuthFiles, joinUrl } from "./management.ts";
+import {
+  accountStatusOf,
+  claudePlanLabel,
+  decodeAuthFiles,
+  joinUrl,
+  planRank,
+} from "./management.ts";
 import { findEnvConflicts } from "./parity.ts";
 import { decodePoolState, defaultRouteMode } from "./state.ts";
+import { codexPlanLabel } from "./t3.ts";
 
 describe("proxy config", () => {
   const yaml = renderProxyConfig({
@@ -71,6 +78,36 @@ describe("claude plan", () => {
     assert.isUndefined(claudePlanLabel(profile("api_individual", null)));
     assert.isUndefined(claudePlanLabel({}));
     assert.isUndefined(claudePlanLabel(null));
+  });
+});
+
+describe("plan order", () => {
+  const assertDescending = (ranks: ReadonlyArray<number>) =>
+    ranks.slice(1).forEach((rank, index) => assert.isBelow(rank, ranks[index]!));
+
+  it("ranks every ChatGPT plan upstream labels, highest first", () => {
+    assertDescending(
+      ["promax", "pro", "prolite", "plus", "go", "free"].map((slug) =>
+        planRank(codexPlanLabel(slug)),
+      ),
+    );
+    for (const slug of ["team", "business", "enterprise", "edu"]) {
+      assert.strictEqual(planRank(codexPlanLabel(slug)), 1, slug);
+    }
+  });
+
+  it("ranks Claude plans by usage and unknown plans last", () => {
+    const organization = (organization_type: string, rate_limit_tier: string | null = null) =>
+      claudePlanLabel({ organization: { organization_type, rate_limit_tier } });
+    assertDescending([
+      planRank(organization("claude_max", "default_claude_max_20x")),
+      planRank(organization("claude_max", "default_claude_max_5x")),
+      planRank(organization("claude_pro")),
+    ]);
+    assert.strictEqual(planRank(organization("claude_team")), 1);
+    assert.strictEqual(planRank(organization("claude_enterprise")), 1);
+    assert.strictEqual(planRank("Claude Subscription"), -1);
+    assert.strictEqual(planRank(undefined), -1);
   });
 });
 

@@ -176,7 +176,7 @@ export function accountNotice(account: PoolAccount): AccountNotice | null {
   }
 }
 
-/** Claude first, then Codex; server order within a provider, so rows never jump between polls. */
+/** Claude first, then Codex; server order (highest plan first) within a provider, so rows never jump between polls. */
 export function orderAccounts(accounts: readonly PoolAccount[]): PoolAccount[] {
   return POOL_PROVIDERS.flatMap((provider) =>
     accounts.filter((account) => account.provider === provider),

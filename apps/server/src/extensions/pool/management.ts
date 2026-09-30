@@ -243,6 +243,35 @@ export const claudePlanLabel = (profile: unknown): string | undefined => {
 };
 
 /**
+ * How far up its provider's list an account sorts: the plan's usage multiple
+ * where the provider publishes one (Plus and Pro = 1x, standard seats too).
+ * Keyed by the labels above and upstream's `codexPlanLabel`.
+ */
+const PLAN_RANK: Readonly<Record<string, number>> = {
+  // OpenAI publishes no multiple for Pro Max; it sits above Pro 20x.
+  "ChatGPT Pro Max Subscription": 40,
+  "ChatGPT Pro 20x Subscription": 20,
+  "ChatGPT Pro 5x Subscription": 5,
+  "ChatGPT Plus Subscription": 1,
+  "ChatGPT Team Subscription": 1,
+  "ChatGPT Business Subscription": 1,
+  "ChatGPT Enterprise Subscription": 1,
+  "ChatGPT Edu Subscription": 1,
+  "ChatGPT Go Subscription": 0.5,
+  "ChatGPT Free Subscription": 0,
+  "Claude Max 20x Subscription": 20,
+  "Claude Max 5x Subscription": 5,
+  "Claude Max Subscription": 5,
+  "Claude Pro Subscription": 1,
+  "Claude Team Subscription": 1,
+  "Claude Enterprise Subscription": 1,
+};
+
+/** Higher plans first; an unknown or missing plan sorts last. */
+export const planRank = (plan: string | undefined): number =>
+  plan === undefined ? -1 : (PLAN_RANK[plan] ?? -1);
+
+/**
  * A Claude account's plan, from the OAuth profile Claude Code reads after
  * sign-in. The proxy's auth file doesn't record it, and the usage source only
  * knows "Claude Subscription".
