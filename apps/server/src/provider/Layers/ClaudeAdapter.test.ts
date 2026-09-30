@@ -4736,6 +4736,81 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  // t3-ext: a pooled session waits out every account's cooldown instead of failing.
+  it.effect("surfaces a long rate-limit retry wait once per wait", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const { runtimeEvents, runtimeEventsFiber, drainSdkMessages } =
+        yield* observeUsageLimitEvents(adapter, harness.query);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "hello", attachments: [] });
+
+      // Claude Code sleeps until the proxy's Retry-After, sending a heartbeat
+      // every 30s with the same attempt.
+      const retry = (attempt: number, retryDelayMs: number, uuid: string) =>
+        ({
+          type: "system",
+          subtype: "api_retry",
+          attempt,
+          max_retries: 300,
+          retry_delay_ms: retryDelayMs,
+          error_status: 429,
+          error: "rate_limit",
+          session_id: "sdk-session-limit",
+          uuid,
+        }) as unknown as SDKMessage;
+      const warningRows = () =>
+        runtimeEvents
+          .filter((event) => event.type === "runtime.warning")
+          .map((event) => (event.type === "runtime.warning" ? event.payload.message : ""));
+
+      harness.query.emit(retry(1, 90 * 60_000, "wait-1"));
+      harness.query.emit(retry(1, 90 * 60_000 - 30_000, "wait-1-heartbeat"));
+      yield* drainSdkMessages;
+      assert.deepEqual(warningRows(), [
+        "Claude is rate limited. This turn is paused and retries in 1h 30m.",
+      ]);
+
+      // The retry met another 429: a new wait gets its own row.
+      harness.query.emit(retry(2, 20 * 60_000, "wait-2"));
+      yield* drainSdkMessages;
+      assert.equal(warningRows().length, 2);
+
+      // A rejected usage window already explains the pause in its own row.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: "sdk-session-limit",
+        uuid: "result-wait",
+      } as unknown as SDKMessage);
+      yield* drainSdkMessages;
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "again", attachments: [] });
+      harness.query.emit({
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected", rateLimitType: "five_hour" },
+        session_id: "sdk-session-limit",
+        uuid: "wait-rejected",
+      } as unknown as SDKMessage);
+      harness.query.emit(retry(1, 90 * 60_000, "wait-after-rejected"));
+      yield* drainSdkMessages;
+      assert.equal(warningRows().length, 3);
+      assert.match(warningRows()[2] ?? "", /^Claude usage limit reached\./);
+
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("keeps allowed and malformed Claude rate-limit events out of the work log", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

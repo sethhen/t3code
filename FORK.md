@@ -25,7 +25,7 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/web/src/components/RightPanelTabs.tsx`                           | extension entries in the add-tab menu, label/icon                                        |
 | `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`                                                               |
 | `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
-| `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges an inline `--settings` launch argument into T3's Claude settings                  |
+| `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait (pool), + its test     |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
 | `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool proxy)         |
 | `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top, may fold the rest) |
@@ -146,7 +146,10 @@ alias in the instance env or `~/.claude/settings.json`) as a failing "Model fami
 3. In the app: Settings → Providers → ⋯ → **Run checks** is all green. A failing **Tool
    search** means Claude Code changed how it treats proxies: search its binary for
    `is not a first-party Anthropic host` to find the new switch.
-4. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
+4. After a Claude Code update, its binary still reads `CLAUDE_CODE_RETRY_WATCHDOG` (undocumented;
+   `overlay.ts` sets it so a thread waits out an exhausted pool instead of failing, subagents too).
+   Search the binary for the name; if it's gone, find the new persistent-retry switch.
+5. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
 
 Known limits: during sign-in the proxy's OAuth callback listeners (54545 Claude, 1455 Codex) bind
 all interfaces (CLIProxyAPI has no option to restrict them); on Windows a hard-killed server leaves

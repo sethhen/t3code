@@ -31,6 +31,11 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "flag --settings for Claude sessions (pool env + advisor)",
   ],
   [
+    "apps/server/src/provider/Layers/ClaudeAdapter.ts",
+    "describeClaudeRetryWait(message)",
+    "work-log row while a pooled turn waits out a rate limit",
+  ],
+  [
     "apps/server/src/textGeneration/ClaudeTextGeneration.ts",
     "...launchArgSettings(claudeSettings.launchArgs)",
     "flag --settings for Claude text generation",

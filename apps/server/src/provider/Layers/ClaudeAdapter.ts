@@ -118,6 +118,7 @@ import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import { spawnAndCollect } from "../providerSnapshot.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { launchArgSettings } from "../../extensions/claudeSettings.ts"; // t3-ext
+import { describeClaudeRetryWait } from "../../extensions/claudeRetryWait.ts"; // t3-ext
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const encodeHistoryArgs = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -3893,7 +3894,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         return;
       case "thinking_tokens":
         return;
-      case "api_retry":
+      case "api_retry": {
         // Transport-level retry heartbeat. Surfacing each attempt as a
         // warning row spammed the work log (10 rows during a 502 storm);
         // the terminal result/error path reports the actual failure. Keep
@@ -3906,7 +3907,22 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             reason: `api_retry:${message.attempt}/${message.max_retries}`,
           },
         });
+        // A long rate-limit wait (a pooled session waiting out every account's
+        // cooldown) gets one row per wait, unless a usage-limit row already
+        // explains the pause.
+        const retryWait = describeClaudeRetryWait(message); // t3-ext
+        const turnState = context.turnState;
+        if (retryWait && turnState && turnState.rejectedRateLimitTypes.size === 0) {
+          if (context.announcedUsageLimits?.turnId !== turnState.turnId) {
+            context.announcedUsageLimits = { turnId: turnState.turnId, keys: new Set() };
+          }
+          if (!context.announcedUsageLimits.keys.has(retryWait.key)) {
+            context.announcedUsageLimits.keys.add(retryWait.key);
+            yield* emitRuntimeWarning(context, retryWait.text, message);
+          }
+        }
         return;
+      }
       case "session_state_changed":
         // Authoritative turn-over signal from the CLI.
         yield* offerRuntimeEvent({
