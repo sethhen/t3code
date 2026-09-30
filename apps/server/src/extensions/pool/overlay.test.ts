@@ -45,6 +45,7 @@ describe("routeInstance: Claude", () => {
     assert.strictEqual(env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL?.value, "1");
     assert.strictEqual(env.ENABLE_TOOL_SEARCH?.value, "true");
     assert.strictEqual(env.CLAUDE_CODE_PROMPT_CACHE_TTL?.value, "1h");
+    assert.strictEqual(env.CLAUDE_CODE_RETRY_WATCHDOG?.value, "1");
     assert.strictEqual(env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY?.value, "0");
 
     // Flag settings outrank ~/.claude/settings.json's env block.
@@ -56,6 +57,7 @@ describe("routeInstance: Claude", () => {
     assert.strictEqual(settings.advisorModel, "opus");
     assert.strictEqual(settings.env.ANTHROPIC_BASE_URL, endpoint.baseUrl);
     assert.strictEqual(settings.env._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL, "1");
+    assert.strictEqual(settings.env.CLAUDE_CODE_RETRY_WATCHDOG, "1");
     assert.strictEqual(settings.env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY, "0");
     assert.isTrue(launchArgs(routed).startsWith("--chrome "));
   });

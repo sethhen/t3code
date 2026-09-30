@@ -21,6 +21,13 @@
  *   their claude.ai login, which a proxied session doesn't carry.
  * - `advisorModel`: the advisor's model normally comes from the account.
  *
+ * `CLAUDE_CODE_RETRY_WATCHDOG` is pool-only, not parity. The proxy fails over
+ * between accounts itself, so a 429 that reaches Claude Code means every account
+ * is cooling down, with `Retry-After` set to the earliest reset. Claude Code
+ * normally fails any retry longer than a minute, which kills the thread and every
+ * subagent in flight. With the watchdog on it waits out the reset (sleeping in
+ * 30s steps that keep background agents' stall timer alive) and carries on.
+ *
  * The pool key never appears in a command line (argv shows up in `ps`, in trace
  * attributes and in T3's resource telemetry): flag settings blank both token
  * variables, which also neutralises a stale token in `~/.claude/settings.json`,
@@ -92,6 +99,7 @@ export const claudeParityEnv = (endpoint: PoolEndpoint): Readonly<Record<string,
   _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL: "1",
   ENABLE_TOOL_SEARCH: "true",
   CLAUDE_CODE_PROMPT_CACHE_TTL: "1h",
+  CLAUDE_CODE_RETRY_WATCHDOG: "1",
   // Gateway model discovery would list the pool's OpenAI models in Claude Code.
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "0",
 });
