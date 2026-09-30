@@ -39,6 +39,7 @@ import {
   type AuthFileEntry,
   accountStatusOf,
   deleteAuthFile,
+  fetchClaudePlan,
   fetchCodexCatalog,
   listAuthFiles,
   loginStatus,
@@ -119,6 +120,10 @@ const CLAUDE_MODEL_ALIASES: ReadonlyArray<string> = [
 /** Native Codex refreshes its catalog on a similar cadence. */
 const CODEX_CATALOG_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
+/** A plan rarely changes; a failed read (e.g. a token mid-refresh) retries sooner. */
+const CLAUDE_PLAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const CLAUDE_PLAN_RETRY_MS = 5 * 60 * 1000;
+
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /** Auth files straight from disk, for when the proxy isn't running (e.g. at boot). */
@@ -168,6 +173,9 @@ export class PoolController {
   private codexCatalogPath: string | undefined;
   private codexCatalogError: string | undefined;
   private fetchingCatalog: Promise<void> | undefined;
+  /** Claude plan labels by auth file name, and when to read each again. */
+  private claudePlans = new Map<string, { readonly plan?: string; readonly nextAt: number }>();
+  private fetchingPlans: Promise<void> | undefined;
   private unregisterOverlay: (() => void) | undefined;
   private closed = false;
   /** Bumped by every stop; a start that began under an older generation must not spawn. */
@@ -403,6 +411,7 @@ export class PoolController {
   private async afterProxyUp() {
     await this.refreshAccounts().catch(() => undefined);
     void this.refreshCodexCatalog();
+    void this.refreshClaudePlans();
     await this.syncUsageSource().catch((error) => this.deps.log("Pool usage source", error));
     void this.runChecks();
   }
@@ -467,6 +476,42 @@ export class PoolController {
     await this.applyRouting();
   }
 
+  private refreshClaudePlans(): Promise<void> {
+    if (this.fetchingPlans) return this.fetchingPlans;
+    this.fetchingPlans = this.fetchDueClaudePlans()
+      .catch((error) => this.deps.log("Pool Claude plans", error))
+      .finally(() => {
+        this.fetchingPlans = undefined;
+      });
+    return this.fetchingPlans;
+  }
+
+  private async fetchDueClaudePlans() {
+    if (this.state.source !== "local" || !this.running) return;
+    const names = new Set(this.accounts.map((file) => file.name));
+    for (const name of this.claudePlans.keys()) {
+      if (!names.has(name)) this.claudePlans.delete(name);
+    }
+    const now = Date.now();
+    const due = this.accounts.filter(
+      (file) =>
+        file.provider === "claude" &&
+        file.authIndex &&
+        (this.claudePlans.get(file.name)?.nextAt ?? 0) <= now,
+    );
+    await Promise.all(
+      due.map(async (file) => {
+        const plan = await fetchClaudePlan(this.target, file).catch(() => null);
+        // A failed read keeps the last label: plans rarely change.
+        const known = plan === null ? this.claudePlans.get(file.name)?.plan : plan;
+        this.claudePlans.set(file.name, {
+          ...(known ? { plan: known } : {}),
+          nextAt: Date.now() + (plan === null ? CLAUDE_PLAN_RETRY_MS : CLAUDE_PLAN_MAX_AGE_MS),
+        });
+      }),
+    );
+  }
+
   private async syncUsageSource() {
     const current = await this.deps.usageSource();
     const wanted: UsageLimitSourceConfig | null =
@@ -526,6 +571,7 @@ export class PoolController {
     if (this.state.source === "local" && this.running) {
       await this.refreshAccounts();
       void this.refreshCodexCatalog();
+      void this.refreshClaudePlans();
     }
     const usage = new Map(
       (await this.deps.usageAccounts().catch(() => [])).map((account) => [account.id, account]),
@@ -535,12 +581,15 @@ export class PoolController {
       const provider = poolProviderOf(file.provider);
       if (!provider) return [];
       const reading = usage.get(file.name);
+      const plan =
+        (provider === "claude" ? this.claudePlans.get(file.name)?.plan : undefined) ??
+        reading?.plan;
       return [
         {
           id: file.name,
           provider,
           ...(file.email ? { email: file.email } : {}),
-          ...(reading?.plan ? { plan: reading.plan } : {}),
+          ...(plan ? { plan } : {}),
           ...accountStatusOf(file, now),
           windows: [...(reading?.usageLimits.windows ?? [])],
         },

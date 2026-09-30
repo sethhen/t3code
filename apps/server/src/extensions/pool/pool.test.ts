@@ -9,7 +9,7 @@ import { assert, describe, it } from "@effect/vitest";
 
 import { RELEASE_ASSETS, binaryName, ensureBinary } from "./binary.ts";
 import { renderProxyConfig } from "./config.ts";
-import { accountStatusOf, decodeAuthFiles, joinUrl } from "./management.ts";
+import { accountStatusOf, claudePlanLabel, decodeAuthFiles, joinUrl } from "./management.ts";
 import { findEnvConflicts } from "./parity.ts";
 import { decodePoolState, defaultRouteMode } from "./state.ts";
 
@@ -30,6 +30,47 @@ describe("proxy config", () => {
 
   it("quotes paths with spaces", () => {
     assert.include(yaml, 'auth-dir: "/Users/me/Library/Application Support/t3/pool/auth"\n');
+  });
+});
+
+describe("claude plan", () => {
+  // Shape of https://api.anthropic.com/api/oauth/profile (Claude Code 2.1.285), trimmed.
+  const profile = (organizationType: string, rateLimitTier: string | null) => ({
+    account: { uuid: "a", email: "a@example.com", has_claude_max: true, has_claude_pro: false },
+    organization: {
+      uuid: "o",
+      organization_type: organizationType,
+      rate_limit_tier: rateLimitTier,
+      billing_type: "stripe_subscription",
+      seat_tier: null,
+    },
+  });
+
+  it("names the Max tier from the rate limit tier", () => {
+    assert.strictEqual(
+      claudePlanLabel(profile("claude_max", "default_claude_max_20x")),
+      "Claude Max 20x Subscription",
+    );
+    assert.strictEqual(
+      claudePlanLabel(profile("claude_max", "default_claude_max_5x")),
+      "Claude Max 5x Subscription",
+    );
+    assert.strictEqual(claudePlanLabel(profile("claude_max", null)), "Claude Max Subscription");
+  });
+
+  it("names the other subscriptions", () => {
+    assert.strictEqual(claudePlanLabel(profile("claude_pro", null)), "Claude Pro Subscription");
+    assert.strictEqual(claudePlanLabel(profile("claude_team", null)), "Claude Team Subscription");
+    assert.strictEqual(
+      claudePlanLabel(profile("claude_enterprise", null)),
+      "Claude Enterprise Subscription",
+    );
+  });
+
+  it("leaves unknown organizations to the usage source's label", () => {
+    assert.isUndefined(claudePlanLabel(profile("api_individual", null)));
+    assert.isUndefined(claudePlanLabel({}));
+    assert.isUndefined(claudePlanLabel(null));
   });
 });
 

@@ -216,6 +216,60 @@ export const fetchCodexCatalog = async (
   return { models: parsed.models };
 };
 
+/**
+ * The plan label for an Anthropic OAuth profile, worded like upstream's ChatGPT
+ * ones (`codexPlanLabel`). Undefined for an organization type Claude Code
+ * doesn't treat as a subscription either.
+ */
+export const claudePlanLabel = (profile: unknown): string | undefined => {
+  const organization =
+    isRecord(profile) && isRecord(profile.organization) ? profile.organization : {};
+  switch (organization.organization_type) {
+    case "claude_max":
+      return organization.rate_limit_tier === "default_claude_max_20x"
+        ? "Claude Max 20x Subscription"
+        : organization.rate_limit_tier === "default_claude_max_5x"
+          ? "Claude Max 5x Subscription"
+          : "Claude Max Subscription";
+    case "claude_pro":
+      return "Claude Pro Subscription";
+    case "claude_team":
+      return "Claude Team Subscription";
+    case "claude_enterprise":
+      return "Claude Enterprise Subscription";
+    default:
+      return undefined;
+  }
+};
+
+/**
+ * A Claude account's plan, from the OAuth profile Claude Code reads after
+ * sign-in. The proxy's auth file doesn't record it, and the usage source only
+ * knows "Claude Subscription".
+ */
+export const fetchClaudePlan = async (
+  target: ManagementTarget,
+  account: AuthFileEntry,
+): Promise<string | undefined> => {
+  if (!account.authIndex) throw new Error("The Claude account has no proxy handle yet.");
+  const json = await request(target, "api-call", {
+    method: "POST",
+    timeoutMs: 20_000,
+    body: {
+      auth_index: account.authIndex,
+      method: "GET",
+      url: "https://api.anthropic.com/api/oauth/profile",
+      header: { Authorization: "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20" },
+    },
+  });
+  const status = isRecord(json) && typeof json.status_code === "number" ? json.status_code : 0;
+  const body = isRecord(json) && typeof json.body === "string" ? json.body : "";
+  if (status < 200 || status >= 300) {
+    throw new Error(`Anthropic refused the account profile (HTTP ${status}).`);
+  }
+  return claudePlanLabel(JSON.parse(body));
+};
+
 export interface ProxyRouting {
   readonly sessionAffinity: boolean;
   readonly subagentsSpread: boolean;
