@@ -28,6 +28,7 @@ import { cn } from "~/lib/utils";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
+import { agentElapsedClock } from "~/extensions/agentElapsed"; // t3-ext
 
 /**
  * In-flight states all present as Working (one steady state, per the
@@ -85,8 +86,8 @@ function elapsedBetween(startedAt: string, endIso: string | null): string {
  */
 function AgentElapsed({ agent }: { agent: RuntimeSubagent }) {
   const textRef = useRef<HTMLSpanElement>(null);
-  const live = agent.status === "running" || agent.status === "waiting";
-  const startedAt = agent.startedAt;
+  // Pending agents (Claude workflow members) tick too, from a start that never resets.
+  const { live, startedAt } = agentElapsedClock(agent); // t3-ext
 
   useEffect(() => {
     if (!live || !startedAt) {
@@ -419,6 +420,13 @@ function ExpandedWorkflowSection({
         ) : null}
         <span className="ml-auto font-mono normal-case text-muted-foreground/80">
           {settled}/{members.length} settled
+          {/* t3-ext: the run's elapsed, ticking while it runs */}
+          {group.workflow.startedAt ? (
+            <>
+              {" "}
+              · <AgentElapsed agent={group.workflow} />
+            </>
+          ) : null}
         </span>
         <Button
           size="icon-micro"
@@ -470,10 +478,6 @@ function CollapsedWorkflowSection({
     (sum, member) => sum + (member.usage?.totalTokens ?? 0),
     members.length === 0 ? (group.workflow.usage?.totalTokens ?? 0) : 0,
   );
-  const elapsed =
-    group.workflow.startedAt && group.workflow.completedAt
-      ? elapsedBetween(group.workflow.startedAt, group.workflow.completedAt)
-      : null;
   return (
     <section>
       <button
@@ -490,7 +494,12 @@ function CollapsedWorkflowSection({
           {failed > 0 ? <span className="text-destructive-foreground">{failed} failed</span> : null}
           <span>{members.length} agents</span>
           <span className="tabular-nums">· {formatSubagentTokenCount(totalTokens)} tok</span>
-          {elapsed ? <span className="tabular-nums">· {elapsed}</span> : null}
+          {/* t3-ext: a running workflow shows its elapsed too, not only once it completes */}
+          {group.workflow.startedAt ? (
+            <span className="tabular-nums">
+              · <AgentElapsed agent={group.workflow} />
+            </span>
+          ) : null}
           <ChevronRight aria-hidden className="size-3" />
         </span>
       </button>
