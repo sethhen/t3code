@@ -1060,12 +1060,10 @@ export function EnvironmentProviderSettings({
   };
 
   return (
-    // t3-ext: fork sections on top; they may fold these away and own the device tabs
+    // t3-ext: fork sections and the device tabs render above these
     <ProviderSettingsExtensions
       environmentId={environmentId}
-      environmentLabel={environmentLabel}
       readOnly={readOnly}
-      targetInstanceId={targetInstanceId}
       deviceTabs={deviceTabs}
     >
       <SettingsSection
