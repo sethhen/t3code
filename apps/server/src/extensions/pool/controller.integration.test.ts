@@ -72,7 +72,7 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
             },
             usageSource: async () => undefined,
             setUsageSource: async () => undefined,
-            usageAccounts: async () => [],
+            usageSnapshot: async () => undefined,
             refreshUsage: async () => undefined,
             claudeProbe: async (instanceId) => {
               const instance = (await instanceMap())[

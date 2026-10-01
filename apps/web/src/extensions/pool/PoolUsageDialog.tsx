@@ -98,6 +98,10 @@ export function PoolUsageDialog({
   onOpenChange,
   accounts,
   now,
+  onRefreshQuotas,
+  refreshingQuotas,
+  quotaRefreshDisabled,
+  quotaError,
   initialAccountId,
 }: {
   readonly client: PoolClient;
@@ -105,6 +109,10 @@ export function PoolUsageDialog({
   readonly onOpenChange: (open: boolean) => void;
   readonly accounts: readonly PoolAccount[];
   readonly now: number;
+  readonly onRefreshQuotas: () => void;
+  readonly refreshingQuotas: boolean;
+  readonly quotaRefreshDisabled: boolean;
+  readonly quotaError: string | null;
   readonly initialAccountId?: string;
 }) {
   const [range, setRange] = useState<PoolUsageRange>(DEFAULT_POOL_USAGE_RANGE);
@@ -148,7 +156,15 @@ export function PoolUsageDialog({
         </DialogHeader>
         <DialogPanel>
           <div className="flex flex-col gap-6">
-            <CurrentQuotas accounts={accounts} selectedId={quotaAccountId} now={now} />
+            <CurrentQuotas
+              accounts={accounts}
+              selectedId={quotaAccountId}
+              now={now}
+              onRefreshQuotas={onRefreshQuotas}
+              refreshingQuotas={refreshingQuotas}
+              quotaRefreshDisabled={quotaRefreshDisabled}
+              quotaError={quotaError}
+            />
             <div className="flex flex-wrap items-center gap-2">
               <ToggleGroup
                 aria-label="Usage period"
@@ -248,21 +264,53 @@ function CurrentQuotas({
   accounts,
   selectedId,
   now,
+  onRefreshQuotas,
+  refreshingQuotas,
+  quotaRefreshDisabled,
+  quotaError,
 }: {
   readonly accounts: readonly PoolAccount[];
   readonly selectedId: string | null;
   readonly now: number;
+  readonly onRefreshQuotas: () => void;
+  readonly refreshingQuotas: boolean;
+  readonly quotaRefreshDisabled: boolean;
+  readonly quotaError: string | null;
 }) {
   const selectedAccounts =
     selectedId === null ? accounts : accounts.filter((account) => account.id === selectedId);
   return (
     <section className="flex flex-col gap-3" aria-label="Current subscription quota">
-      <div className="flex flex-col gap-1">
-        <h3 className={HEADING}>Current subscription quota</h3>
-        <p className="text-xs text-muted-foreground">
-          Remaining allowance reported by the provider, independent of the usage period below.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex flex-col gap-1">
+          <h3 className={HEADING}>Current subscription quota</h3>
+          <p className="text-xs text-muted-foreground">
+            Remaining allowance reported by the provider, independent of the usage period below.
+          </p>
+        </div>
+        <Button
+          size="xs"
+          variant="ghost-muted"
+          aria-label="Refresh quotas"
+          aria-busy={refreshingQuotas}
+          disabled={quotaRefreshDisabled || refreshingQuotas}
+          onClick={onRefreshQuotas}
+        >
+          <RefreshIcon size="sm" refreshing={refreshingQuotas} />
+          Refresh quotas
+        </Button>
       </div>
+      {quotaError ? (
+        <p role="status" className="text-xs text-warning-foreground">
+          Could not read quotas: {quotaError}{" "}
+          <InlineButton
+            disabled={quotaRefreshDisabled || refreshingQuotas}
+            onClick={onRefreshQuotas}
+          >
+            Retry
+          </InlineButton>
+        </p>
+      ) : null}
       {selectedAccounts.length === 0 ? (
         <p className="text-xs text-muted-foreground">No current quota for this account.</p>
       ) : (
@@ -299,7 +347,7 @@ function CurrentQuotas({
                   </Badge>
                 ) : null}
               </div>
-              <PoolQuota account={account} now={now} />
+              <PoolQuota account={account} now={now} sourceError={quotaError !== null} />
             </div>
           ))}
         </div>

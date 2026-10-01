@@ -88,6 +88,9 @@ export const PoolAccount = Schema.Struct({
   message: Schema.optional(Schema.String),
   /** Quota windows (5-hour, weekly, ...) from the last usage read; empty until one lands. */
   windows: Schema.Array(ServerProviderUsageWindow),
+  /** When this account's quota was last checked, including unsuccessful checks. */
+  quotaCheckedAt: Schema.optional(Schema.String),
+  quotaError: Schema.optional(Schema.String),
   /**
    * The proxy is holding this account back (cooling or error), but a quota read
    * taken after it was benched shows every window below 100%, e.g. after a usage
@@ -133,6 +136,8 @@ export const PoolStatus = Schema.Struct({
   external: PoolExternal,
   accounts: Schema.Array(PoolAccount),
   accountsError: Schema.optional(Schema.String),
+  /** A source-wide quota read failure, separate from the proxy's account listing. */
+  quotaError: Schema.optional(Schema.String),
   routes: Schema.Array(PoolRoute),
   checks: Schema.Array(PoolCheck),
   checkedAt: Schema.optional(Schema.String),
@@ -282,6 +287,8 @@ export type PoolUsage = typeof PoolUsage.Type;
 
 export const PoolExtension = defineExtension(POOL_EXTENSION_ID, {
   status: { input: Schema.Struct({}), output: PoolStatus },
+  /** Reads subscription quota now without starting a turn or clearing a cooldown. */
+  "quota.refresh": { input: Schema.Struct({}), output: PoolStatus },
   setSource: { input: PoolSetSourceInput, output: PoolStatus },
   setRoute: {
     input: Schema.Struct({ instanceId: Schema.String, mode: PoolRouteMode }),

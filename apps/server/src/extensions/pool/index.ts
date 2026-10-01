@@ -24,6 +24,7 @@ const withController = <A>(run: (controller: PoolController) => Promise<A>) =>
 export const makePoolServerExtension = Effect.sync(() =>
   serverExtension(PoolExtension, {
     status: () => withController((pool) => pool.status()),
+    "quota.refresh": () => withController((pool) => pool.refreshQuota()),
     setSource: (input) => withController((pool) => pool.setSource(input)),
     setRoute: ({ instanceId, mode }) => withController((pool) => pool.setRoute(instanceId, mode)),
     "login.start": ({ provider }) => withController((pool) => pool.startLogin(provider)),

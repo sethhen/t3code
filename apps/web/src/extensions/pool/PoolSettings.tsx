@@ -38,10 +38,11 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { type ReactNode, useCallback, useId, useState } from "react";
 
-import { Button } from "~/components/ui/button";
+import { Button, InlineButton } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
+import { RefreshIcon } from "~/components/ui/refresh-icon";
 import {
   Select,
   SelectItem,
@@ -72,8 +73,10 @@ import {
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
+  poolQuotaError,
   poolStartFailure,
   type PoolStartFailure,
+  type QuotaRefreshFailure,
   withLiveStartFailure,
   poolProviderDriver,
   routeWaitingReason,
@@ -144,6 +147,7 @@ export function PoolSettings({
   const [externalFormOpen, setExternalFormOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
   const [checksOpen, setChecksOpen] = useState(false);
+  const [quotaRefreshError, setQuotaRefreshError] = useState<QuotaRefreshFailure | null>(null);
   // The account stays set while the dialog animates closed.
   const [usageView, setUsageView] = useState<{ open: boolean; accountId?: string }>({
     open: false,
@@ -169,6 +173,20 @@ export function PoolSettings({
   };
   const runRestart = () =>
     void actions.run("restart", () => client.call("restart", {}), "Could not restart");
+  const refreshingQuotas = actions.isBusy("quota.refresh");
+  const quotaRefreshDisabled = readOnly || runtimeState !== "running";
+  const quotaError = poolQuotaError(status, quotaRefreshError);
+  const refreshQuotas = async () => {
+    if (quotaRefreshDisabled) return;
+    const outcome = await actions.run(
+      "quota.refresh",
+      () => client.call("quota.refresh", {}),
+      null,
+    );
+    if (outcome !== null) {
+      setQuotaRefreshError(outcome.ok ? null : { message: outcome.message, failedAt: Date.now() });
+    }
+  };
   // One account shares its row's key, so the row shows the spinner; no intent, so pause state holds.
   const resetCooldowns = async (account?: PoolAccount) => {
     const outcome = await actions.run(
@@ -198,7 +216,7 @@ export function PoolSettings({
           title="Providers"
           headerAction={
             status ? (
-              <div className="flex min-w-0 items-center gap-1.5">
+              <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
                 {header ? <HeaderStatusLabel header={header} /> : null}
                 {resetOffered ? (
                   <Button
@@ -209,6 +227,19 @@ export function PoolSettings({
                   >
                     {actions.isBusy("reset") ? <Spinner className="size-3.5" /> : null}
                     Reset cooldowns
+                  </Button>
+                ) : null}
+                {local && status.accounts.length > 0 ? (
+                  <Button
+                    size="xs"
+                    variant="ghost-muted"
+                    aria-label="Refresh quotas"
+                    aria-busy={refreshingQuotas}
+                    disabled={quotaRefreshDisabled || refreshingQuotas}
+                    onClick={() => void refreshQuotas()}
+                  >
+                    <RefreshIcon size="sm" refreshing={refreshingQuotas} />
+                    Refresh quotas
                   </Button>
                 ) : null}
                 {local && status.accounts.length > 0 ? (
@@ -298,6 +329,17 @@ export function PoolSettings({
                   onClose={() => setExternalFormOpen(false)}
                 />
               ) : null}
+              {status.source === "local" && quotaError ? (
+                <p role="status" className="px-3 py-2.5 text-xs text-warning-foreground sm:px-4">
+                  Could not read quotas: {quotaError}{" "}
+                  <InlineButton
+                    disabled={quotaRefreshDisabled || refreshingQuotas}
+                    onClick={() => void refreshQuotas()}
+                  >
+                    Retry
+                  </InlineButton>
+                </p>
+              ) : null}
               {status.source === "local" ? (
                 <PoolAccounts
                   status={status}
@@ -306,6 +348,7 @@ export function PoolSettings({
                   readOnly={readOnly || login.pending}
                   usage={usageSummaries}
                   now={pool.receivedAt}
+                  quotaError={quotaError}
                   onAdd={(provider) => void login.start(provider)}
                   onClearCooldown={(account) => void resetCooldowns(account)}
                   onShowUsage={showUsage}
@@ -350,6 +393,10 @@ export function PoolSettings({
             onOpenChange={(open) => setUsageView((current) => ({ ...current, open }))}
             accounts={status.accounts}
             now={pool.receivedAt}
+            onRefreshQuotas={() => void refreshQuotas()}
+            refreshingQuotas={refreshingQuotas}
+            quotaRefreshDisabled={quotaRefreshDisabled}
+            quotaError={quotaError}
             {...(usageView.accountId ? { initialAccountId: usageView.accountId } : {})}
           />
         ) : null}

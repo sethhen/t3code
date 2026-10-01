@@ -12,11 +12,11 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { DEFAULT_SERVER_SETTINGS, ProviderDriverKind } from "@t3tools/contracts";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 
 import { PoolController, type PoolDeps, attributeSample } from "./controller.ts";
 import type { AuthFileEntry } from "./management.ts";
-import { poolPaths, type PoolPaths } from "./state.ts";
+import { decodePoolState, poolPaths, savePoolState, type PoolPaths } from "./state.ts";
 import { deriveProviderInstanceConfigMap } from "./t3.ts";
 import type { UsageSample } from "./usageTypes.ts";
 
@@ -164,7 +164,7 @@ const deps = (paths: PoolPaths, binary: string, over: Partial<PoolDeps> = {}): P
   reconcile: async () => undefined,
   usageSource: async () => undefined,
   setUsageSource: async () => undefined,
-  usageAccounts: async () => [],
+  usageSnapshot: async () => undefined,
   refreshUsage: async () => undefined,
   claudeProbe: async () => {
     throw new Error("no probe in unit tests");
@@ -279,6 +279,217 @@ describe("attribution", () => {
 });
 
 describe("pool usage and reset", () => {
+  it("checks quota after startup even when the saved source is unchanged", async () => {
+    const api = await startFakeApi();
+    const paths = poolPaths(tempDir());
+    signIn(paths, api, [ACCOUNTS[0]]);
+    const refreshed = Promise.withResolvers<void>();
+    let sourceWrites = 0;
+    const pool = new PoolController(
+      deps(paths, writeForwardingProxy(paths, api), {
+        usageSource: async () => {
+          const state = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
+            port: number;
+            managementKey: string;
+          };
+          return {
+            kind: "cliproxy",
+            label: "Shared accounts",
+            url: `http://127.0.0.1:${state.port}`,
+            managementKey: state.managementKey,
+            enabled: true,
+          };
+        },
+        setUsageSource: async () => {
+          sourceWrites++;
+        },
+        refreshUsage: async () => {
+          assert.include(api.requests, "GET /v0/management/auth-files");
+          refreshed.resolve();
+        },
+      }),
+    );
+    try {
+      await startPool(pool);
+      await refreshed.promise;
+      assert.strictEqual(sourceWrites, 0, "an unchanged source still needs a post-start read");
+      assert.deepStrictEqual(api.resets, []);
+    } finally {
+      await pool.shutdown();
+      await api.close();
+    }
+  });
+
+  it("awaits and shares manual quota refreshes without usage, resets, or restarts", async () => {
+    const api = await startFakeApi();
+    const paths = poolPaths(tempDir());
+    signIn(paths, api, [ACCOUNTS[0]]);
+    const started = Promise.withResolvers<void>();
+    const probing = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const checkedAt = "2026-10-01T03:00:00.000Z";
+    let reads = 0;
+    let manual = false;
+    let snapshot: Awaited<ReturnType<PoolDeps["usageSnapshot"]>>;
+    const pool = new PoolController(
+      deps(paths, writeForwardingProxy(paths, api), {
+        usageSnapshot: async () => snapshot,
+        refreshUsage: async () => {
+          reads++;
+          if (!manual) {
+            started.resolve();
+            return;
+          }
+          probing.resolve();
+          await finish.promise;
+          snapshot = {
+            checkedAt,
+            accounts: [
+              {
+                id: ACCOUNTS[0].name,
+                driver: ProviderDriverKind.make("claudeAgent"),
+                usageLimits: {
+                  checkedAt,
+                  windows: [
+                    { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+                  ],
+                },
+              },
+            ],
+          };
+        },
+      }),
+    );
+    try {
+      await startPool(pool);
+      await started.promise;
+      await pool.refreshQuota();
+      const before = reads;
+      const pid = NodeFS.readFileSync(paths.pidPath, "utf8");
+      manual = true;
+      let completed = false;
+      const first = pool.refreshQuota().then((status) => {
+        completed = true;
+        return status;
+      });
+      await probing.promise;
+      const second = pool.refreshQuota();
+      assert.isFalse(completed);
+      finish.resolve();
+      const [one, two] = await Promise.all([first, second]);
+      assert.strictEqual(reads, before + 1);
+      assert.deepStrictEqual(one, two);
+      assert.strictEqual(one.accounts[0]?.windows[0]?.usedPercent, 25);
+      assert.strictEqual(one.accounts[0]?.quotaCheckedAt, checkedAt);
+      assert.isUndefined(one.accounts[0]?.quotaError);
+      assert.strictEqual(NodeFS.readFileSync(paths.pidPath, "utf8"), pid);
+      assert.deepStrictEqual(api.resets, []);
+      assert.isFalse(api.requests.some((request) => request.includes("/v1/messages")));
+      assert.strictEqual((await pool.usage({ range: "24h", timeZone: "UTC" })).totals.requests, 0);
+    } finally {
+      finish.resolve();
+      await pool.shutdown();
+      await api.close();
+    }
+  });
+
+  it("preserves source and account quota failures instead of presenting them as empty quotas", async () => {
+    const api = await startFakeApi();
+    const paths = poolPaths(tempDir());
+    signIn(paths, api, [ACCOUNTS[0]]);
+    const checkedAt = "2026-10-01T03:00:00.000Z";
+    let snapshot: Awaited<ReturnType<PoolDeps["usageSnapshot"]>> = {
+      checkedAt,
+      accounts: [],
+      error: "The hub could not list accounts.",
+    };
+    let unavailable = false;
+    const pool = new PoolController(
+      deps(paths, writeForwardingProxy(paths, api), {
+        usageSnapshot: async () => {
+          if (unavailable) throw new Error("internal failure details");
+          return snapshot;
+        },
+        refreshUsage: async () => {
+          if (unavailable) throw new Error("Account quota checks are unavailable.");
+        },
+      }),
+    );
+    try {
+      await startPool(pool);
+      const sourceFailure = await pool.refreshQuota();
+      assert.strictEqual(sourceFailure.quotaError, snapshot.error);
+      assert.strictEqual(sourceFailure.accounts[0]?.quotaCheckedAt, checkedAt);
+      snapshot = {
+        checkedAt,
+        accounts: [
+          {
+            id: ACCOUNTS[0].name,
+            driver: ProviderDriverKind.make("claudeAgent"),
+            usageLimits: {
+              checkedAt,
+              windows: [],
+              unavailable: {
+                reason: "probeFailed",
+                message: "The hub could not read this account's usage.",
+              },
+            },
+          },
+        ],
+      };
+      const accountFailure = await pool.refreshQuota();
+      assert.isUndefined(accountFailure.quotaError);
+      assert.strictEqual(
+        accountFailure.accounts[0]?.quotaError,
+        "The hub could not read this account's usage.",
+      );
+      assert.strictEqual(accountFailure.accounts[0]?.quotaCheckedAt, checkedAt);
+      unavailable = true;
+      const serviceFailure = await pool.status();
+      assert.strictEqual(
+        serviceFailure.quotaError,
+        "Couldn't read account quotas. Try refreshing.",
+      );
+      await expect(pool.refreshQuota()).rejects.toThrow(/Account quota checks are unavailable/);
+      assert.deepStrictEqual(api.resets, []);
+    } finally {
+      await pool.shutdown();
+      await api.close();
+    }
+  });
+
+  it("rejects quota refresh for external and stopped pools without starting anything", async () => {
+    const paths = poolPaths(tempDir());
+    let reads = 0;
+    let installs = 0;
+    const options = deps(paths, "unused", {
+      installBinary: async () => {
+        installs++;
+        throw new Error("must not start");
+      },
+      refreshUsage: async () => {
+        reads++;
+      },
+    });
+    const pool = new PoolController(options);
+    try {
+      await pool.init();
+      await expect(pool.refreshQuota()).rejects.toThrow(/isn't running/);
+    } finally {
+      await pool.shutdown();
+    }
+    await savePoolState(paths, { ...decodePoolState({}, 8317), source: "external" });
+    const external = new PoolController(options);
+    try {
+      await external.init();
+      await expect(external.refreshQuota()).rejects.toThrow(/Disconnect from the team server/);
+      assert.strictEqual(reads, 0);
+      assert.strictEqual(installs, 0);
+    } finally {
+      await external.shutdown();
+    }
+  });
+
   it("resets every enabled account, or only the one named", { timeout: 30_000 }, async () => {
     const api = await startFakeApi();
     const paths = poolPaths(tempDir());
@@ -335,7 +546,10 @@ describe("pool usage and reset", () => {
     });
     const pool = new PoolController(
       deps(paths, writeForwardingProxy(paths, api), {
-        usageAccounts: async () => [reading(ACCOUNTS[0].name, 12), reading(ACCOUNTS[1].name, 100)],
+        usageSnapshot: async () => ({
+          checkedAt,
+          accounts: [reading(ACCOUNTS[0].name, 12), reading(ACCOUNTS[1].name, 100)],
+        }),
       }),
     );
     try {

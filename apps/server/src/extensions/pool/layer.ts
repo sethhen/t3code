@@ -77,13 +77,14 @@ export const PoolLive = Layer.effectDiscard(
           settings.updateSettings({ usageLimitSources: { [POOL_USAGE_SOURCE]: entry } }),
         );
       },
-      usageAccounts: async () => {
-        if (Option.isNone(usageSources)) return [];
+      usageSnapshot: async () => {
+        if (Option.isNone(usageSources)) throw new Error("Account quota checks are unavailable.");
         const snapshots = await Effect.runPromise(usageSources.value.current);
-        return snapshots.find((snapshot) => snapshot.id === POOL_USAGE_SOURCE_ID)?.accounts ?? [];
+        return snapshots.find((snapshot) => snapshot.id === POOL_USAGE_SOURCE_ID);
       },
       refreshUsage: async () => {
-        if (Option.isSome(usageSources)) await Effect.runPromise(usageSources.value.refresh);
+        if (Option.isNone(usageSources)) throw new Error("Account quota checks are unavailable.");
+        await Effect.runPromise(usageSources.value.refresh);
       },
       claudeProbe: async (instanceId) => {
         const instance = (await instanceMap())[ProviderInstanceId.make(instanceId)];

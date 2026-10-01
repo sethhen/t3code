@@ -184,6 +184,48 @@ export function accountNotice(account: PoolAccount): AccountNotice | null {
   }
 }
 
+/** Missing readings never mean full quota; a failed read may still have last-known windows. */
+export function accountQuotaNotice(account: PoolAccount, sourceError: boolean) {
+  if (account.status === "disabled" && account.windows.length === 0) {
+    return { text: "Paused. Resume this account, then refresh quotas.", warning: false };
+  }
+  if (sourceError) {
+    return account.windows.length > 0
+      ? { text: "Showing last reported quota.", warning: false }
+      : null;
+  }
+  const error = account.quotaError?.trim();
+  if (error) {
+    return {
+      text: account.windows.length > 0 ? `Showing last reported quota. ${error}` : error,
+      warning: true,
+    };
+  }
+  return account.windows.length === 0
+    ? { text: "Quota not reported. Refresh quotas to try again.", warning: false }
+    : null;
+}
+
+export interface QuotaRefreshFailure {
+  readonly message: string;
+  readonly failedAt: number;
+}
+
+/** A newer provider check supersedes a failed manual RPC; ordinary status polls do not. */
+export function poolQuotaError(
+  status: Pick<PoolStatus, "accounts" | "quotaError"> | null,
+  failure: QuotaRefreshFailure | null,
+): string | null {
+  const newerCheck =
+    failure !== null &&
+    status?.accounts.some(
+      (account) =>
+        account.quotaCheckedAt !== undefined &&
+        Date.parse(account.quotaCheckedAt) > failure.failedAt,
+    );
+  return (!newerCheck ? failure?.message.trim() : null) || status?.quotaError?.trim() || null;
+}
+
 /** Cooling or in error: the account is skipped until its cooldown runs out, or it is cleared. */
 export function isHeldBack(account: PoolAccount): boolean {
   return account.status === "cooling" || account.status === "error";

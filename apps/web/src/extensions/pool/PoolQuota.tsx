@@ -1,25 +1,38 @@
 /** The provider's current subscription allowance, independent of recorded pool requests. */
 import type { PoolAccount } from "@t3tools/contracts";
 
-import { poolProviderDriver } from "./pool.logic";
+import { accountQuotaNotice, poolProviderDriver } from "./pool.logic";
 import { LimitWindows } from "./t3";
 
 export function PoolQuota({
   account,
   now,
+  sourceError,
 }: {
   readonly account: PoolAccount;
   readonly now: number;
+  readonly sourceError: boolean;
 }) {
-  if (account.windows.length === 0) {
-    return <p className="text-xs text-muted-foreground">Quota not reported.</p>;
-  }
+  const notice = accountQuotaNotice(account, sourceError);
   return (
-    <LimitWindows
-      driver={poolProviderDriver(account.provider)}
-      windows={account.windows}
-      now={now}
-      compact
-    />
+    <div className="flex flex-col gap-1">
+      {account.windows.length > 0 ? (
+        <LimitWindows
+          driver={poolProviderDriver(account.provider)}
+          windows={account.windows}
+          now={now}
+          compact
+        />
+      ) : null}
+      {notice ? (
+        <p
+          className={
+            notice.warning ? "text-xs text-warning-foreground" : "text-xs text-muted-foreground"
+          }
+        >
+          {notice.text}
+        </p>
+      ) : null}
+    </div>
   );
 }
