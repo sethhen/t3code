@@ -24,6 +24,7 @@ const withController = <A>(run: (controller: PoolController) => Promise<A>) =>
 export const makePoolServerExtension = Effect.sync(() =>
   serverExtension(PoolExtension, {
     status: () => withController((pool) => pool.status()),
+    "quota.refresh": () => withController((pool) => pool.refreshQuota()),
     setSource: (input) => withController((pool) => pool.setSource(input)),
     setRoute: ({ instanceId, mode }) => withController((pool) => pool.setRoute(instanceId, mode)),
     "login.start": ({ provider }) => withController((pool) => pool.startLogin(provider)),
@@ -33,5 +34,7 @@ export const makePoolServerExtension = Effect.sync(() =>
     "account.remove": ({ id }) => withController((pool) => pool.removeAccount(id)),
     check: () => withController((pool) => pool.check()),
     restart: () => withController((pool) => pool.restart()),
+    reset: ({ id }) => withController((pool) => pool.reset(id)),
+    usage: (input) => withController((pool) => pool.usage(input)),
   }),
 );

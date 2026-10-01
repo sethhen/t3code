@@ -1,8 +1,9 @@
 /**
  * The provider rows of the accounts section: Claude, then Codex, each with its
  * add button, a line on how its accounts are used, and one line per signed-in
- * account (plan, state, pause/remove). Quotas live on the usage page. Every
- * provider is a direct child of the settings card, so it gets the card's dividers.
+ * account (plan, state, current quota, what it served lately, clear cooldown/
+ * pause/remove). Every provider is a direct child of the settings card, so
+ * it gets the card's dividers.
  */
 import type { PoolAccount, PoolProvider, PoolRoute, PoolStatus } from "@t3tools/contracts";
 import { EllipsisIcon, PlusIcon } from "lucide-react";
@@ -18,7 +19,7 @@ import {
   AlertDialogTitle,
 } from "~/components/ui/alert-dialog";
 import { Badge } from "~/components/ui/badge";
-import { Button } from "~/components/ui/button";
+import { Button, InlineButton } from "~/components/ui/button";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
 import { Spinner } from "~/components/ui/spinner";
 import { cn } from "~/lib/utils";
@@ -26,6 +27,9 @@ import { cn } from "~/lib/utils";
 import {
   accountLabel,
   accountNotice,
+  accountUsageLine,
+  type AccountUsageSummary,
+  isHeldBack,
   orderAccounts,
   POOL_ACCOUNT_KIND,
   POOL_PROVIDER_LABEL,
@@ -33,6 +37,7 @@ import {
   poolProviderDriver,
   providerNote,
 } from "./pool.logic";
+import { PoolQuota } from "./PoolQuota";
 import { PROVIDER_STATUS_STYLES, ProviderInstanceIcon, RedactedSensitiveText } from "./t3";
 import type { PoolActions, PoolClient } from "./usePoolStatus";
 
@@ -41,13 +46,25 @@ export function PoolAccounts({
   client,
   actions,
   readOnly,
+  usage,
+  now,
+  quotaError,
   onAdd,
+  onClearCooldown,
+  onShowUsage,
 }: {
   readonly status: PoolStatus;
   readonly client: PoolClient;
   readonly actions: PoolActions;
   readonly readOnly: boolean;
+  /** Per-account summaries (`accountUsageSummaries`); an account without one shows no usage line. */
+  readonly usage: ReadonlyMap<string, AccountUsageSummary>;
+  readonly now: number;
+  readonly quotaError: string | null;
   readonly onAdd: (provider: PoolProvider) => void;
+  readonly onClearCooldown: (account: PoolAccount) => void;
+  /** Opens the usage view on that account; allowed while read-only. */
+  readonly onShowUsage: (accountId: string) => void;
 }) {
   // The account stays set while the confirm animates closed.
   const [confirm, setConfirm] = useState<{ account: PoolAccount; open: boolean } | null>(null);
@@ -84,9 +101,14 @@ export function PoolAccounts({
           routes={status.routes}
           readOnly={readOnly}
           actions={actions}
+          usage={usage}
+          now={now}
+          quotaErrorShown={quotaError !== null}
           onAdd={() => onAdd(provider)}
           onSetEnabled={setEnabled}
           onRemove={(account) => setConfirm({ account, open: true })}
+          onClearCooldown={onClearCooldown}
+          onShowUsage={onShowUsage}
         />
       ))}
       {/* A sibling of the row menus: dialogs stack under popovers. Portalled, so no card divider. */}
@@ -146,18 +168,28 @@ function ProviderAccounts({
   routes,
   readOnly,
   actions,
+  usage,
+  now,
+  quotaErrorShown,
   onAdd,
   onSetEnabled,
   onRemove,
+  onClearCooldown,
+  onShowUsage,
 }: {
   readonly provider: PoolProvider;
   readonly accounts: readonly PoolAccount[];
   readonly routes: readonly PoolRoute[];
   readonly readOnly: boolean;
   readonly actions: PoolActions;
+  readonly usage: ReadonlyMap<string, AccountUsageSummary>;
+  readonly now: number;
+  readonly quotaErrorShown: boolean;
   readonly onAdd: () => void;
   readonly onSetEnabled: (account: PoolAccount, enabled: boolean) => void;
   readonly onRemove: (account: PoolAccount) => void;
+  readonly onClearCooldown: (account: PoolAccount) => void;
+  readonly onShowUsage: (accountId: string) => void;
 }) {
   const label = POOL_PROVIDER_LABEL[provider];
   return (
@@ -195,8 +227,13 @@ function ProviderAccounts({
               readOnly={readOnly}
               busy={actions.isBusy(`account:${account.id}`)}
               intent={actions.intent(`account:${account.id}`)}
+              usage={usage.get(account.id)}
+              now={now}
+              quotaErrorShown={quotaErrorShown}
               onSetEnabled={(enabled) => onSetEnabled(account, enabled)}
               onRemove={() => onRemove(account)}
+              onClearCooldown={() => onClearCooldown(account)}
+              onShowUsage={() => onShowUsage(account.id)}
             />
           ))}
         </div>
@@ -205,90 +242,127 @@ function ProviderAccounts({
   );
 }
 
-/** The masked email, plan and state of one account, with its pause/remove menu. */
+/**
+ * The masked email, plan and state of one account, what it served lately
+ * (opens the usage view), current quota, and its clear cooldown/pause/remove menu.
+ */
 function AccountLine({
   account,
   readOnly,
   busy,
   intent,
+  usage,
+  now,
+  quotaErrorShown,
   onSetEnabled,
   onRemove,
+  onClearCooldown,
+  onShowUsage,
 }: {
   readonly account: PoolAccount;
   readonly readOnly: boolean;
   readonly busy: boolean;
   /** The enabled value a running pause/resume is heading to. */
   readonly intent: unknown;
+  readonly usage: AccountUsageSummary | undefined;
+  readonly now: number;
+  readonly quotaErrorShown: boolean;
   readonly onSetEnabled: (enabled: boolean) => void;
   readonly onRemove: () => void;
+  readonly onClearCooldown: () => void;
+  readonly onShowUsage: () => void;
 }) {
   const paused = typeof intent === "boolean" ? !intent : account.status === "disabled";
   const notice = paused ? ({ kind: "paused" } as const) : accountNotice(account);
   const label = accountLabel(account);
+  const clearable = !paused && (isHeldBack(account) || account.staleCooldown === true);
 
   return (
-    <div className="flex min-h-8 min-w-0 items-center gap-2">
-      <div
-        className={cn(
-          "flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5 text-sm",
-          paused && "opacity-60",
-        )}
-      >
-        {account.email ? (
-          <RedactedSensitiveText
-            value={account.email}
-            ariaLabel="Toggle account email visibility"
-            revealTooltip="Click to reveal email"
-            hideTooltip="Click to hide email"
-            className="max-w-full truncate text-foreground"
-          />
-        ) : (
-          <span className="truncate text-foreground">{label}</span>
-        )}
-        {account.plan ? (
-          <span className="shrink-0 text-xs text-muted-foreground">{account.plan}</span>
-        ) : null}
-        {notice?.kind === "paused" ? (
-          <Badge variant="outline" size="sm" className="font-normal text-muted-foreground">
-            Paused
-          </Badge>
-        ) : notice?.kind === "cooling" ? (
-          <Badge variant="info" size="sm" className="min-w-0 truncate font-normal">
-            {notice.text}
-          </Badge>
-        ) : notice?.kind === "error" ? (
-          <span className="flex min-w-0 items-center gap-1.5 text-xs text-warning-foreground">
-            <span
-              aria-hidden
-              className={cn("size-1.5 shrink-0 rounded-full", PROVIDER_STATUS_STYLES.warning.dot)}
-            />
-            <span className="line-clamp-2 [overflow-wrap:anywhere]">{notice.text}</span>
-          </span>
-        ) : null}
-      </div>
-      <Menu>
-        <MenuTrigger
-          render={
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="shrink-0 text-muted-foreground hover:text-foreground"
-              disabled={readOnly || busy}
-              aria-label={`Actions for ${POOL_PROVIDER_LABEL[account.provider]} account ${label}`}
-            />
-          }
+    <div className="flex min-w-0 flex-col gap-1 py-2">
+      <div className="flex min-h-8 min-w-0 items-center gap-2">
+        <div
+          className={cn(
+            "flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-0.5 text-sm",
+            paused && "opacity-60",
+          )}
         >
-          {busy ? <Spinner className="size-3.5" /> : <EllipsisIcon className="size-3.5" />}
-        </MenuTrigger>
-        <MenuPopup align="end" className="min-w-36">
-          <MenuItem onClick={() => onSetEnabled(paused)}>{paused ? "Resume" : "Pause"}</MenuItem>
-          <MenuSeparator />
-          <MenuItem variant="destructive" onClick={onRemove}>
-            Remove…
-          </MenuItem>
-        </MenuPopup>
-      </Menu>
+          {account.email ? (
+            <RedactedSensitiveText
+              value={account.email}
+              ariaLabel="Toggle account email visibility"
+              revealTooltip="Click to reveal email"
+              hideTooltip="Click to hide email"
+              className="max-w-full truncate text-foreground"
+            />
+          ) : (
+            <span className="truncate text-foreground">{label}</span>
+          )}
+          {account.plan ? (
+            <span className="shrink-0 text-xs text-muted-foreground">{account.plan}</span>
+          ) : null}
+          {notice?.kind === "paused" ? (
+            <Badge variant="outline" size="sm" className="font-normal text-muted-foreground">
+              Paused
+            </Badge>
+          ) : notice?.kind === "cooling" ? (
+            <Badge variant="info" size="sm" className="min-w-0 truncate font-normal">
+              {notice.text}
+            </Badge>
+          ) : notice?.kind === "error" || notice?.kind === "stale" ? (
+            <span className="flex min-w-0 items-center gap-1.5 text-xs text-warning-foreground">
+              <span
+                aria-hidden
+                className={cn("size-1.5 shrink-0 rounded-full", PROVIDER_STATUS_STYLES.warning.dot)}
+              />
+              <span className="line-clamp-2 [overflow-wrap:anywhere]">{notice.text}</span>
+              {notice.kind === "stale" ? (
+                <InlineButton disabled={readOnly || busy} onClick={onClearCooldown}>
+                  Clear
+                </InlineButton>
+              ) : null}
+            </span>
+          ) : null}
+          {/* Inline at the row's end, so it lands without moving the rows below. */}
+          {usage ? (
+            <span className="ms-auto shrink-0 text-xs tabular-nums">
+              <InlineButton
+                tone="muted"
+                aria-label={`Usage for ${label}: ${accountUsageLine(usage)}`}
+                onClick={onShowUsage}
+              >
+                {accountUsageLine(usage)}
+              </InlineButton>
+            </span>
+          ) : null}
+        </div>
+        <Menu>
+          <MenuTrigger
+            render={
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="shrink-0 text-muted-foreground hover:text-foreground"
+                disabled={readOnly || busy}
+                aria-label={`Actions for ${POOL_PROVIDER_LABEL[account.provider]} account ${label}`}
+              />
+            }
+          >
+            {busy ? <Spinner className="size-3.5" /> : <EllipsisIcon className="size-3.5" />}
+          </MenuTrigger>
+          <MenuPopup align="end" className="min-w-36">
+            {clearable ? <MenuItem onClick={onClearCooldown}>Clear cooldown</MenuItem> : null}
+            <MenuItem onClick={() => onSetEnabled(paused)}>{paused ? "Resume" : "Pause"}</MenuItem>
+            <MenuSeparator />
+            <MenuItem variant="destructive" onClick={onRemove}>
+              Remove…
+            </MenuItem>
+          </MenuPopup>
+        </Menu>
+      </div>
+      <div className={cn("pe-6", paused && "opacity-60")}>
+        <PoolQuota account={account} now={now} sourceError={quotaErrorShown} />
+      </div>
     </div>
   );
 }

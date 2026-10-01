@@ -13,6 +13,7 @@ import {
   accountStatusOf,
   claudePlanLabel,
   decodeAuthFiles,
+  isStaleCooldown,
   joinUrl,
   planRank,
 } from "./management.ts";
@@ -33,6 +34,10 @@ describe("proxy config", () => {
     assert.include(yaml, "  session-affinity-subagents: false\n");
     assert.include(yaml, "host: 127.0.0.1\n");
     assert.include(yaml, "  allow-remote: false\n");
+  });
+
+  it("keeps unread usage for an hour, so a missed drain loses nothing", () => {
+    assert.include(yaml, "\nredis-usage-queue-retention-seconds: 3600\n");
   });
 
   it("quotes paths with spaces", () => {
@@ -140,14 +145,32 @@ describe("auth files", () => {
         cooldowns: [{ model: "claude-opus-5-5", until: "2030-01-01T03:00:00Z" }],
       },
       { name: "gemini-x.json", provider: "gemini" },
+      {
+        // A 429 benches the whole account; the proxy keeps the raw upstream body as its message.
+        name: "claude-d@example.com.json",
+        provider: "claude",
+        status: "error",
+        status_message: '{"type":"error","error":{"type":"rate_limit_error"}}',
+        unavailable: true,
+        next_retry_after: "2030-01-01T05:00:00+10:00",
+        quota: { observed_at: "2029-12-31T23:30:00Z", signals: {} },
+        cooldowns: [],
+      },
     ],
   };
   const files = decodeAuthFiles(sample);
   const now = Date.parse("2030-01-01T00:00:00Z");
 
   it("decodes the proxy's listing", () => {
-    assert.strictEqual(files.length, 4);
+    assert.strictEqual(files.length, 5);
     assert.strictEqual(files[2]!.cooldownUntil, "2030-01-01T03:00:00Z");
+    assert.strictEqual(files[4]!.nextRetryAfter, "2030-01-01T05:00:00+10:00");
+    assert.strictEqual(files[4]!.quotaObservedAt, "2029-12-31T23:30:00Z");
+    assert.isUndefined(
+      decodeAuthFiles({ files: [{ name: "x.json", next_retry_after: "0001-01-01T00:00:00Z" }] })[0]!
+        .nextRetryAfter,
+      "Go's zero time means no retry is scheduled",
+    );
   });
 
   it("maps proxy state to account status", () => {
@@ -163,11 +186,69 @@ describe("auth files", () => {
     );
   });
 
+  it("shows a benched account's retry time instead of the upstream error body", () => {
+    assert.deepStrictEqual(accountStatusOf(files[4]!, Date.parse("2029-12-31T18:00:00Z")), {
+      status: "cooling",
+      message: "Cooling down · resets in 1h 0m",
+    });
+    // Past its retry time but still unavailable: cooling, with no time to show.
+    assert.deepStrictEqual(accountStatusOf(files[4]!, now), {
+      status: "cooling",
+      message: "Cooling down",
+    });
+  });
+
   it("keeps a URL path prefix", () => {
     assert.strictEqual(
       joinUrl("https://pool.example.com/team/", "/v1/models"),
       "https://pool.example.com/team/v1/models",
     );
+  });
+});
+
+describe("stale cooldown", () => {
+  const now = Date.parse("2030-01-01T12:00:00Z");
+  const benched = {
+    name: "claude-a@example.com.json",
+    provider: "claude",
+    disabled: false,
+    unavailable: true,
+    status: "error",
+    statusMessage: "",
+    quotaObservedAt: "2030-01-01T10:00:00Z",
+  };
+  const reading = (checkedAt: string, ...usedPercent: number[]) => ({
+    checkedAt,
+    windows: usedPercent.map((used, index) => ({
+      id: `w${index}`,
+      kind: "session" as const,
+      label: "5h",
+      usedPercent: used,
+    })),
+  });
+
+  it("flags a cooldown a later quota read shows to be over", () => {
+    assert.isTrue(isStaleCooldown(benched, reading("2030-01-01T11:00:00Z", 3, 40), now));
+  });
+
+  it("trusts the cooldown while any window is full or the read predates it", () => {
+    assert.isFalse(isStaleCooldown(benched, reading("2030-01-01T11:00:00Z", 3, 100), now));
+    assert.isFalse(isStaleCooldown(benched, reading("2030-01-01T09:00:00Z", 3), now));
+    assert.isFalse(isStaleCooldown(benched, reading("2030-01-01T11:00:00Z"), now));
+    assert.isFalse(isStaleCooldown(benched, undefined, now));
+    assert.isFalse(
+      isStaleCooldown(
+        benched,
+        { ...reading("2030-01-01T11:00:00Z", 3), unavailable: { reason: "probeFailed" } },
+        now,
+      ),
+    );
+  });
+
+  it("without the proxy's observation time, needs a read from the last 15 minutes", () => {
+    const { quotaObservedAt: _, ...unknown } = benched;
+    assert.isTrue(isStaleCooldown(unknown, reading("2030-01-01T11:50:00Z", 3), now));
+    assert.isFalse(isStaleCooldown(unknown, reading("2030-01-01T11:40:00Z", 3), now));
   });
 });
 

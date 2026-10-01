@@ -23,6 +23,7 @@ import * as Effect from "effect/Effect";
 
 import { launchArgSettings } from "../claudeSettings.ts";
 import { PoolController, type PoolDeps } from "./controller.ts";
+import { drainUsageQueue } from "./management.ts";
 import { poolPaths } from "./state.ts";
 import {
   buildClaudeCapabilitiesProbeQueryOptions,
@@ -71,7 +72,7 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
             },
             usageSource: async () => undefined,
             setUsageSource: async () => undefined,
-            usageAccounts: async () => [],
+            usageSnapshot: async () => undefined,
             refreshUsage: async () => undefined,
             claudeProbe: async (instanceId) => {
               const instance = (await instanceMap())[
@@ -100,6 +101,8 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
             },
             claudeConfigDir: async () => stateDir,
             codexVersion: async () => undefined,
+            ratesCachePath: NodePath.join(stateDir, "usage-model-rates.json"),
+            usagePriceOverrides: async () => ({}),
             log: () => undefined,
           };
           const pool = new PoolController(deps);
@@ -165,6 +168,28 @@ describe.skipIf(!enabled)("pool controller (integration)", () => {
             assert.strictEqual(checks.proxy, "ok");
             assert.strictEqual(checks.sticky, "ok");
             assert.strictEqual(checks.toolSearch, "ok", JSON.stringify(status.checks));
+
+            // Verify the new management endpoints against the pinned proxy itself.
+            status = await pool.reset("claude-it@example.com.json");
+            assert.strictEqual(status.accounts[0]?.status, "ready");
+            const proxyState = JSON.parse(NodeFS.readFileSync(paths.statePath, "utf8")) as {
+              port: number;
+              managementKey: string;
+            };
+            assert.deepStrictEqual(
+              await drainUsageQueue(
+                {
+                  baseUrl: `http://127.0.0.1:${proxyState.port}`,
+                  managementKey: proxyState.managementKey,
+                },
+                10,
+              ),
+              [],
+            );
+            const usage = await pool.usage({ range: "today", timeZone: "Australia/Sydney" });
+            assert.isTrue(usage.recording);
+            assert.strictEqual(usage.totals.requests, 0);
+            assert.strictEqual(usage.accounts[0]?.id, "claude-it@example.com.json");
 
             // Pause, then remove.
             status = await pool.setAccountEnabled("claude-it@example.com.json", false);

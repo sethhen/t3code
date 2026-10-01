@@ -8,7 +8,11 @@
  * proxy's file watcher misses atomic renames (an in-place edit is a WRITE, a
  * rename is a REMOVE the proxy never re-reads).
  */
-import type { PoolAccountStatus, PoolProvider } from "@t3tools/contracts";
+import type {
+  PoolAccountStatus,
+  PoolProvider,
+  ServerProviderUsageLimits,
+} from "@t3tools/contracts";
 
 export interface ManagementTarget {
   readonly baseUrl: string;
@@ -27,6 +31,10 @@ export interface AuthFileEntry {
   readonly status: string;
   readonly statusMessage: string;
   readonly cooldownUntil?: string;
+  /** When the proxy last read this account's quota (`quota.observed_at`, ISO). */
+  readonly quotaObservedAt?: string;
+  /** When the proxy tries a benched account again (`next_retry_after`, ISO). */
+  readonly nextRetryAfter?: string;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -84,12 +92,18 @@ const cooldownUntil = (cooldowns: unknown): string | undefined => {
   return latest;
 };
 
+/** An ISO timestamp, or undefined (the proxy writes Go's zero time for "never"). */
+const isoTime = (value: unknown): string | undefined =>
+  typeof value === "string" && Date.parse(value) > 0 ? value : undefined;
+
 export const decodeAuthFiles = (json: unknown): AuthFileEntry[] => {
   const files = isRecord(json) && Array.isArray(json.files) ? json.files : [];
   return files.flatMap((file): AuthFileEntry[] => {
     if (!isRecord(file) || typeof file.name !== "string") return [];
     const until = cooldownUntil(file.cooldowns);
     const idToken = isRecord(file.id_token) ? file.id_token : {};
+    const observedAt = isRecord(file.quota) ? isoTime(file.quota.observed_at) : undefined;
+    const retryAfter = isoTime(file.next_retry_after);
     return [
       {
         name: file.name,
@@ -104,6 +118,8 @@ export const decodeAuthFiles = (json: unknown): AuthFileEntry[] => {
         status: typeof file.status === "string" ? file.status : "",
         statusMessage: typeof file.status_message === "string" ? file.status_message : "",
         ...(until ? { cooldownUntil: until } : {}),
+        ...(observedAt ? { quotaObservedAt: observedAt } : {}),
+        ...(retryAfter ? { nextRetryAfter: retryAfter } : {}),
       },
     ];
   });
@@ -117,20 +133,48 @@ export const accountStatusOf = (
   now: number,
 ): { readonly status: PoolAccountStatus; readonly message?: string } => {
   if (file.disabled) return { status: "disabled", message: "Paused" };
-  const cooling =
-    (file.cooldownUntil !== undefined && Date.parse(file.cooldownUntil) > now) || file.unavailable;
-  if (cooling) {
+  // A 429 benches the whole account: `unavailable` with a retry time (its status reads
+  // "error" and its message is the raw upstream body, so this check comes first).
+  const resetsAt = Math.max(
+    ...[file.cooldownUntil, file.unavailable ? file.nextRetryAfter : undefined].map((at) =>
+      at === undefined ? 0 : Date.parse(at),
+    ),
+  );
+  if (resetsAt > now || file.unavailable) {
     return {
       status: "cooling",
-      message: file.cooldownUntil
-        ? `Cooling down · resets ${relativeTime(Date.parse(file.cooldownUntil) - now)}`
-        : "Cooling down",
+      message:
+        resetsAt > now ? `Cooling down · resets ${relativeTime(resetsAt - now)}` : "Cooling down",
     };
   }
   if (file.status === "error" || (file.statusMessage && file.status !== "active")) {
     return { status: "error", message: file.statusMessage || "The proxy reports an error" };
   }
   return { status: "ready" };
+};
+
+/** Read this soon after a cooldown with no proxy observation time, a quota read still counts. */
+const STALE_COOLDOWN_READ_MS = 15 * 60_000;
+
+/**
+ * True when the proxy is holding `file` back on old information: a quota read
+ * taken after the proxy last saw the account's quota (or, without that time,
+ * in the last 15 minutes) has every window below 100%, e.g. after a usage
+ * reset. The proxy never re-checks a cooldown against fresh quota on its own.
+ * The caller decides the account is cooling or failing.
+ */
+export const isStaleCooldown = (
+  file: AuthFileEntry,
+  limits: ServerProviderUsageLimits | undefined,
+  now: number,
+): boolean => {
+  if (!limits || limits.unavailable || limits.windows.length === 0) return false;
+  if (limits.windows.some((window) => window.usedPercent >= 100)) return false;
+  const checkedAt = Date.parse(limits.checkedAt);
+  if (Number.isNaN(checkedAt)) return false;
+  return file.quotaObservedAt
+    ? checkedAt > Date.parse(file.quotaObservedAt)
+    : now - checkedAt <= STALE_COOLDOWN_READ_MS;
 };
 
 const relativeTime = (ms: number) => {
@@ -148,6 +192,23 @@ export const setAuthFileDisabled = (target: ManagementTarget, name: string, disa
 
 export const deleteAuthFile = (target: ManagementTarget, name: string) =>
   request(target, `auth-files?name=${encodeURIComponent(name)}`, { method: "DELETE" });
+
+/**
+ * Pops up to `count` records off the proxy's usage queue (one per upstream
+ * attempt, failed ones too). Popped means gone: only the pool that owns the
+ * proxy may call this, never a client of someone else's.
+ */
+export const drainUsageQueue = async (
+  target: ManagementTarget,
+  count: number,
+): Promise<unknown[]> => {
+  const json = await request(target, `usage-queue?count=${count}`);
+  return Array.isArray(json) ? json : [];
+};
+
+/** Clears an account's cooldown and per-model states in the proxy's memory, so it is tried now. */
+export const resetQuota = (target: ManagementTarget, authIndex: string) =>
+  request(target, "reset-quota", { method: "POST", body: { auth_index: authIndex } });
 
 /** Starts an OAuth sign-in; the proxy listens for the browser callback itself. */
 export const startLogin = async (target: ManagementTarget, provider: PoolProvider) => {
