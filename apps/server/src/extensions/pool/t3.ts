@@ -6,14 +6,6 @@ export { ServerConfig } from "../../config.ts";
 export { ServerSettingsService } from "../../serverSettings.ts";
 export { expandHomePath } from "../../pathExpansion.ts";
 export { UsageLimitSources } from "../../usage/UsageLimitSources.ts";
-export { UsageService } from "../../usage/UsageService.ts";
-export {
-  cacheSavingsUsd,
-  createOverrideRateTable,
-  parseRateTable,
-  priceUsage,
-  type RateTable,
-} from "../../usage/usagePricing.ts";
 export { deriveProviderInstanceConfigMap } from "../../provider/Layers/ProviderInstanceRegistryHydration.ts";
 export { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 export { makeClaudeEnvironment } from "../../provider/Drivers/ClaudeHome.ts";

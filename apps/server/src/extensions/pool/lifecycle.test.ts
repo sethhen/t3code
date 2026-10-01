@@ -88,15 +88,13 @@ const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
     },
     usageSource: async () => undefined,
     setUsageSource: async () => undefined,
-    usageSnapshot: async () => undefined,
+    usageAccounts: async () => [],
     refreshUsage: async () => undefined,
     claudeProbe: async () => {
       throw new Error("no probe in unit tests");
     },
     claudeConfigDir: async () => undefined,
     codexVersion: async () => undefined,
-    ratesCachePath: NodePath.join(paths.root, "usage-model-rates.json"),
-    usagePriceOverrides: async () => ({}),
     log: () => undefined,
     ...over,
   };
@@ -352,15 +350,13 @@ describe("controller", () => {
       installBinary: async () => {
         throw new Error("offline");
       },
-      usageSnapshot: async () => ({
-        checkedAt: "2026-09-30T00:00:00.000Z",
-        accounts: Object.entries(plans).map(([id, plan]) => ({
+      usageAccounts: async () =>
+        Object.entries(plans).map(([id, plan]) => ({
           id,
           driver: ProviderDriverKind.make("codex"),
           ...(proReadFails && id === "codex-pro.json" ? {} : { plan }),
           usageLimits: { checkedAt: "2026-09-30T00:00:00.000Z", windows: [] },
         })),
-      }),
     });
     const pool = new PoolController(deps);
     await pool.init();

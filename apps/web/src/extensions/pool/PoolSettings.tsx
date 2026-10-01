@@ -5,11 +5,10 @@
  * provider and usage is shared between them.
  *
  * Problems first, everything else out of the way: each provider shows its
- * accounts and one line on how they are used, each account what it served
- * lately; failing checks show inline; the header carries a state only when
- * something is off (with "Reset cooldowns" while an account is held back) plus
- * the way into usage, and the menu holds the rare actions (routing, checks, a
- * team server, reset, restart). The upstream provider list folds away under
+ * accounts and one line on how they are used; failing checks show inline;
+ * the header carries a state only when something is off (with "Reset cooldowns"
+ * while an account is held back), and the menu holds the rare actions (routing,
+ * checks, a team server, reset, restart). The upstream provider list folds away under
  * "More provider settings".
  */
 import {
@@ -25,7 +24,6 @@ import {
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
-  ChartNoAxesColumnIcon,
   CheckIcon,
   ChevronRightIcon,
   CircleDashedIcon,
@@ -38,11 +36,10 @@ import {
 import { useAtomValue } from "@effect/atom-react";
 import { type ReactNode, useCallback, useId, useState } from "react";
 
-import { Button, InlineButton } from "~/components/ui/button";
+import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
 import { Label } from "~/components/ui/label";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
-import { RefreshIcon } from "~/components/ui/refresh-icon";
 import {
   Select,
   SelectItem,
@@ -59,10 +56,7 @@ import { useExtensionClient } from "../client";
 import type { ProviderSettingsExtensionProps } from "../providerSettings";
 import { PoolAccounts } from "./PoolAccounts";
 import { PoolLoginDialog, usePoolLogin } from "./PoolLogin";
-import { PoolUsageDialog } from "./PoolUsageDialog";
 import {
-  accountUsageSummaries,
-  type AccountUsageSummary,
   isCooldownResetOffered,
   isParityVisible,
   isRoutingVisible,
@@ -73,10 +67,8 @@ import {
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
-  poolQuotaError,
   poolStartFailure,
   type PoolStartFailure,
-  type QuotaRefreshFailure,
   withLiveStartFailure,
   poolProviderDriver,
   routeWaitingReason,
@@ -110,7 +102,6 @@ import {
   usePolling,
   usePoolStatus,
 } from "./usePoolStatus";
-import { usePoolUsage } from "./usePoolUsage";
 
 const EXTERNAL_EXPLAINER =
   "Use accounts someone else signs in on their server. Sign-ins and quotas live on that server.";
@@ -121,8 +112,6 @@ const ROUTING_EXPLAINER =
 /** After a reset: why a thread may still sit on its rate-limit wait, and how to skip it. */
 const RESET_WAITING_NOTE =
   "A thread already waiting on a rate limit retries at its scheduled time; stop it and resend to retry now.";
-
-const NO_USAGE: ReadonlyMap<string, AccountUsageSummary> = new Map();
 
 const ROUTE_OPTIONS = [
   { value: "pool", label: "These accounts" },
@@ -147,15 +136,6 @@ export function PoolSettings({
   const [externalFormOpen, setExternalFormOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
   const [checksOpen, setChecksOpen] = useState(false);
-  const [quotaRefreshError, setQuotaRefreshError] = useState<QuotaRefreshFailure | null>(null);
-  // The account stays set while the dialog animates closed.
-  const [usageView, setUsageView] = useState<{ open: boolean; accountId?: string }>({
-    open: false,
-  });
-  // One 7-day read feeds every row's usage line; only a local pool with accounts records usage.
-  const usageRange =
-    pool.status?.source === "local" && pool.status.accounts.length > 0 ? "7d" : null;
-  const { usage } = usePoolUsage(client, usageRange);
 
   // No accounts here (an official T3 server, or no permission to read them): the upstream page as is.
   if (pool.unsupported) return children;
@@ -173,20 +153,6 @@ export function PoolSettings({
   };
   const runRestart = () =>
     void actions.run("restart", () => client.call("restart", {}), "Could not restart");
-  const refreshingQuotas = actions.isBusy("quota.refresh");
-  const quotaRefreshDisabled = readOnly || runtimeState !== "running";
-  const quotaError = poolQuotaError(status, quotaRefreshError);
-  const refreshQuotas = async () => {
-    if (quotaRefreshDisabled) return;
-    const outcome = await actions.run(
-      "quota.refresh",
-      () => client.call("quota.refresh", {}),
-      null,
-    );
-    if (outcome !== null) {
-      setQuotaRefreshError(outcome.ok ? null : { message: outcome.message, failedAt: Date.now() });
-    }
-  };
   // One account shares its row's key, so the row shows the spinner; no intent, so pause state holds.
   const resetCooldowns = async (account?: PoolAccount) => {
     const outcome = await actions.run(
@@ -205,9 +171,6 @@ export function PoolSettings({
   };
   const local = status?.source === "local";
   const resetOffered = status ? isCooldownResetOffered(status) : false;
-  const usageSummaries = usage ? accountUsageSummaries(usage) : NO_USAGE;
-  const showUsage = (accountId?: string) =>
-    setUsageView(accountId ? { open: true, accountId } : { open: true });
 
   return (
     <>
@@ -227,25 +190,6 @@ export function PoolSettings({
                   >
                     {actions.isBusy("reset") ? <Spinner className="size-3.5" /> : null}
                     Reset cooldowns
-                  </Button>
-                ) : null}
-                {local && status.accounts.length > 0 ? (
-                  <Button
-                    size="xs"
-                    variant="ghost-muted"
-                    aria-label="Refresh quotas"
-                    aria-busy={refreshingQuotas}
-                    disabled={quotaRefreshDisabled || refreshingQuotas}
-                    onClick={() => void refreshQuotas()}
-                  >
-                    <RefreshIcon size="sm" refreshing={refreshingQuotas} />
-                    Refresh quotas
-                  </Button>
-                ) : null}
-                {local && status.accounts.length > 0 ? (
-                  <Button size="xs" variant="ghost-muted" onClick={() => showUsage()}>
-                    <ChartNoAxesColumnIcon aria-hidden />
-                    Usage
                   </Button>
                 ) : null}
                 <Menu>
@@ -329,29 +273,14 @@ export function PoolSettings({
                   onClose={() => setExternalFormOpen(false)}
                 />
               ) : null}
-              {status.source === "local" && quotaError ? (
-                <p role="status" className="px-3 py-2.5 text-xs text-warning-foreground sm:px-4">
-                  Could not read quotas: {quotaError}{" "}
-                  <InlineButton
-                    disabled={quotaRefreshDisabled || refreshingQuotas}
-                    onClick={() => void refreshQuotas()}
-                  >
-                    Retry
-                  </InlineButton>
-                </p>
-              ) : null}
               {status.source === "local" ? (
                 <PoolAccounts
                   status={status}
                   client={client}
                   actions={actions}
                   readOnly={readOnly || login.pending}
-                  usage={usageSummaries}
-                  now={pool.receivedAt}
-                  quotaError={quotaError}
                   onAdd={(provider) => void login.start(provider)}
                   onClearCooldown={(account) => void resetCooldowns(account)}
-                  onShowUsage={showUsage}
                 />
               ) : null}
               {routingVisible && routingOpen ? (
@@ -386,20 +315,6 @@ export function PoolSettings({
           onRetry={(provider) => void login.start(provider)}
           onClose={login.close}
         />
-        {local ? (
-          <PoolUsageDialog
-            client={client}
-            open={usageView.open}
-            onOpenChange={(open) => setUsageView((current) => ({ ...current, open }))}
-            accounts={status.accounts}
-            now={pool.receivedAt}
-            onRefreshQuotas={() => void refreshQuotas()}
-            refreshingQuotas={refreshingQuotas}
-            quotaRefreshDisabled={quotaRefreshDisabled}
-            quotaError={quotaError}
-            {...(usageView.accountId ? { initialAccountId: usageView.accountId } : {})}
-          />
-        ) : null}
       </div>
       <MoreProviderSettings targetInstanceId={targetInstanceId}>{children}</MoreProviderSettings>
     </>

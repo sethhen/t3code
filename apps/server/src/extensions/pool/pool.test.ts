@@ -36,10 +36,6 @@ describe("proxy config", () => {
     assert.include(yaml, "  allow-remote: false\n");
   });
 
-  it("keeps unread usage for an hour, so a missed drain loses nothing", () => {
-    assert.include(yaml, "\nredis-usage-queue-retention-seconds: 3600\n");
-  });
-
   it("quotes paths with spaces", () => {
     assert.include(yaml, 'auth-dir: "/Users/me/Library/Application Support/t3/pool/auth"\n');
   });

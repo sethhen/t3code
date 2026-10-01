@@ -34,7 +34,6 @@ import {
   ServerConfig,
   ServerSettingsService,
   UsageLimitSources,
-  UsageService,
 } from "./t3.ts";
 
 const configRecord = (config: unknown): Record<string, unknown> =>
@@ -53,7 +52,6 @@ export const PoolLive = Layer.effectDiscard(
     // Optional so the pool degrades instead of failing a layer build if an upstream
     // refactor moves it.
     const usageSources = yield* Effect.serviceOption(UsageLimitSources);
-    const usageService = yield* Effect.serviceOption(UsageService);
     const platform = yield* HostProcessPlatform;
     const arch = yield* HostProcessArchitecture;
 
@@ -77,14 +75,13 @@ export const PoolLive = Layer.effectDiscard(
           settings.updateSettings({ usageLimitSources: { [POOL_USAGE_SOURCE]: entry } }),
         );
       },
-      usageSnapshot: async () => {
-        if (Option.isNone(usageSources)) throw new Error("Account quota checks are unavailable.");
+      usageAccounts: async () => {
+        if (Option.isNone(usageSources)) return [];
         const snapshots = await Effect.runPromise(usageSources.value.current);
-        return snapshots.find((snapshot) => snapshot.id === POOL_USAGE_SOURCE_ID);
+        return snapshots.find((snapshot) => snapshot.id === POOL_USAGE_SOURCE_ID)?.accounts ?? [];
       },
       refreshUsage: async () => {
-        if (Option.isNone(usageSources)) throw new Error("Account quota checks are unavailable.");
-        await Effect.runPromise(usageSources.value.refresh);
+        if (Option.isSome(usageSources)) await Effect.runPromise(usageSources.value.refresh);
       },
       claudeProbe: async (instanceId) => {
         const instance = (await instanceMap())[ProviderInstanceId.make(instanceId)];
@@ -137,16 +134,6 @@ export const PoolLive = Layer.effectDiscard(
         }).catch(() => ({ stdout: "" }));
         return /(\d+\.\d+\.\d+(?:-[\w.]+)?)/.exec(stdout)?.[1];
       },
-      // The same rate table and overrides as the Usage page, so the two agree on cost.
-      ratesCachePath: NodePath.join(config.stateDir, "usage-model-rates.json"),
-      ...(Option.isSome(usageService)
-        ? {
-            refreshRates: async () => {
-              await Effect.runPromise(usageService.value.refreshRates);
-            },
-          }
-        : {}),
-      usagePriceOverrides: async () => (await getSettings()).usagePriceOverrides,
       log: (message, cause) => console.warn(`[pool] ${message}`, cause ?? ""),
     };
 

@@ -5,16 +5,12 @@ import {
   type PoolModelIssue,
   type PoolRoute,
   type PoolStatus,
-  type PoolUsageBucket,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
   accountLabel,
   accountNotice,
-  accountQuotaNotice,
-  accountUsageLine,
-  accountUsageSummaries,
   isCooldownResetOffered,
   isParityVisible,
   isPoolUnsupported,
@@ -30,7 +26,6 @@ import {
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
-  poolQuotaError,
   providerNote,
   routeWaitingReason,
   statusPollDelay,
@@ -152,86 +147,6 @@ describe("accounts", () => {
   });
 });
 
-describe("account quota notices", () => {
-  const windows = [{ id: "five_hour", kind: "session" as const, label: "5h", usedPercent: 40 }];
-
-  it("distinguishes an unread account from a known quota", () => {
-    assert.deepEqual(accountQuotaNotice(account(), false), {
-      text: "Quota not reported. Refresh quotas to try again.",
-      warning: false,
-    });
-    assert.isNull(accountQuotaNotice(account({ windows }), false));
-  });
-
-  it("explains that a paused account needs resuming before it can be read", () => {
-    assert.deepEqual(
-      accountQuotaNotice(account({ status: "disabled", quotaError: "old failure" }), false),
-      { text: "Paused. Resume this account, then refresh quotas.", warning: false },
-    );
-    assert.isNull(accountQuotaNotice(account({ status: "disabled", windows }), false));
-  });
-
-  it("keeps per-account failures beside last-known windows instead of claiming they are fresh", () => {
-    assert.deepEqual(
-      accountQuotaNotice(account({ windows, quotaError: " Sign in again. " }), false),
-      {
-        text: "Showing last reported quota. Sign in again.",
-        warning: true,
-      },
-    );
-    assert.deepEqual(accountQuotaNotice(account({ quotaError: "Sign in again." }), false), {
-      text: "Sign in again.",
-      warning: true,
-    });
-  });
-
-  it("does not repeat a source-level failure in every account", () => {
-    assert.isNull(accountQuotaNotice(account({ quotaError: "Connection refused" }), true));
-    assert.deepEqual(
-      accountQuotaNotice(account({ windows, quotaError: "Connection refused" }), true),
-      {
-        text: "Showing last reported quota.",
-        warning: false,
-      },
-    );
-  });
-});
-
-describe("manual quota refresh errors", () => {
-  const failure = { message: "Connection lost", failedAt: Date.parse("2030-01-01T12:00:00Z") };
-
-  it("keeps the manual failure while polls report the same or older quota check", () => {
-    for (const quotaCheckedAt of [
-      undefined,
-      "invalid",
-      "2030-01-01T11:59:59Z",
-      "2030-01-01T12:00:00Z",
-    ]) {
-      const accounts = [account(quotaCheckedAt === undefined ? {} : { quotaCheckedAt })];
-      assert.equal(poolQuotaError({ accounts }, failure), "Connection lost");
-    }
-    assert.equal(poolQuotaError(null, failure), "Connection lost");
-  });
-
-  it("dismisses the obsolete manual failure when an automatic check is newer", () => {
-    const accounts = [account({ quotaCheckedAt: "2030-01-01T12:00:01Z" })];
-    assert.isNull(poolQuotaError({ accounts }, failure));
-    assert.equal(
-      poolQuotaError({ accounts, quotaError: "Hub unavailable" }, failure),
-      "Hub unavailable",
-    );
-    const perAccountError = account({
-      quotaCheckedAt: "2030-01-01T12:00:01Z",
-      quotaError: "Sign in again",
-    });
-    assert.isNull(poolQuotaError({ accounts: [perAccountError] }, failure));
-    assert.deepEqual(accountQuotaNotice(perAccountError, false), {
-      text: "Sign in again",
-      warning: true,
-    });
-  });
-});
-
 describe("cooldown reset", () => {
   it("is offered while an account that isn't paused is being skipped", () => {
     assert.isFalse(isCooldownResetOffered(status({ accounts: [account()] })));
@@ -256,71 +171,6 @@ describe("cooldown reset", () => {
           accounts: [account({ status: "cooling" })],
         }),
       ),
-    );
-  });
-});
-
-describe("account usage", () => {
-  const day = (key: string, accounts: PoolUsageBucket["accounts"] = []): PoolUsageBucket => ({
-    key,
-    accounts,
-  });
-  const week = (buckets: PoolUsageBucket[]) =>
-    ({ range: "7d", resolution: "day", buckets }) as const;
-
-  it("takes today from the last bucket and the week from all of them, per account", () => {
-    const summaries = accountUsageSummaries(
-      week([
-        day("2026-09-25", [{ id: "claude-a.json", costUsd: 10, tokens: 2_000_000, requests: 20 }]),
-        day("2026-09-26"),
-        day("2026-09-30", [
-          { id: "claude-a.json", costUsd: 3.5, tokens: 500_000, requests: 4 },
-          { id: "codex-b.json", costUsd: 1, tokens: 100_000, requests: 2 },
-        ]),
-        day("2026-10-01", [{ id: "claude-a.json", costUsd: 4.2, tokens: 1_200_000, requests: 6 }]),
-      ]),
-    );
-    assert.deepEqual(summaries.get("claude-a.json"), {
-      todayCostUsd: 4.2,
-      todayTokens: 1_200_000,
-      weekCostUsd: 17.7,
-      weekTokens: 3_700_000,
-      weekRequests: 30,
-    });
-    assert.deepEqual(summaries.get("codex-b.json"), {
-      todayCostUsd: 0,
-      todayTokens: 0,
-      weekCostUsd: 1,
-      weekTokens: 100_000,
-      weekRequests: 2,
-    });
-  });
-
-  it("leaves out accounts that only failed, and reports other than 7 days by day", () => {
-    const failedOnly = day("2026-10-01", [
-      { id: "claude-a.json", costUsd: 0, tokens: 0, requests: 3 },
-    ]);
-    assert.equal(accountUsageSummaries(week([failedOnly])).size, 0);
-    const served = day("2026-10-01", [
-      { id: "claude-a.json", costUsd: 1, tokens: 10, requests: 1 },
-    ]);
-    assert.equal(accountUsageSummaries({ ...week([served]), resolution: "hour" }).size, 0);
-    assert.equal(accountUsageSummaries({ ...week([served]), range: "30d" }).size, 0);
-    assert.equal(accountUsageSummaries(week([])).size, 0);
-  });
-
-  it("writes the row line, leading with the week on a quiet day", () => {
-    const summary = {
-      todayCostUsd: 4.2,
-      todayTokens: 1_200_000,
-      weekCostUsd: 38.1,
-      weekTokens: 9_100_000,
-      weekRequests: 80,
-    };
-    assert.equal(accountUsageLine(summary), "Today $4.20 · 1.20M tokens · 7 days $38.10");
-    assert.equal(
-      accountUsageLine({ ...summary, todayCostUsd: 0, todayTokens: 0 }),
-      "7 days $38.10 · 9.10M tokens",
     );
   });
 });

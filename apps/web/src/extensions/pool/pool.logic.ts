@@ -1,6 +1,6 @@
 /**
  * Pure helpers for the accounts section of Settings → Providers: header status,
- * labels, account and route presentation, cooldown resets, usage lines, parity
+ * labels, account and route presentation, cooldown resets, parity
  * checks, the external URL draft and failure triage. The UI never says "pool":
  * to the user these are their Claude and ChatGPT accounts, with usage shared
  * between them.
@@ -13,13 +13,11 @@ import {
   type PoolProvider,
   type PoolRoute,
   type PoolStatus,
-  type PoolUsage,
   ProviderDriverKind,
   type ProviderInstanceConfig,
   ProviderInstanceId,
   type ServerSettings,
 } from "@t3tools/contracts";
-import { formatTokens, formatUsd } from "@t3tools/shared/usageFormat";
 
 /** Dot tones, keyed like the provider cards' `PROVIDER_STATUS_STYLES`. */
 export type PoolTone = "ready" | "warning" | "error" | "disabled";
@@ -42,7 +40,7 @@ const DRIVER: Readonly<Record<PoolProvider, ProviderDriverKind>> = {
   codex: ProviderDriverKind.make("codex"),
 };
 
-/** The T3 driver a pool provider maps to, for its icon and quota bar colour. */
+/** The T3 driver a pool provider maps to, for its icon. */
 export function poolProviderDriver(provider: PoolProvider): ProviderDriverKind {
   return DRIVER[provider];
 }
@@ -184,48 +182,6 @@ export function accountNotice(account: PoolAccount): AccountNotice | null {
   }
 }
 
-/** Missing readings never mean full quota; a failed read may still have last-known windows. */
-export function accountQuotaNotice(account: PoolAccount, sourceError: boolean) {
-  if (account.status === "disabled" && account.windows.length === 0) {
-    return { text: "Paused. Resume this account, then refresh quotas.", warning: false };
-  }
-  if (sourceError) {
-    return account.windows.length > 0
-      ? { text: "Showing last reported quota.", warning: false }
-      : null;
-  }
-  const error = account.quotaError?.trim();
-  if (error) {
-    return {
-      text: account.windows.length > 0 ? `Showing last reported quota. ${error}` : error,
-      warning: true,
-    };
-  }
-  return account.windows.length === 0
-    ? { text: "Quota not reported. Refresh quotas to try again.", warning: false }
-    : null;
-}
-
-export interface QuotaRefreshFailure {
-  readonly message: string;
-  readonly failedAt: number;
-}
-
-/** A newer provider check supersedes a failed manual RPC; ordinary status polls do not. */
-export function poolQuotaError(
-  status: Pick<PoolStatus, "accounts" | "quotaError"> | null,
-  failure: QuotaRefreshFailure | null,
-): string | null {
-  const newerCheck =
-    failure !== null &&
-    status?.accounts.some(
-      (account) =>
-        account.quotaCheckedAt !== undefined &&
-        Date.parse(account.quotaCheckedAt) > failure.failedAt,
-    );
-  return (!newerCheck ? failure?.message.trim() : null) || status?.quotaError?.trim() || null;
-}
-
 /** Cooling or in error: the account is skipped until its cooldown runs out, or it is cleared. */
 export function isHeldBack(account: PoolAccount): boolean {
   return account.status === "cooling" || account.status === "error";
@@ -250,56 +206,6 @@ export function orderAccounts(accounts: readonly PoolAccount[]): PoolAccount[] {
   return POOL_PROVIDERS.flatMap((provider) =>
     accounts.filter((account) => account.provider === provider),
   );
-}
-
-/** What one account served today and over the last 7 days, for its row. */
-export interface AccountUsageSummary {
-  readonly todayCostUsd: number;
-  readonly todayTokens: number;
-  readonly weekCostUsd: number;
-  readonly weekTokens: number;
-  readonly weekRequests: number;
-}
-
-/**
- * Per-account summaries from a 7-day, day-resolution report: "today" is the
- * last bucket (buckets run oldest first and end today), the week is all of
- * them. Both sides sum buckets, so they count tokens the same way. Accounts
- * that served nothing (no tokens, no cost) are left out; any other report
- * gives an empty map.
- */
-export function accountUsageSummaries(
-  usage: Pick<PoolUsage, "range" | "resolution" | "buckets">,
-): ReadonlyMap<string, AccountUsageSummary> {
-  const summaries = new Map<string, AccountUsageSummary>();
-  if (usage.range !== "7d" || usage.resolution !== "day") return summaries;
-  const last = usage.buckets.length - 1;
-  usage.buckets.forEach((bucket, index) => {
-    const today = index === last;
-    for (const entry of bucket.accounts) {
-      const previous = summaries.get(entry.id);
-      summaries.set(entry.id, {
-        todayCostUsd: (previous?.todayCostUsd ?? 0) + (today ? entry.costUsd : 0),
-        todayTokens: (previous?.todayTokens ?? 0) + (today ? entry.tokens : 0),
-        weekCostUsd: (previous?.weekCostUsd ?? 0) + entry.costUsd,
-        weekTokens: (previous?.weekTokens ?? 0) + entry.tokens,
-        weekRequests: (previous?.weekRequests ?? 0) + entry.requests,
-      });
-    }
-  });
-  for (const [id, summary] of summaries) {
-    if (summary.weekTokens === 0 && summary.weekCostUsd === 0) summaries.delete(id);
-  }
-  return summaries;
-}
-
-/** "Today $4.20 · 1.20M tokens · 7 days $38.10"; a quiet day leads with the week instead. */
-export function accountUsageLine(summary: AccountUsageSummary): string {
-  const week = `7 days ${formatUsd(summary.weekCostUsd)}`;
-  if (summary.todayTokens === 0 && summary.todayCostUsd === 0) {
-    return `${week} · ${formatTokens(summary.weekTokens)} tokens`;
-  }
-  return `Today ${formatUsd(summary.todayCostUsd)} · ${formatTokens(summary.todayTokens)} tokens · ${week}`;
 }
 
 /** Why a route set to Pool is not serving yet; null when it is active or set to Direct. */
