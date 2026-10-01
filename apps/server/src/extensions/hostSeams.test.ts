@@ -60,6 +60,16 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "codexHasNoSubscriptionUsage(snapshot.account)",
     "unsupported (not failed) usage for a pooled Codex",
   ],
+  [
+    "apps/web/src/components/AgentsPanel.tsx",
+    "agentElapsedClock(agent)",
+    "elapsed for live agents, pending workflow members included",
+  ],
+  [
+    "apps/web/src/components/AgentsPanel.tsx",
+    "{group.workflow.startedAt ? (",
+    "elapsed on a running workflow's header",
+  ],
 ];
 
 describe("fork host seams", () => {

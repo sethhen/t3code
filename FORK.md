@@ -24,6 +24,7 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/web/src/rightPanelStore.ts`                                      | `extension` surface kind + `openExtension`                                               |
 | `apps/web/src/components/RightPanelTabs.tsx`                           | extension entries in the add-tab menu, label/icon                                        |
 | `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`                                                               |
+| `apps/web/src/components/AgentsPanel.tsx`                              | shows live elapsed time for workflows and pending members via `agentElapsedClock`        |
 | `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
 | `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait (pool), + its test     |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
