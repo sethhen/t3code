@@ -5,12 +5,16 @@ import {
   type PoolModelIssue,
   type PoolRoute,
   type PoolStatus,
+  type PoolUsageBucket,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
   accountLabel,
   accountNotice,
+  accountUsageLine,
+  accountUsageSummaries,
+  isCooldownResetOffered,
   isParityVisible,
   isPoolUnsupported,
   isRoutingVisible,
@@ -114,6 +118,19 @@ describe("accounts", () => {
     });
   });
 
+  it("calls out a stale cooldown instead of the plain cooling badge, unless paused", () => {
+    const stale = { kind: "stale", text: "Has usage again but is still held back" } as const;
+    assert.deepEqual(
+      accountNotice(account({ status: "cooling", message: "Cooling down", staleCooldown: true })),
+      stale,
+    );
+    assert.deepEqual(accountNotice(account({ status: "error", staleCooldown: true })), stale);
+    assert.deepEqual(accountNotice(account({ status: "disabled", staleCooldown: true })), {
+      kind: "paused",
+    });
+    assert.isNull(accountNotice(account({ staleCooldown: true })));
+  });
+
   it("labels an account by email, else by what was signed in", () => {
     assert.equal(accountLabel(account({ email: "a@example.com" })), "a@example.com");
     assert.equal(accountLabel(account({ provider: "codex" })), "ChatGPT account");
@@ -129,6 +146,99 @@ describe("accounts", () => {
     assert.deepEqual(
       ordered.map((entry) => entry.id),
       ["c1", "c2", "x1", "x2"],
+    );
+  });
+});
+
+describe("cooldown reset", () => {
+  it("is offered while an account that isn't paused is being skipped", () => {
+    assert.isFalse(isCooldownResetOffered(status({ accounts: [account()] })));
+    assert.isFalse(
+      isCooldownResetOffered(status({ accounts: [account(), account({ status: "disabled" })] })),
+    );
+    for (const held of [
+      account({ status: "cooling" }),
+      account({ status: "error", message: "Rate limited" }),
+      account({ status: "cooling", staleCooldown: true }),
+    ]) {
+      assert.isTrue(isCooldownResetOffered(status({ accounts: [account(), held] })));
+    }
+  });
+
+  it("is not offered for a team server, whose cooldowns live there", () => {
+    assert.isFalse(
+      isCooldownResetOffered(
+        status({
+          source: "external",
+          external: { url: "http://pool:8317", hasKey: true, reachable: true },
+          accounts: [account({ status: "cooling" })],
+        }),
+      ),
+    );
+  });
+});
+
+describe("account usage", () => {
+  const day = (key: string, accounts: PoolUsageBucket["accounts"] = []): PoolUsageBucket => ({
+    key,
+    accounts,
+  });
+  const week = (buckets: PoolUsageBucket[]) =>
+    ({ range: "7d", resolution: "day", buckets }) as const;
+
+  it("takes today from the last bucket and the week from all of them, per account", () => {
+    const summaries = accountUsageSummaries(
+      week([
+        day("2026-09-25", [{ id: "claude-a.json", costUsd: 10, tokens: 2_000_000, requests: 20 }]),
+        day("2026-09-26"),
+        day("2026-09-30", [
+          { id: "claude-a.json", costUsd: 3.5, tokens: 500_000, requests: 4 },
+          { id: "codex-b.json", costUsd: 1, tokens: 100_000, requests: 2 },
+        ]),
+        day("2026-10-01", [{ id: "claude-a.json", costUsd: 4.2, tokens: 1_200_000, requests: 6 }]),
+      ]),
+    );
+    assert.deepEqual(summaries.get("claude-a.json"), {
+      todayCostUsd: 4.2,
+      todayTokens: 1_200_000,
+      weekCostUsd: 17.7,
+      weekTokens: 3_700_000,
+      weekRequests: 30,
+    });
+    assert.deepEqual(summaries.get("codex-b.json"), {
+      todayCostUsd: 0,
+      todayTokens: 0,
+      weekCostUsd: 1,
+      weekTokens: 100_000,
+      weekRequests: 2,
+    });
+  });
+
+  it("leaves out accounts that only failed, and reports other than 7 days by day", () => {
+    const failedOnly = day("2026-10-01", [
+      { id: "claude-a.json", costUsd: 0, tokens: 0, requests: 3 },
+    ]);
+    assert.equal(accountUsageSummaries(week([failedOnly])).size, 0);
+    const served = day("2026-10-01", [
+      { id: "claude-a.json", costUsd: 1, tokens: 10, requests: 1 },
+    ]);
+    assert.equal(accountUsageSummaries({ ...week([served]), resolution: "hour" }).size, 0);
+    assert.equal(accountUsageSummaries({ ...week([served]), range: "30d" }).size, 0);
+    assert.equal(accountUsageSummaries(week([])).size, 0);
+  });
+
+  it("writes the row line, leading with the week on a quiet day", () => {
+    const summary = {
+      todayCostUsd: 4.2,
+      todayTokens: 1_200_000,
+      weekCostUsd: 38.1,
+      weekTokens: 9_100_000,
+      weekRequests: 80,
+    };
+    assert.equal(accountUsageLine(summary), "Today $4.20 · 1.20M tokens · 7 days $38.10");
+    assert.equal(
+      accountUsageLine({ ...summary, todayCostUsd: 0, todayTokens: 0 }),
+      "7 days $38.10 · 9.10M tokens",
     );
   });
 });

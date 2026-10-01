@@ -33,5 +33,7 @@ export const makePoolServerExtension = Effect.sync(() =>
     "account.remove": ({ id }) => withController((pool) => pool.removeAccount(id)),
     check: () => withController((pool) => pool.check()),
     restart: () => withController((pool) => pool.restart()),
+    reset: ({ id }) => withController((pool) => pool.reset(id)),
+    usage: (input) => withController((pool) => pool.usage(input)),
   }),
 );

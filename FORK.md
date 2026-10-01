@@ -59,8 +59,15 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
 - **Claude and Codex accounts:** Settings → Providers → **Add account** next to Claude or Codex
   (Codex signs in with ChatGPT), then sign in in the browser. Add as many as you like: usage is
   shared between them automatically, nothing else to configure. The usual provider settings
-  (models, other providers) are under **More provider settings**. The first sign-in may show a
-  firewall prompt for `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer
+  (models, other providers) are under **More provider settings**. Keep Claude enabled to use
+  pooled Claude accounts and Codex enabled to use pooled ChatGPT accounts: these providers run
+  the agents, while the pool supplies their accounts. **Usage** (next to the accounts) shows new
+  requests served through this pool and their API-equivalent cost; earlier activity is not
+  backfilled. Quota bars beside each account and in **Usage** show its current subscription
+  allowance and reset time, independently of the selected usage period. If an account's usage
+  was reset but the app still won't use it, **Reset cooldowns**
+  (or Clear cooldown on the account) tries it again now. The first sign-in may show a firewall
+  prompt for `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer
   works, sign-in uses localhost. Don't also sign the same account into another proxy (CC Switch, EasyCLIProxyAPI):
   two proxies refreshing one account sign each other out.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
@@ -133,6 +140,21 @@ flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyH
 0600 key file for that pool's address, `<stateDir>/pool/keys/<sha256(url) prefix>`, so a session still aimed at one pool can never read another pool's key (other pools' files are removed once routing has switched). The helper command holds no path: it reads the file named by
 `T3_POOL_KEY_FILE` (`cat "$T3_POOL_KEY_FILE"`, PowerShell `-LiteralPath` on Windows), so neither
 `/bin/sh` nor `cmd.exe` can expand anything in it. Codex reads the key from an env var.
+Usage per account comes from the proxy's usage queue (`usage-queue`), which pops records and
+forgets unread ones after `redis-usage-queue-retention-seconds` (3600 in our config). A missed drain
+or sleeping laptop can lose records older than that hour. The local pool drains it every 15s and
+once more before the proxy stops, and keeps 15-minute rollups per account and model for 90 days
+plus the latest requests and errors in
+`<stateDir>/pool/usage/` (never T3's database, which official builds share). It never drains a team
+server: the queue is pop-based, so that would take the owner's records. Costs are priced like the
+Usage page (upstream's cached LiteLLM table plus the user's custom prices).
+
+The proxy benches an account after a 429 until the reset time it parsed then, and never re-checks
+that against fresh quota (CLIProxyAPI issues #5639, #5404, #5770), so an account whose usage was
+reset early stays unused and turns fail. `reset` clears cooldowns through `reset-quota` (no restart,
+nothing in flight dropped); status marks `staleCooldown` when a quota read taken after the 429 shows
+room again.
+
 Models stay in their own harness: T3 never offers a cross-family model through the pool (pooled
 instances drop cross-family custom models, gateway model discovery is off, Codex uses OpenAI's
 catalog), and Settings → Providers flags any hand-configured one (a custom model, or a Claude model
@@ -149,13 +171,16 @@ alias in the instance env or `~/.claude/settings.json`) as a failing "Model fami
 4. After a Claude Code update, its binary still reads `CLAUDE_CODE_RETRY_WATCHDOG` (undocumented;
    `overlay.ts` sets it so a thread waits out an exhausted pool instead of failing, subagents too).
    Search the binary for the name; if it's gone, find the new persistent-retry switch.
-5. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2.
+5. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2, and
+   check that `usage-queue` records still match `usageQueue.ts` (`token_breakdown` v2, `auth_index`,
+   `source`) and that `reset-quota` still takes `auth_index`.
 
 Known limits: during sign-in the proxy's OAuth callback listeners (54545 Claude, 1455 Codex) bind
 all interfaces (CLIProxyAPI has no option to restrict them); on Windows a hard-killed server leaves
 the proxy running until T3 starts again;
 signing in on a remote environment needs a browser on that machine (the OAuth callback is its
-localhost); a team server (external pool) shows no accounts and Codex keeps its built-in catalog.
+localhost); a team server (external pool) shows no accounts, records no usage here, and Codex keeps
+its built-in catalog.
 
 ## Traps
 

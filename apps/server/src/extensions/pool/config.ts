@@ -12,6 +12,10 @@
  *   pile onto one account. With it each subagent binds to its own account.
  * - Failover is built in: a bound account that becomes unavailable is
  *   re-selected on the next request.
+ *
+ * `redis-usage-queue-retention-seconds` (the maximum) keeps unread usage
+ * records for an hour instead of a minute, so a missed drain or a sleeping
+ * laptop loses nothing (the pool drains the queue every 15 seconds).
  */
 export interface PoolProxyConfigInput {
   readonly port: number;
@@ -41,6 +45,7 @@ export const renderProxyConfig = (input: PoolProxyConfigInput): string =>
     "  session-affinity-subagents: false",
     "request-retry: 3",
     "usage-statistics-enabled: true",
+    "redis-usage-queue-retention-seconds: 3600",
     "logging-to-file: false",
     "debug: false",
     "",

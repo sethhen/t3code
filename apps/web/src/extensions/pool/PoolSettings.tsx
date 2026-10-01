@@ -5,13 +5,16 @@
  * provider and usage is shared between them.
  *
  * Problems first, everything else out of the way: each provider shows its
- * accounts and one line on how they are used; failing checks show inline; the
- * header carries a state only when something is off, and the menu holds the
- * rare actions (routing, checks, a team server, restart). The upstream
- * provider list folds away under "More provider settings".
+ * accounts and one line on how they are used, each account what it served
+ * lately; failing checks show inline; the header carries a state only when
+ * something is off (with "Reset cooldowns" while an account is held back) plus
+ * the way into usage, and the menu holds the rare actions (routing, checks, a
+ * team server, reset, restart). The upstream provider list folds away under
+ * "More provider settings".
  */
 import {
   type EnvironmentId,
+  type PoolAccount,
   type PoolCheck,
   type PoolCheckState,
   PoolExtension,
@@ -22,6 +25,7 @@ import {
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import {
+  ChartNoAxesColumnIcon,
   CheckIcon,
   ChevronRightIcon,
   CircleDashedIcon,
@@ -54,7 +58,11 @@ import { useExtensionClient } from "../client";
 import type { ProviderSettingsExtensionProps } from "../providerSettings";
 import { PoolAccounts } from "./PoolAccounts";
 import { PoolLoginDialog, usePoolLogin } from "./PoolLogin";
+import { PoolUsageDialog } from "./PoolUsageDialog";
 import {
+  accountUsageSummaries,
+  type AccountUsageSummary,
+  isCooldownResetOffered,
   isParityVisible,
   isRoutingVisible,
   modelIssueHint,
@@ -99,12 +107,19 @@ import {
   usePolling,
   usePoolStatus,
 } from "./usePoolStatus";
+import { usePoolUsage } from "./usePoolUsage";
 
 const EXTERNAL_EXPLAINER =
   "Use accounts someone else signs in on their server. Sign-ins and quotas live on that server.";
 
 const ROUTING_EXPLAINER =
   "These accounts: sessions share the accounts above. Own sign-in: the provider signs in the way it would without T3 Code. Switching restarts that provider's running sessions.";
+
+/** After a reset: why a thread may still sit on its rate-limit wait, and how to skip it. */
+const RESET_WAITING_NOTE =
+  "A thread already waiting on a rate limit retries at its scheduled time; stop it and resend to retry now.";
+
+const NO_USAGE: ReadonlyMap<string, AccountUsageSummary> = new Map();
 
 const ROUTE_OPTIONS = [
   { value: "pool", label: "These accounts" },
@@ -129,6 +144,14 @@ export function PoolSettings({
   const [externalFormOpen, setExternalFormOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
   const [checksOpen, setChecksOpen] = useState(false);
+  // The account stays set while the dialog animates closed.
+  const [usageView, setUsageView] = useState<{ open: boolean; accountId?: string }>({
+    open: false,
+  });
+  // One 7-day read feeds every row's usage line; only a local pool with accounts records usage.
+  const usageRange =
+    pool.status?.source === "local" && pool.status.accounts.length > 0 ? "7d" : null;
+  const { usage } = usePoolUsage(client, usageRange);
 
   // No accounts here (an official T3 server, or no permission to read them): the upstream page as is.
   if (pool.unsupported) return children;
@@ -146,6 +169,27 @@ export function PoolSettings({
   };
   const runRestart = () =>
     void actions.run("restart", () => client.call("restart", {}), "Could not restart");
+  // One account shares its row's key, so the row shows the spinner; no intent, so pause state holds.
+  const resetCooldowns = async (account?: PoolAccount) => {
+    const outcome = await actions.run(
+      account ? `account:${account.id}` : "reset",
+      () => client.call("reset", account ? { id: account.id } : {}),
+      account ? "Could not clear the cooldown" : "Could not reset the cooldowns",
+    );
+    if (!outcome?.ok) return;
+    toastManager.add({
+      type: "success",
+      title: account ? "Cooldown cleared" : "Cooldowns cleared",
+      description: account
+        ? `The account is tried again now, and cools down again after one try if it's really out of usage. ${RESET_WAITING_NOTE}`
+        : `Accounts are tried again now. One that's really out of usage cools down again after one try. ${RESET_WAITING_NOTE}`,
+    });
+  };
+  const local = status?.source === "local";
+  const resetOffered = status ? isCooldownResetOffered(status) : false;
+  const usageSummaries = usage ? accountUsageSummaries(usage) : NO_USAGE;
+  const showUsage = (accountId?: string) =>
+    setUsageView(accountId ? { open: true, accountId } : { open: true });
 
   return (
     <>
@@ -156,6 +200,23 @@ export function PoolSettings({
             status ? (
               <div className="flex min-w-0 items-center gap-1.5">
                 {header ? <HeaderStatusLabel header={header} /> : null}
+                {resetOffered ? (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={readOnly || actions.isBusy("reset")}
+                    onClick={() => void resetCooldowns()}
+                  >
+                    {actions.isBusy("reset") ? <Spinner className="size-3.5" /> : null}
+                    Reset cooldowns
+                  </Button>
+                ) : null}
+                {local && status.accounts.length > 0 ? (
+                  <Button size="xs" variant="ghost-muted" onClick={() => showUsage()}>
+                    <ChartNoAxesColumnIcon aria-hidden />
+                    Usage
+                  </Button>
+                ) : null}
                 <Menu>
                   <MenuTrigger
                     render={
@@ -185,6 +246,14 @@ export function PoolSettings({
                     {status.source === "local" ? (
                       <MenuItem onClick={() => setExternalFormOpen(true)}>
                         Use a team server…
+                      </MenuItem>
+                    ) : null}
+                    {local && runtimeState !== "idle" && status.accounts.length > 0 ? (
+                      <MenuItem
+                        disabled={actions.isBusy("reset")}
+                        onClick={() => void resetCooldowns()}
+                      >
+                        Reset cooldowns
                       </MenuItem>
                     ) : null}
                     {status.source === "local" && runtimeState !== "idle" ? (
@@ -235,7 +304,11 @@ export function PoolSettings({
                   client={client}
                   actions={actions}
                   readOnly={readOnly || login.pending}
+                  usage={usageSummaries}
+                  now={pool.receivedAt}
                   onAdd={(provider) => void login.start(provider)}
+                  onClearCooldown={(account) => void resetCooldowns(account)}
+                  onShowUsage={showUsage}
                 />
               ) : null}
               {routingVisible && routingOpen ? (
@@ -270,6 +343,16 @@ export function PoolSettings({
           onRetry={(provider) => void login.start(provider)}
           onClose={login.close}
         />
+        {local ? (
+          <PoolUsageDialog
+            client={client}
+            open={usageView.open}
+            onOpenChange={(open) => setUsageView((current) => ({ ...current, open }))}
+            accounts={status.accounts}
+            now={pool.receivedAt}
+            {...(usageView.accountId ? { initialAccountId: usageView.accountId } : {})}
+          />
+        ) : null}
       </div>
       <MoreProviderSettings targetInstanceId={targetInstanceId}>{children}</MoreProviderSettings>
     </>

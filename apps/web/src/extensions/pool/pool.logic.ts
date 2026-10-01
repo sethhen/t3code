@@ -1,8 +1,9 @@
 /**
  * Pure helpers for the accounts section of Settings → Providers: header status,
- * labels, account and route presentation, parity checks, the external URL
- * draft and failure triage. The UI never says "pool": to the user these are
- * their Claude and ChatGPT accounts, with usage shared between them.
+ * labels, account and route presentation, cooldown resets, usage lines, parity
+ * checks, the external URL draft and failure triage. The UI never says "pool":
+ * to the user these are their Claude and ChatGPT accounts, with usage shared
+ * between them.
  */
 import {
   defaultInstanceIdForDriver,
@@ -12,11 +13,13 @@ import {
   type PoolProvider,
   type PoolRoute,
   type PoolStatus,
+  type PoolUsage,
   ProviderDriverKind,
   type ProviderInstanceConfig,
   ProviderInstanceId,
   type ServerSettings,
 } from "@t3tools/contracts";
+import { formatTokens, formatUsd } from "@t3tools/shared/usageFormat";
 
 /** Dot tones, keyed like the provider cards' `PROVIDER_STATUS_STYLES`. */
 export type PoolTone = "ready" | "warning" | "error" | "disabled";
@@ -159,11 +162,16 @@ export function accountLabel(account: PoolAccount): string {
 export type AccountNotice =
   | { readonly kind: "paused" }
   | { readonly kind: "cooling"; readonly text: string }
-  | { readonly kind: "error"; readonly text: string };
+  | { readonly kind: "error"; readonly text: string }
+  /** Usage is back but an old cooldown still keeps the account out; the row offers Clear. */
+  | { readonly kind: "stale"; readonly text: string };
 
 /** The badge or warning an account row carries; null when it is simply ready. */
 export function accountNotice(account: PoolAccount): AccountNotice | null {
   const message = account.message?.trim();
+  if (account.staleCooldown === true && isHeldBack(account)) {
+    return { kind: "stale", text: "Has usage again but is still held back" };
+  }
   switch (account.status) {
     case "ready":
       return null;
@@ -176,11 +184,80 @@ export function accountNotice(account: PoolAccount): AccountNotice | null {
   }
 }
 
+/** Cooling or in error: the account is skipped until its cooldown runs out, or it is cleared. */
+export function isHeldBack(account: PoolAccount): boolean {
+  return account.status === "cooling" || account.status === "error";
+}
+
+/**
+ * Whether the section header offers "Reset cooldowns": a local account that is
+ * not paused is being skipped (cooling, in error, or held by a stale cooldown).
+ */
+export function isCooldownResetOffered(status: PoolStatus): boolean {
+  return (
+    status.source === "local" &&
+    status.accounts.some(
+      (account) =>
+        account.status !== "disabled" && (isHeldBack(account) || account.staleCooldown === true),
+    )
+  );
+}
+
 /** Claude first, then Codex; server order (highest plan first) within a provider, so rows never jump between polls. */
 export function orderAccounts(accounts: readonly PoolAccount[]): PoolAccount[] {
   return POOL_PROVIDERS.flatMap((provider) =>
     accounts.filter((account) => account.provider === provider),
   );
+}
+
+/** What one account served today and over the last 7 days, for its row. */
+export interface AccountUsageSummary {
+  readonly todayCostUsd: number;
+  readonly todayTokens: number;
+  readonly weekCostUsd: number;
+  readonly weekTokens: number;
+  readonly weekRequests: number;
+}
+
+/**
+ * Per-account summaries from a 7-day, day-resolution report: "today" is the
+ * last bucket (buckets run oldest first and end today), the week is all of
+ * them. Both sides sum buckets, so they count tokens the same way. Accounts
+ * that served nothing (no tokens, no cost) are left out; any other report
+ * gives an empty map.
+ */
+export function accountUsageSummaries(
+  usage: Pick<PoolUsage, "range" | "resolution" | "buckets">,
+): ReadonlyMap<string, AccountUsageSummary> {
+  const summaries = new Map<string, AccountUsageSummary>();
+  if (usage.range !== "7d" || usage.resolution !== "day") return summaries;
+  const last = usage.buckets.length - 1;
+  usage.buckets.forEach((bucket, index) => {
+    const today = index === last;
+    for (const entry of bucket.accounts) {
+      const previous = summaries.get(entry.id);
+      summaries.set(entry.id, {
+        todayCostUsd: (previous?.todayCostUsd ?? 0) + (today ? entry.costUsd : 0),
+        todayTokens: (previous?.todayTokens ?? 0) + (today ? entry.tokens : 0),
+        weekCostUsd: (previous?.weekCostUsd ?? 0) + entry.costUsd,
+        weekTokens: (previous?.weekTokens ?? 0) + entry.tokens,
+        weekRequests: (previous?.weekRequests ?? 0) + entry.requests,
+      });
+    }
+  });
+  for (const [id, summary] of summaries) {
+    if (summary.weekTokens === 0 && summary.weekCostUsd === 0) summaries.delete(id);
+  }
+  return summaries;
+}
+
+/** "Today $4.20 · 1.20M tokens · 7 days $38.10"; a quiet day leads with the week instead. */
+export function accountUsageLine(summary: AccountUsageSummary): string {
+  const week = `7 days ${formatUsd(summary.weekCostUsd)}`;
+  if (summary.todayTokens === 0 && summary.todayCostUsd === 0) {
+    return `${week} · ${formatTokens(summary.weekTokens)} tokens`;
+  }
+  return `Today ${formatUsd(summary.todayCostUsd)} · ${formatTokens(summary.todayTokens)} tokens · ${week}`;
 }
 
 /** Why a route set to Pool is not serving yet; null when it is active or set to Direct. */

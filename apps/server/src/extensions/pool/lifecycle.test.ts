@@ -95,6 +95,8 @@ const fakeDeps = (paths: PoolPaths, over: Partial<PoolDeps> = {}) => {
     },
     claudeConfigDir: async () => undefined,
     codexVersion: async () => undefined,
+    ratesCachePath: NodePath.join(paths.root, "usage-model-rates.json"),
+    usagePriceOverrides: async () => ({}),
     log: () => undefined,
     ...over,
   };

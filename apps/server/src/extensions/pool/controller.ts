@@ -1,4 +1,4 @@
-// @effect-diagnostics globalDate:off - the pool's process manager is plain async Node by design; Effect wraps it at the layer and handler boundary.
+// @effect-diagnostics globalDate:off globalTimers:off - the pool's process manager is plain async Node by design; Effect wraps it at the layer and handler boundary.
 // @effect-diagnostics nodeBuiltinImport:off - the pool manages a child process and its state files with plain Node.
 /**
  * The pool's state machine, shared by every ws connection (one instance per
@@ -27,10 +27,13 @@ import type {
   PoolRuntimeState,
   PoolSetSourceInput,
   PoolStatus,
+  PoolUsage,
+  PoolUsageInput,
   ProviderInstanceConfig,
   ProviderInstanceConfigMap,
   UsageLimitSourceAccount,
   UsageLimitSourceConfig,
+  UsageModelPriceOverride,
 } from "@t3tools/contracts";
 
 import { registerInstanceOverlay } from "../instanceOverlays.ts";
@@ -39,14 +42,17 @@ import {
   type AuthFileEntry,
   accountStatusOf,
   deleteAuthFile,
+  drainUsageQueue,
   fetchClaudePlan,
   fetchCodexCatalog,
+  isStaleCooldown,
   listAuthFiles,
   loginStatus,
   planRank,
   poolProviderOf,
   probeClientKey,
   readRouting,
+  resetQuota,
   setAuthFileDisabled,
   startLogin,
 } from "./management.ts";
@@ -75,6 +81,12 @@ import {
   savePoolState,
   keyFilePath,
 } from "./state.ts";
+import { createOverrideRateTable } from "./t3.ts";
+import { parseUsageQueueRecord } from "./usageQueue.ts";
+import { createUsageRates } from "./usageRates.ts";
+import { buildPoolUsage } from "./usageReport.ts";
+import { PoolUsageStore } from "./usageStore.ts";
+import type { AttributedSample, UsageSample } from "./usageTypes.ts";
 
 /** The pool's entry in `settings.usageLimitSources`, so its quotas show on the usage page. */
 export const POOL_USAGE_SOURCE_ID = "cliproxy-t3-pool";
@@ -100,6 +112,12 @@ export interface PoolDeps {
   readonly claudeConfigDir: (instanceId: string) => Promise<string | undefined>;
   /** The version of the Codex CLI the pooled Codex instance runs (`client_version` for its catalog). */
   readonly codexVersion: () => Promise<string | undefined>;
+  /** Upstream's cached LiteLLM rate table (`<stateDir>/usage-model-rates.json`), for usage costs. */
+  readonly ratesCachePath: string;
+  /** Has upstream's Usage service refetch that table; absent when the service isn't there. */
+  readonly refreshRates?: () => Promise<void>;
+  /** `settings.usagePriceOverrides`, so pool costs match the Usage page. */
+  readonly usagePriceOverrides: () => Promise<Readonly<Record<string, UsageModelPriceOverride>>>;
   /** Tests replace the download; production uses `ensureBinary`. */
   readonly installBinary?: (signal: AbortSignal) => Promise<string>;
   readonly log: (message: string, cause?: unknown) => void;
@@ -125,7 +143,39 @@ const CODEX_CATALOG_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 const CLAUDE_PLAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const CLAUDE_PLAN_RETRY_MS = 5 * 60 * 1000;
 
+/** The proxy keeps unread usage for an hour (config.ts); draining often keeps the view current. */
+const USAGE_DRAIN_MS = 15_000;
+/** Records per pop, and pops per drain: a drain stays bounded while traffic keeps filling the queue. */
+const USAGE_DRAIN_BATCH = 500;
+const USAGE_DRAIN_MAX_POPS = 20;
+/** How long stopping waits on the last drain before it stops the proxy anyway. */
+const FINAL_DRAIN_TIMEOUT_MS = 5_000;
+
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * The pool account a usage sample belongs to: the auth file the proxy's handle
+ * names, else the one account of that provider with the sample's address, else
+ * `email:<address>`, else `""` (the proxy answered without trying an account).
+ */
+export const attributeSample = (
+  sample: UsageSample,
+  accounts: ReadonlyArray<AuthFileEntry>,
+): AttributedSample => {
+  const byIndex = sample.authIndex
+    ? accounts.find((account) => account.authIndex === sample.authIndex)
+    : undefined;
+  if (byIndex) return { ...sample, account: byIndex.name };
+  if (!sample.email) return { ...sample, account: "" };
+  const address = sample.email.toLowerCase();
+  // One address can sign in to both providers, or to two ChatGPT workspaces: only a unique match counts.
+  const byEmail = accounts.filter(
+    (account) =>
+      account.email?.toLowerCase() === address &&
+      poolProviderOf(account.provider) === sample.provider,
+  );
+  return { ...sample, account: byEmail.length === 1 ? byEmail[0]!.name : `email:${sample.email}` };
+};
 
 /** Auth files straight from disk, for when the proxy isn't running (e.g. at boot). */
 export const scanAuthDir = async (authDir: string): Promise<AuthFileEntry[]> => {
@@ -190,15 +240,33 @@ export class PoolController {
   private routingQueue: Promise<void> = Promise.resolve();
   /** The instance map as it reached the pool's overlay (custom models unfiltered). */
   private baseMap: ProviderInstanceConfigMap | undefined;
+  /** What each account served, drained from the local proxy's usage queue. */
+  private readonly usageStore: PoolUsageStore;
+  /** Settles once the store has read its history; a failed read is logged, recording goes on. */
+  private usageLoaded: Promise<void> = Promise.resolve();
+  private readonly usageRates: ReturnType<typeof createUsageRates>;
+  private drainTimer: ReturnType<typeof setInterval> | undefined;
+  /** Serialises drains: the queue is pop-based, one reader at a time. */
+  private drainQueue: Promise<void> = Promise.resolve();
+  private drainsQueued = 0;
 
   private readonly deps: PoolDeps;
 
   constructor(deps: PoolDeps) {
     this.deps = deps;
+    this.usageStore = new PoolUsageStore({ dir: deps.paths.usageDir });
+    this.usageRates = createUsageRates({
+      cachePath: deps.ratesCachePath,
+      ...(deps.refreshRates ? { refresh: deps.refreshRates } : {}),
+    });
   }
 
   async init() {
     this.state = await loadPoolState(this.deps.paths);
+    // Not awaited: history can be large, and nothing reads or records before it settles.
+    this.usageLoaded = this.usageStore
+      .load()
+      .catch((error) => this.deps.log("Couldn't read the pool's usage history", error));
     this.accounts = await scanAuthDir(this.deps.paths.authDir);
     this.codexCatalogPath = await NodeFSP.access(this.deps.paths.codexCatalogPath).then(
       () => this.deps.paths.codexCatalogPath,
@@ -225,6 +293,12 @@ export class PoolController {
     this.closed = true;
     this.unregisterOverlay?.();
     await this.stopLocal();
+    // A drain cut off by the stop timeout settles quickly once the proxy is gone.
+    await this.drainQueue;
+    await this.usageLoaded;
+    await this.usageStore
+      .flush()
+      .catch((error) => this.deps.log("Couldn't save the pool's usage", error));
   }
 
   // -------------------------------------------------------------------------
@@ -412,6 +486,7 @@ export class PoolController {
   }
 
   private async afterProxyUp() {
+    this.startUsageDrain();
     await this.refreshAccounts().catch(() => undefined);
     void this.refreshCodexCatalog();
     void this.refreshClaudePlans();
@@ -419,10 +494,16 @@ export class PoolController {
     void this.runChecks();
   }
 
-  /** Stops the proxy, cancelling (and waiting out) a start in progress. */
+  /**
+   * Stops the proxy, cancelling (and waiting out) a start in progress. A running
+   * proxy's unread usage lives only in its memory, so it is drained first
+   * (bounded; a failed drain never blocks the stop).
+   */
   private async stopLocal() {
     this.generation++;
     this.startAbort?.abort();
+    if (this.running) await this.finalDrain();
+    this.stopUsageDrain();
     const sidecar = this.sidecar;
     this.sidecar = undefined;
     await sidecar?.stop();
@@ -430,6 +511,85 @@ export class PoolController {
     const late = this.sidecar as Sidecar | undefined;
     this.sidecar = undefined;
     await late?.stop();
+  }
+
+  // -------------------------------------------------------------------------
+  // Usage recording
+
+  /** Drains every 15 s while the local proxy runs; `stopLocal` ends it. */
+  private startUsageDrain() {
+    if (this.drainTimer || this.closed || this.state.source !== "local") return;
+    this.drainTimer = setInterval(() => {
+      if (this.drainsQueued > 0 || this.state.source !== "local") return;
+      void this.drainUsage().catch((error) => this.deps.log("Couldn't record pool usage", error));
+    }, USAGE_DRAIN_MS);
+    this.drainTimer.unref();
+  }
+
+  private stopUsageDrain() {
+    if (this.drainTimer) clearInterval(this.drainTimer);
+    this.drainTimer = undefined;
+  }
+
+  /** Moves the local proxy's usage queue into the store; queued behind any drain in progress. */
+  private drainUsage(): Promise<void> {
+    this.drainsQueued++;
+    const run = this.drainQueue
+      .then(() => this.drainOnce())
+      .finally(() => {
+        this.drainsQueued--;
+      });
+    this.drainQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * Pops until the queue comes back short (bounded). Only ever the local proxy
+   * (`this.target`): popping a team server's queue would take its owner's records.
+   */
+  private async drainOnce() {
+    await this.usageLoaded;
+    let listed = false;
+    try {
+      for (let pop = 0; pop < USAGE_DRAIN_MAX_POPS && this.running; pop++) {
+        const records = await drainUsageQueue(this.target, USAGE_DRAIN_BATCH);
+        const samples = records.flatMap((record) => parseUsageQueueRecord(record) ?? []);
+        // An account signed in since the last listing: list once, so it isn't recorded by address.
+        if (
+          !listed &&
+          samples.some(
+            (sample) =>
+              sample.authIndex &&
+              !this.accounts.some((account) => account.authIndex === sample.authIndex),
+          )
+        ) {
+          listed = true;
+          await this.refreshAccounts().catch(() => undefined);
+        }
+        if (samples.length > 0) {
+          this.usageStore.ingest(samples.map((sample) => attributeSample(sample, this.accounts)));
+        }
+        if (records.length < USAGE_DRAIN_BATCH) break;
+      }
+    } finally {
+      await this.usageStore.flush();
+    }
+  }
+
+  private async finalDrain() {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.drainUsage().catch((error) =>
+        this.deps.log("Couldn't record the pool's last usage", error),
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, FINAL_DRAIN_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   private async refreshAccounts() {
@@ -585,6 +745,10 @@ export class PoolController {
       const provider = poolProviderOf(file.provider);
       if (!provider) return [];
       const reading = usage.get(file.name);
+      const health = accountStatusOf(file, now);
+      const staleCooldown =
+        (health.status === "cooling" || health.status === "error") &&
+        isStaleCooldown(file, reading?.usageLimits, now);
       const plan =
         (provider === "claude" ? this.claudePlans.get(file.name)?.plan : undefined) ??
         reading?.plan ??
@@ -596,8 +760,9 @@ export class PoolController {
           provider,
           ...(file.email ? { email: file.email } : {}),
           ...(plan ? { plan } : {}),
-          ...accountStatusOf(file, now),
+          ...health,
           windows: [...(reading?.usageLimits.windows ?? [])],
+          ...(staleCooldown ? { staleCooldown } : {}),
         },
       ];
     });
@@ -798,6 +963,80 @@ export class PoolController {
     this.startError = undefined;
     if (this.accounts.length > 0) await this.ensureStarted();
     return this.status();
+  }
+
+  /**
+   * Clears the proxy's cooldown on `id`, or on every enabled account, so it is
+   * tried again now. The proxy never re-checks a cooldown against fresh quota;
+   * an account that really is out goes back to cooling after one attempt.
+   */
+  async reset(id?: string) {
+    this.requireLocal();
+    if (id !== undefined) this.requireAccount(id);
+    await this.ensureStarted();
+    const chosen = () =>
+      this.accounts.filter((account) =>
+        id === undefined ? !account.disabled : account.name === id,
+      );
+    // Accounts read from disk at boot have no proxy handle yet.
+    if (chosen().some((account) => !account.authIndex)) await this.refreshAccounts();
+    const results = await Promise.allSettled(
+      chosen().map((account) =>
+        account.authIndex
+          ? resetQuota(this.target, account.authIndex)
+          : Promise.reject(new Error(`Account sharing hasn't listed ${account.name} yet.`)),
+      ),
+    );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason as unknown] : [],
+    );
+    if (failures.length > 0 && failures.length === results.length) throw failures[0];
+    if (failures.length > 0) this.deps.log("Couldn't reset every pool account", failures[0]);
+    await this.refreshAccounts();
+    // So the quota windows shown next to the accounts are as fresh as the reset.
+    await this.deps.refreshUsage().catch(() => undefined);
+    return this.status();
+  }
+
+  /**
+   * What each account served in `input.range`. History stays readable when
+   * nothing is being recorded (a team server, or the proxy stopped).
+   */
+  async usage(input: PoolUsageInput): Promise<PoolUsage> {
+    const local = this.state.source === "local";
+    const recording = local && this.running;
+    // Up to the moment, not as of the last 15 s tick.
+    if (recording) {
+      await this.drainUsage().catch((error) => this.deps.log("Couldn't record pool usage", error));
+    }
+    await this.usageLoaded;
+    const [{ rates, pricing }, overrides] = await Promise.all([
+      this.usageRates.read(),
+      this.deps.usagePriceOverrides(),
+    ]);
+    return buildPoolUsage({
+      range: input.range,
+      timeZone: input.timeZone,
+      now: Date.now(),
+      data: this.usageStore,
+      accounts: this.accounts.flatMap((file) => {
+        const provider = poolProviderOf(file.provider);
+        return provider
+          ? [{ id: file.name, provider, ...(file.email ? { email: file.email } : {}) }]
+          : [];
+      }),
+      rates,
+      overrides: createOverrideRateTable(overrides),
+      pricing,
+      recording,
+      ...(recording
+        ? {}
+        : {
+            recordingNote: local
+              ? "Account sharing isn't running, so nothing is being recorded."
+              : "A team server records its own usage.",
+          }),
+    });
   }
 
   async check() {
