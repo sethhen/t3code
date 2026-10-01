@@ -12,6 +12,7 @@ import { assert, describe, it } from "vite-plus/test";
 import {
   accountLabel,
   accountNotice,
+  accountQuotaNotice,
   accountUsageLine,
   accountUsageSummaries,
   isCooldownResetOffered,
@@ -29,6 +30,7 @@ import {
   parityProblems,
   parityProblemText,
   poolHeaderStatus,
+  poolQuotaError,
   providerNote,
   routeWaitingReason,
   statusPollDelay,
@@ -147,6 +149,86 @@ describe("accounts", () => {
       ordered.map((entry) => entry.id),
       ["c1", "c2", "x1", "x2"],
     );
+  });
+});
+
+describe("account quota notices", () => {
+  const windows = [{ id: "five_hour", kind: "session" as const, label: "5h", usedPercent: 40 }];
+
+  it("distinguishes an unread account from a known quota", () => {
+    assert.deepEqual(accountQuotaNotice(account(), false), {
+      text: "Quota not reported. Refresh quotas to try again.",
+      warning: false,
+    });
+    assert.isNull(accountQuotaNotice(account({ windows }), false));
+  });
+
+  it("explains that a paused account needs resuming before it can be read", () => {
+    assert.deepEqual(
+      accountQuotaNotice(account({ status: "disabled", quotaError: "old failure" }), false),
+      { text: "Paused. Resume this account, then refresh quotas.", warning: false },
+    );
+    assert.isNull(accountQuotaNotice(account({ status: "disabled", windows }), false));
+  });
+
+  it("keeps per-account failures beside last-known windows instead of claiming they are fresh", () => {
+    assert.deepEqual(
+      accountQuotaNotice(account({ windows, quotaError: " Sign in again. " }), false),
+      {
+        text: "Showing last reported quota. Sign in again.",
+        warning: true,
+      },
+    );
+    assert.deepEqual(accountQuotaNotice(account({ quotaError: "Sign in again." }), false), {
+      text: "Sign in again.",
+      warning: true,
+    });
+  });
+
+  it("does not repeat a source-level failure in every account", () => {
+    assert.isNull(accountQuotaNotice(account({ quotaError: "Connection refused" }), true));
+    assert.deepEqual(
+      accountQuotaNotice(account({ windows, quotaError: "Connection refused" }), true),
+      {
+        text: "Showing last reported quota.",
+        warning: false,
+      },
+    );
+  });
+});
+
+describe("manual quota refresh errors", () => {
+  const failure = { message: "Connection lost", failedAt: Date.parse("2030-01-01T12:00:00Z") };
+
+  it("keeps the manual failure while polls report the same or older quota check", () => {
+    for (const quotaCheckedAt of [
+      undefined,
+      "invalid",
+      "2030-01-01T11:59:59Z",
+      "2030-01-01T12:00:00Z",
+    ]) {
+      const accounts = [account(quotaCheckedAt === undefined ? {} : { quotaCheckedAt })];
+      assert.equal(poolQuotaError({ accounts }, failure), "Connection lost");
+    }
+    assert.equal(poolQuotaError(null, failure), "Connection lost");
+  });
+
+  it("dismisses the obsolete manual failure when an automatic check is newer", () => {
+    const accounts = [account({ quotaCheckedAt: "2030-01-01T12:00:01Z" })];
+    assert.isNull(poolQuotaError({ accounts }, failure));
+    assert.equal(
+      poolQuotaError({ accounts, quotaError: "Hub unavailable" }, failure),
+      "Hub unavailable",
+    );
+    const perAccountError = account({
+      quotaCheckedAt: "2030-01-01T12:00:01Z",
+      quotaError: "Sign in again",
+    });
+    assert.isNull(poolQuotaError({ accounts: [perAccountError] }, failure));
+    assert.deepEqual(accountQuotaNotice(perAccountError, false), {
+      text: "Sign in again",
+      warning: true,
+    });
   });
 });
 

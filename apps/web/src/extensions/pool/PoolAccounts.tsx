@@ -48,6 +48,7 @@ export function PoolAccounts({
   readOnly,
   usage,
   now,
+  quotaError,
   onAdd,
   onClearCooldown,
   onShowUsage,
@@ -59,6 +60,7 @@ export function PoolAccounts({
   /** Per-account summaries (`accountUsageSummaries`); an account without one shows no usage line. */
   readonly usage: ReadonlyMap<string, AccountUsageSummary>;
   readonly now: number;
+  readonly quotaError: string | null;
   readonly onAdd: (provider: PoolProvider) => void;
   readonly onClearCooldown: (account: PoolAccount) => void;
   /** Opens the usage view on that account; allowed while read-only. */
@@ -101,6 +103,7 @@ export function PoolAccounts({
           actions={actions}
           usage={usage}
           now={now}
+          quotaErrorShown={quotaError !== null}
           onAdd={() => onAdd(provider)}
           onSetEnabled={setEnabled}
           onRemove={(account) => setConfirm({ account, open: true })}
@@ -167,6 +170,7 @@ function ProviderAccounts({
   actions,
   usage,
   now,
+  quotaErrorShown,
   onAdd,
   onSetEnabled,
   onRemove,
@@ -180,6 +184,7 @@ function ProviderAccounts({
   readonly actions: PoolActions;
   readonly usage: ReadonlyMap<string, AccountUsageSummary>;
   readonly now: number;
+  readonly quotaErrorShown: boolean;
   readonly onAdd: () => void;
   readonly onSetEnabled: (account: PoolAccount, enabled: boolean) => void;
   readonly onRemove: (account: PoolAccount) => void;
@@ -224,6 +229,7 @@ function ProviderAccounts({
               intent={actions.intent(`account:${account.id}`)}
               usage={usage.get(account.id)}
               now={now}
+              quotaErrorShown={quotaErrorShown}
               onSetEnabled={(enabled) => onSetEnabled(account, enabled)}
               onRemove={() => onRemove(account)}
               onClearCooldown={() => onClearCooldown(account)}
@@ -247,6 +253,7 @@ function AccountLine({
   intent,
   usage,
   now,
+  quotaErrorShown,
   onSetEnabled,
   onRemove,
   onClearCooldown,
@@ -259,6 +266,7 @@ function AccountLine({
   readonly intent: unknown;
   readonly usage: AccountUsageSummary | undefined;
   readonly now: number;
+  readonly quotaErrorShown: boolean;
   readonly onSetEnabled: (enabled: boolean) => void;
   readonly onRemove: () => void;
   readonly onClearCooldown: () => void;
@@ -353,7 +361,7 @@ function AccountLine({
         </Menu>
       </div>
       <div className={cn("pe-6", paused && "opacity-60")}>
-        <PoolQuota account={account} now={now} />
+        <PoolQuota account={account} now={now} sourceError={quotaErrorShown} />
       </div>
     </div>
   );

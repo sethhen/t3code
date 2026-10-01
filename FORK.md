@@ -65,7 +65,8 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   the agents, while the pool supplies their accounts. **Usage** (next to the accounts) shows new
   requests served through this pool and their API-equivalent cost; earlier activity is not
   backfilled. Quota bars beside each account and in **Usage** show its current subscription
-  allowance and reset time, independently of the selected usage period. If an account's usage
+  allowance and reset time, independently of the selected usage period. **Refresh quotas**
+  reads fresh limits without sending a chat or consuming model tokens. If an account's usage
   was reset but the app still won't use it, **Reset cooldowns**
   (or Clear cooldown on the account) tries it again now. The first sign-in may show a firewall
   prompt for `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer

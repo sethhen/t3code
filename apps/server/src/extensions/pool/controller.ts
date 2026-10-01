@@ -31,7 +31,7 @@ import type {
   PoolUsageInput,
   ProviderInstanceConfig,
   ProviderInstanceConfigMap,
-  UsageLimitSourceAccount,
+  UsageLimitSourceSnapshot,
   UsageLimitSourceConfig,
   UsageModelPriceOverride,
 } from "@t3tools/contracts";
@@ -102,7 +102,9 @@ export interface PoolDeps {
   readonly reconcile: () => Promise<void>;
   readonly usageSource: () => Promise<UsageLimitSourceConfig | undefined>;
   readonly setUsageSource: (entry: UsageLimitSourceConfig | null) => Promise<void>;
-  readonly usageAccounts: () => Promise<ReadonlyArray<UsageLimitSourceAccount>>;
+  readonly usageSnapshot: () => Promise<
+    Pick<UsageLimitSourceSnapshot, "accounts" | "checkedAt" | "error"> | undefined
+  >;
   readonly refreshUsage: () => Promise<void>;
   /** How a pooled session of `instanceId` launches, for the tool-search probe. */
   readonly claudeProbe: (
@@ -249,6 +251,8 @@ export class PoolController {
   /** Serialises drains: the queue is pop-based, one reader at a time. */
   private drainQueue: Promise<void> = Promise.resolve();
   private drainsQueued = 0;
+  private refreshingQuota: Promise<void> | undefined;
+  private quotaRefreshRequest: Promise<PoolStatus> | undefined;
 
   private readonly deps: PoolDeps;
 
@@ -490,7 +494,9 @@ export class PoolController {
     await this.refreshAccounts().catch(() => undefined);
     void this.refreshCodexCatalog();
     void this.refreshClaudePlans();
-    await this.syncUsageSource().catch((error) => this.deps.log("Pool usage source", error));
+    await this.syncUsageSource()
+      .then(() => this.refreshQuotaSnapshot())
+      .catch((error) => this.deps.log("Pool usage source", error));
     void this.runChecks();
   }
 
@@ -691,7 +697,6 @@ export class PoolController {
     // Keep the entry while the proxy restarts; drop it only when the pool no longer applies.
     if (wanted === null && this.state.source === "local" && this.accounts.length > 0) return;
     await this.deps.setUsageSource(wanted);
-    if (wanted) await this.deps.refreshUsage();
   }
 
   private async probeExternal() {
@@ -736,9 +741,14 @@ export class PoolController {
       void this.refreshCodexCatalog();
       void this.refreshClaudePlans();
     }
-    const usage = new Map(
-      (await this.deps.usageAccounts().catch(() => [])).map((account) => [account.id, account]),
-    );
+    let quotaError: string | undefined;
+    const snapshot = await this.deps.usageSnapshot().catch((error) => {
+      this.deps.log("Couldn't read account quotas", error);
+      quotaError = "Couldn't read account quotas. Try refreshing.";
+      return undefined;
+    });
+    quotaError ??= snapshot?.error;
+    const usage = new Map((snapshot?.accounts ?? []).map((account) => [account.id, account]));
     const now = Date.now();
     const shownPlans = new Map<string, string>();
     const accounts = this.accounts.flatMap((file): PoolAccount[] => {
@@ -746,6 +756,11 @@ export class PoolController {
       if (!provider) return [];
       const reading = usage.get(file.name);
       const health = accountStatusOf(file, now);
+      const quotaCheckedAt = reading?.usageLimits.checkedAt ?? snapshot?.checkedAt;
+      const unavailable = reading?.usageLimits.unavailable;
+      const accountQuotaError = unavailable
+        ? (unavailable.message ?? "This account's quota could not be read.")
+        : undefined;
       const staleCooldown =
         (health.status === "cooling" || health.status === "error") &&
         isStaleCooldown(file, reading?.usageLimits, now);
@@ -762,6 +777,8 @@ export class PoolController {
           ...(plan ? { plan } : {}),
           ...health,
           windows: [...(reading?.usageLimits.windows ?? [])],
+          ...(quotaCheckedAt ? { quotaCheckedAt } : {}),
+          ...(accountQuotaError ? { quotaError: accountQuotaError } : {}),
           ...(staleCooldown ? { staleCooldown } : {}),
         },
       ];
@@ -801,6 +818,7 @@ export class PoolController {
       },
       accounts: this.state.source === "local" ? accounts : [],
       ...(this.accountsError ? { accountsError: this.accountsError } : {}),
+      ...(this.state.source === "local" && quotaError ? { quotaError } : {}),
       routes,
       checks,
       ...(modelIssues.length > 0 ? { modelIssues } : {}),
@@ -928,7 +946,7 @@ export class PoolController {
     if (result.state === "done") {
       await this.refreshAccounts();
       await this.syncUsageSource().catch(() => undefined);
-      await this.deps.refreshUsage().catch(() => undefined);
+      await this.refreshQuotaSnapshot().catch(() => undefined);
     }
     return result;
   }
@@ -955,6 +973,30 @@ export class PoolController {
     await this.refreshAccounts();
     await this.syncUsageSource().catch(() => undefined);
     return this.status();
+  }
+
+  /** Shares in-flight quota reads between startup, account changes, and manual refreshes. */
+  private refreshQuotaSnapshot(): Promise<void> {
+    if (this.refreshingQuota) return this.refreshingQuota;
+    this.refreshingQuota = this.deps.refreshUsage().finally(() => {
+      this.refreshingQuota = undefined;
+    });
+    return this.refreshingQuota;
+  }
+
+  /** Reads the provider's subscription quota without running a turn or changing cooldowns. */
+  async refreshQuota(): Promise<PoolStatus> {
+    this.requireLocal();
+    if (!this.running) throw new Error("Account sharing isn't running. Try again once it starts.");
+    if (this.quotaRefreshRequest) return this.quotaRefreshRequest;
+    this.quotaRefreshRequest = (async () => {
+      await this.syncUsageSource();
+      await this.refreshQuotaSnapshot();
+      return this.status();
+    })().finally(() => {
+      this.quotaRefreshRequest = undefined;
+    });
+    return this.quotaRefreshRequest;
   }
 
   async restart() {
@@ -994,7 +1036,7 @@ export class PoolController {
     if (failures.length > 0) this.deps.log("Couldn't reset every pool account", failures[0]);
     await this.refreshAccounts();
     // So the quota windows shown next to the accounts are as fresh as the reset.
-    await this.deps.refreshUsage().catch(() => undefined);
+    await this.refreshQuotaSnapshot().catch(() => undefined);
     return this.status();
   }
 
