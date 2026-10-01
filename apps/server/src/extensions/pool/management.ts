@@ -193,19 +193,6 @@ export const setAuthFileDisabled = (target: ManagementTarget, name: string, disa
 export const deleteAuthFile = (target: ManagementTarget, name: string) =>
   request(target, `auth-files?name=${encodeURIComponent(name)}`, { method: "DELETE" });
 
-/**
- * Pops up to `count` records off the proxy's usage queue (one per upstream
- * attempt, failed ones too). Popped means gone: only the pool that owns the
- * proxy may call this, never a client of someone else's.
- */
-export const drainUsageQueue = async (
-  target: ManagementTarget,
-  count: number,
-): Promise<unknown[]> => {
-  const json = await request(target, `usage-queue?count=${count}`);
-  return Array.isArray(json) ? json : [];
-};
-
 /** Clears an account's cooldown and per-model states in the proxy's memory, so it is tried now. */
 export const resetQuota = (target: ManagementTarget, authIndex: string) =>
   request(target, "reset-quota", { method: "POST", body: { auth_index: authIndex } });

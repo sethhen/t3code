@@ -17,15 +17,13 @@ type StatusOutcome = ExtensionCallOutcome<PoolStatus>;
 
 export interface PoolStatusState {
   readonly status: PoolStatus | null;
-  /** Local time when the current status arrived, for quota countdowns without another timer. */
-  readonly receivedAt: number;
   /** The last read failed; `status`, when present, is from before it. */
   readonly error: string | null;
   /** This environment has no pool, or this session may not read it: the section steps aside. */
   readonly unsupported: boolean;
 }
 
-const INITIAL: PoolStatusState = { status: null, receivedAt: 0, error: null, unsupported: false };
+const INITIAL: PoolStatusState = { status: null, error: null, unsupported: false };
 
 export function usePoolStatus(client: PoolClient, readOnly: boolean) {
   const [state, setState] = useState<PoolStatusState>(INITIAL);
@@ -35,7 +33,7 @@ export function usePoolStatus(client: PoolClient, readOnly: boolean) {
   const accept = useCallback((id: number, status: PoolStatus) => {
     if (id < applied.current) return;
     applied.current = id;
-    setState({ status, receivedAt: Date.now(), error: null, unsupported: false });
+    setState({ status, error: null, unsupported: false });
   }, []);
 
   const refresh = useCallback(async () => {

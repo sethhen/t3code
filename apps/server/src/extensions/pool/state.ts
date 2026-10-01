@@ -41,8 +41,6 @@ export interface PoolPaths {
   readonly legacyClientKeyPath: string;
   /** OpenAI's Codex model catalog, as fetched through a pool account. */
   readonly codexCatalogPath: string;
-  /** What each account served, drained from the proxy's usage queue (`usageStore.ts`). */
-  readonly usageDir: string;
 }
 
 export const poolPaths = (stateDir: string): PoolPaths => {
@@ -58,7 +56,6 @@ export const poolPaths = (stateDir: string): PoolPaths => {
     keysDir: NodePath.join(root, "keys"),
     legacyClientKeyPath: NodePath.join(root, "client-key"),
     codexCatalogPath: NodePath.join(root, "codex-models.json"),
-    usageDir: NodePath.join(root, "usage"),
   };
 };
 
