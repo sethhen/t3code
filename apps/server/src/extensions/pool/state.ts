@@ -1,143 +1,161 @@
-// @effect-diagnostics nodeBuiltinImport:off - the pool manages a downloaded binary, its files and its child process with plain Node.
+// @effect-diagnostics nodeBuiltinImport:off - the move list is a small JSON file in T3's state directory, read and written with plain Node.
 /**
- * The pool's persisted state: `<stateDir>/pool/pool.json` (mode 0600), next to
- * the proxy's config, auth files and binaries. It lives in T3's state
- * directory, never in the app bundle, so app updates keep sign-ins.
+ * What the retired pool leaves behind: `<stateDir>/pool-move.json` (mode
+ * 0600), the accounts it held that are not signed in directly yet. Provider,
+ * email and plan only, never a token. The list only shrinks, and the file goes
+ * once it is empty.
  */
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
-import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
 
-import type { PoolRouteMode, PoolSource } from "@t3tools/contracts";
+import type { MoveProvider } from "@t3tools/contracts";
 
-export interface PoolState {
-  readonly version: 1;
-  readonly source: PoolSource;
-  readonly port: number;
-  /** Client key T3's Claude and Codex sessions present to the local proxy. */
-  readonly clientKey: string;
-  /** Plaintext management secret (the proxy stores only its hash). */
-  readonly managementKey: string;
-  readonly external: { readonly url: string; readonly key: string };
-  /** Per-instance route overrides; absent instances use `defaultRouteMode`. */
-  readonly routes: Readonly<Record<string, PoolRouteMode>>;
+export interface MoveEntry {
+  readonly provider: MoveProvider;
+  readonly email: string;
+  /** Plan label, e.g. "ChatGPT Pro 20x Subscription". */
+  readonly plan?: string;
 }
 
-export interface PoolPaths {
-  readonly root: string;
-  readonly statePath: string;
-  readonly configPath: string;
-  readonly authDir: string;
-  readonly binDir: string;
-  readonly logPath: string;
-  readonly pidPath: string;
-  /**
-   * Keys T3's Claude sessions read through `apiKeyHelper` (never argv): one 0600 file per
-   * pool address, so a session aimed at pool A can only ever read A's key (see `keyFilePath`).
-   */
-  readonly keysDir: string;
-  /** Pre-keysDir single key file, removed on the next routing change. */
-  readonly legacyClientKeyPath: string;
-  /** OpenAI's Codex model catalog, as fetched through a pool account. */
-  readonly codexCatalogPath: string;
-}
-
-export const poolPaths = (stateDir: string): PoolPaths => {
+/** The retired pool's directory (proxy binary, auth files, keys, logs). Boot deletes it. */
+export const poolPaths = (stateDir: string) => {
   const root = NodePath.join(stateDir, "pool");
   return {
     root,
-    statePath: NodePath.join(root, "pool.json"),
     configPath: NodePath.join(root, "config.yaml"),
     authDir: NodePath.join(root, "auth"),
     binDir: NodePath.join(root, "bin"),
-    logPath: NodePath.join(root, "proxy.log"),
     pidPath: NodePath.join(root, "proxy.pid"),
-    keysDir: NodePath.join(root, "keys"),
-    legacyClientKeyPath: NodePath.join(root, "client-key"),
-    codexCatalogPath: NodePath.join(root, "codex-models.json"),
   };
 };
+export type PoolPaths = ReturnType<typeof poolPaths>;
 
-/** The key file for the pool at `baseUrl`: switching pools never rewrites another pool's key. */
-export const keyFilePath = (paths: Pick<PoolPaths, "keysDir">, baseUrl: string) =>
-  NodePath.join(
-    paths.keysDir,
-    NodeCrypto.createHash("sha256").update(baseUrl).digest("hex").slice(0, 16),
-  );
+export const moveListPath = (stateDir: string) => NodePath.join(stateDir, "pool-move.json");
 
-/** Default instances (`claudeAgent`, `codex`) use the pool; extra instances stay direct. */
-export const defaultRouteMode = (instanceId: string): PoolRouteMode =>
-  instanceId === "claudeAgent" || instanceId === "codex" ? "pool" : "direct";
-
-const randomKey = () => NodeCrypto.randomBytes(24).toString("hex");
-
-/** First port in the range that nothing listens on. Stays fixed once chosen. */
-export const findFreePort = async (from = 18_417, to = 18_499): Promise<number> => {
-  for (let port = from; port <= to; port++) {
-    if (await isPortFree(port)) return port;
-  }
-  throw new Error(`No free port for account sharing between ${from} and ${to}.`);
-};
-
-export const isPortFree = (port: number) =>
-  new Promise<boolean>((resolve) => {
-    const server = NodeNet.createServer();
-    server.once("error", () => resolve(false));
-    server.listen({ host: "127.0.0.1", port, exclusive: true }, () =>
-      server.close(() => resolve(true)),
-    );
-  });
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-/** Tolerant decode: unknown or damaged fields fall back to defaults, secrets are regenerated. */
-export const decodePoolState = (raw: unknown, fallbackPort: number): PoolState => {
-  const value = isRecord(raw) ? raw : {};
-  const external = isRecord(value.external) ? value.external : {};
-  const routes: Record<string, PoolRouteMode> = {};
-  if (isRecord(value.routes)) {
-    for (const [id, mode] of Object.entries(value.routes)) {
-      if (mode === "pool" || mode === "direct") routes[id] = mode;
-    }
+export const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+
+export const isMissing = (error: unknown) => isRecord(error) && error.code === "ENOENT";
+
+export const sameAccount = (a: MoveEntry, b: MoveEntry) =>
+  a.provider === b.provider && a.email.toLowerCase() === b.email.toLowerCase();
+
+/** 8 hex chars, stable per provider + email (any case). */
+export const accountHash = (provider: MoveProvider, email: string) =>
+  NodeCrypto.createHash("sha256")
+    .update(`${provider}:${email.toLowerCase()}`)
+    .digest("hex")
+    .slice(0, 8);
+
+/** `claude_1a2b3c4d`: the account's id in the contract and the id of the instance it becomes. */
+export const moveAccountId = (entry: MoveEntry) =>
+  `${entry.provider}_${accountHash(entry.provider, entry.email)}`;
+
+/** The `<slug>` in `~/.claude-<slug>`: the lowercased email, other characters as "-", at most 40. */
+export const emailSlug = (email: string) =>
+  email
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+
+/** Adds `found` to `current`, keeping the first entry per provider + email. */
+export const mergeMoveEntries = (
+  current: ReadonlyArray<MoveEntry>,
+  found: ReadonlyArray<MoveEntry>,
+): MoveEntry[] => {
+  const merged: MoveEntry[] = [];
+  for (const entry of [...current, ...found]) {
+    if (!merged.some((kept) => sameAccount(kept, entry))) merged.push(entry);
   }
-  const text = (field: unknown) => (typeof field === "string" ? field : "");
-  return {
-    version: 1,
-    source: value.source === "external" ? "external" : "local",
-    port:
-      typeof value.port === "number" && Number.isInteger(value.port) && value.port > 0
-        ? value.port
-        : fallbackPort,
-    clientKey: text(value.clientKey) || randomKey(),
-    managementKey: text(value.managementKey) || randomKey(),
-    external: { url: text(external.url), key: text(external.key) },
-    routes,
-  };
+  return merged;
 };
 
-export const loadPoolState = async (paths: PoolPaths): Promise<PoolState> => {
+/** The list on disk; a missing file is an empty list, a damaged one an error. */
+export const readMoveList = async (path: string): Promise<MoveEntry[]> => {
   let raw: unknown;
   try {
-    raw = JSON.parse(await NodeFSP.readFile(paths.statePath, "utf8"));
-  } catch {
-    raw = undefined;
+    raw = JSON.parse(await NodeFSP.readFile(path, "utf8"));
+  } catch (error) {
+    if (isMissing(error)) return [];
+    throw error;
   }
-  const state = decodePoolState(
-    raw,
-    isRecord(raw) && typeof raw.port === "number" ? raw.port : await findFreePort(),
-  );
-  if (raw === undefined || JSON.stringify(raw) !== JSON.stringify(state)) {
-    await savePoolState(paths, state);
-  }
-  return state;
+  const accounts = isRecord(raw) && Array.isArray(raw.accounts) ? raw.accounts : [];
+  return accounts.flatMap((account): MoveEntry[] => {
+    if (!isRecord(account)) return [];
+    const provider =
+      account.provider === "claude" || account.provider === "codex" ? account.provider : undefined;
+    const email = text(account.email);
+    const plan = text(account.plan);
+    return provider && email ? [{ provider, email, ...(plan ? { plan } : {}) }] : [];
+  });
 };
 
-export const savePoolState = async (paths: PoolPaths, state: PoolState) => {
-  await NodeFSP.mkdir(paths.root, { recursive: true, mode: 0o700 });
+/** Writes the list atomically (temp file + rename, 0600); an empty list deletes the file. */
+const writeMoveList = async (path: string, entries: ReadonlyArray<MoveEntry>) => {
+  if (entries.length === 0) {
+    await NodeFSP.rm(path, { force: true });
+    return;
+  }
   // Unique per write: concurrent saves must never share (and delete) one temp file.
-  const temp = `${paths.statePath}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-  await NodeFSP.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  await NodeFSP.rename(temp, paths.statePath);
+  const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
+  await NodeFSP.writeFile(temp, `${JSON.stringify({ version: 1, accounts: entries }, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  await NodeFSP.rename(temp, path);
+};
+
+let writes: Promise<unknown> = Promise.resolve();
+
+/**
+ * Runs `task` after every earlier one, so two changes to the move list (boot,
+ * a sign-in, a skip from another ws connection) never read the same list and
+ * drop each other's write.
+ */
+const serialized = <A>(task: () => Promise<A>): Promise<A> => {
+  const next = writes.then(task);
+  writes = next.catch(() => undefined);
+  return next;
+};
+
+export const updateMoveList = (
+  path: string,
+  change: (entries: MoveEntry[]) => ReadonlyArray<MoveEntry>,
+) =>
+  serialized(async () => {
+    const next = change(await readMoveList(path));
+    await writeMoveList(path, next);
+    return next;
+  });
+
+/**
+ * A JWT's payload claims. Unverified: only the email and plan are read, from
+ * a token the provider's own CLI (or the retired pool) saved on this machine.
+ */
+export const jwtClaims = (token: unknown): Record<string, unknown> => {
+  if (typeof token !== "string") return {};
+  try {
+    const payload: unknown = JSON.parse(
+      Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"),
+    );
+    return isRecord(payload) ? payload : {};
+  } catch {
+    return {};
+  }
+};
+
+/** The account email in an OpenAI id_token. */
+export const jwtEmail = (claims: Record<string, unknown>) => {
+  const profile = claims["https://api.openai.com/profile"];
+  return text(claims.email) || (isRecord(profile) ? text(profile.email) : "");
+};
+
+/** The ChatGPT plan slug in an OpenAI id_token (`pro`, `plus`, ...). */
+export const jwtPlanType = (claims: Record<string, unknown>) => {
+  const auth = claims["https://api.openai.com/auth"];
+  return isRecord(auth) ? text(auth.chatgpt_plan_type) : "";
 };

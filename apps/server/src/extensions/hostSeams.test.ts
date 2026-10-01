@@ -2,9 +2,9 @@
 /**
  * The fork's host seams, checked after every upstream merge (scripts/fork/update.sh
  * runs the extension tests). An upstream refactor that moves or drops a seam
- * fails here by name instead of silently disabling a fork feature, e.g. the
- * pool no longer routing Claude, which would look like it works and cost
- * every thread its tool search.
+ * fails here by name instead of silently disabling a fork feature, e.g. a
+ * Claude instance's `--settings` launch argument being dropped again, which
+ * would look like it works.
  */
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -23,17 +23,17 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
   [
     "apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts",
     "applyForkInstanceOverlays(",
-    "runtime overlays (pool routing) on provider instances",
+    "runtime overlays on provider instances",
   ],
   [
     "apps/server/src/provider/Layers/ClaudeAdapter.ts",
     "...launchArgSettings(claudeSettings.launchArgs)",
-    "flag --settings for Claude sessions (pool env + advisor)",
+    "flag --settings for Claude sessions (launch args)",
   ],
   [
     "apps/server/src/provider/Layers/ClaudeAdapter.ts",
     "describeClaudeRetryWait(message)",
-    "work-log row while a pooled turn waits out a rate limit",
+    "work-log row while a Claude turn waits out a rate limit",
   ],
   [
     "apps/server/src/textGeneration/ClaudeTextGeneration.ts",
@@ -43,7 +43,7 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
   [
     "apps/server/src/server.ts",
     "Layer.provideMerge(ForkServicesLive)",
-    "server-lifetime fork services (the pool proxy)",
+    "server-lifetime fork services (the pool's retirement)",
   ],
   [
     "apps/web/src/components/settings/ProviderSettingsPanel.tsx",
@@ -53,12 +53,12 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
   [
     "apps/server/src/provider/Layers/CodexProvider.ts",
     "codexHasNoSubscriptionUsage(accountResponse)",
-    "no usage read for a pooled Codex (custom model_provider)",
+    "no usage read for a Codex without ChatGPT (API key, custom model_provider)",
   ],
   [
     "apps/server/src/provider/Layers/CodexProvider.ts",
     "codexHasNoSubscriptionUsage(snapshot.account)",
-    "unsupported (not failed) usage for a pooled Codex",
+    "unsupported (not failed) usage for a Codex without ChatGPT",
   ],
   [
     "apps/web/src/components/AgentsPanel.tsx",

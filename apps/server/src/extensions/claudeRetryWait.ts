@@ -1,12 +1,12 @@
 /**
  * The work-log row for a long rate-limit wait inside a Claude turn.
  *
- * Pooled sessions run with `CLAUDE_CODE_RETRY_WATCHDOG` (see pool/overlay.ts),
- * so when every account is cooling down Claude Code sleeps until the proxy's
- * `Retry-After` instead of failing the turn. It reports the wait only as an
- * `api_retry` heartbeat every 30s, all with the same `attempt`, which the
- * adapter keeps quiet. Without a row the thread just shows as running, possibly
- * for hours. The host edit in ClaudeAdapter.ts posts this row once per `key`.
+ * A session whose environment sets `CLAUDE_CODE_RETRY_WATCHDOG` (the user's
+ * choice; T3 doesn't set it) sleeps until the API's `Retry-After` instead of
+ * failing the turn. Claude Code reports the wait only as an `api_retry`
+ * heartbeat every 30s, all with the same `attempt`, which the adapter keeps
+ * quiet. Without a row the thread just shows as running, possibly for hours.
+ * The host edit in ClaudeAdapter.ts posts this row once per `key`.
  */
 import type { SDKAPIRetryMessage } from "@anthropic-ai/claude-agent-sdk";
 

@@ -1,186 +1,94 @@
 /**
- * Pool extension - Claude and Codex through a CLIProxyAPI account pool, set up
- * the way native Claude Code and Codex behave.
- *
- * The pool is either `local` (this server downloads, configures and runs a
- * pinned CLIProxyAPI with its own sign-ins) or `external` (a CLIProxyAPI the
- * user reaches by URL and client key, e.g. a team server). Either way the
- * routing is applied here, at spawn time, as a runtime overlay on the
- * provider instances: nothing is written to `~/.claude/settings.json` or
- * `~/.codex/config.toml`, and every setting that keeps a proxied session at
- * native parity (tool search, 1h prompt cache, advisor, sticky routing) comes
- * with the fork, so an update fixes every install.
+ * Pool extension, retired. The fork used to route Claude and Codex through a
+ * local CLIProxyAPI that held several subscription sign-ins. That is gone:
+ * the server stops and deletes the proxy at startup and keeps only the list
+ * of accounts it held (provider + email). Settings → Providers then signs
+ * each one in directly, with Claude Code's and Codex's own `login` commands,
+ * as a normal provider instance. The list shrinks as accounts are signed in
+ * or skipped, and the section disappears once it is empty.
  */
 import * as Schema from "effect/Schema";
 
-import { ServerProviderUsageWindow } from "../providerUsageLimits.ts";
 import { defineExtension } from "./host.ts";
 
 export const POOL_EXTENSION_ID = "pool";
 
-/** Where the pool runs: this server (`local`) or a CLIProxyAPI reached by URL (`external`). */
-export const PoolSource = Schema.Literals(["local", "external"]);
-export type PoolSource = typeof PoolSource.Type;
-
-/** The agents a pool serves; matches the proxy's own provider names. */
-export const PoolProvider = Schema.Literals(["claude", "codex"]);
-export type PoolProvider = typeof PoolProvider.Type;
-
-export const PoolRouteMode = Schema.Literals(["pool", "direct"]);
-export type PoolRouteMode = typeof PoolRouteMode.Type;
-
-/** One Claude or Codex provider instance and whether its sessions go through the pool. */
-export const PoolRoute = Schema.Struct({
-  instanceId: Schema.String,
-  provider: PoolProvider,
-  displayName: Schema.String,
-  mode: PoolRouteMode,
-  /** True when `mode` is `pool` and the pool can serve this provider now. */
-  active: Schema.Boolean,
-  /** Why a `pool` route is not active, e.g. no Claude account signed in yet. */
-  reason: Schema.optional(Schema.String),
-});
-export type PoolRoute = typeof PoolRoute.Type;
-
-export const PoolRuntimeState = Schema.Literals([
-  /** Local pool with no accounts yet: nothing downloaded, nothing running. */
-  "idle",
-  "downloading",
-  "starting",
-  "running",
-  "error",
-]);
-export type PoolRuntimeState = typeof PoolRuntimeState.Type;
-
-export const PoolRuntime = Schema.Struct({
-  state: PoolRuntimeState,
-  /** The pinned CLIProxyAPI version this build runs. */
-  version: Schema.String,
-  /** `127.0.0.1:<port>` once the local proxy listens. */
-  endpoint: Schema.optional(Schema.String),
-  message: Schema.optional(Schema.String),
-  /** The local proxy's log file, when it failed (for "Show log"). */
-  logPath: Schema.optional(Schema.String),
-});
-export type PoolRuntime = typeof PoolRuntime.Type;
-
-export const PoolExternal = Schema.Struct({
-  url: Schema.String,
-  hasKey: Schema.Boolean,
-  /** Last reachability probe: undefined before the first one. */
-  reachable: Schema.optional(Schema.Boolean),
-  message: Schema.optional(Schema.String),
-});
-export type PoolExternal = typeof PoolExternal.Type;
-
-export const PoolAccountStatus = Schema.Literals(["ready", "cooling", "error", "disabled"]);
-export type PoolAccountStatus = typeof PoolAccountStatus.Type;
-
-export const PoolAccount = Schema.Struct({
-  /** The proxy's auth file name; stable for the account's lifetime. */
-  id: Schema.String,
-  provider: PoolProvider,
-  email: Schema.optional(Schema.String),
-  plan: Schema.optional(Schema.String),
-  status: PoolAccountStatus,
-  message: Schema.optional(Schema.String),
-  /** Quota windows (5-hour, weekly, ...) from the last usage read; empty until one lands. */
-  windows: Schema.Array(ServerProviderUsageWindow),
-  /**
-   * The proxy is holding this account back (cooling or error), but a quota read
-   * taken after it was benched shows every window below 100%, e.g. after a usage
-   * reset. The proxy never re-checks a cooldown on its own; `reset` clears it.
-   */
-  staleCooldown: Schema.optional(Schema.Boolean),
-});
-export type PoolAccount = typeof PoolAccount.Type;
-
-export const PoolCheckState = Schema.Literals(["ok", "warn", "fail", "unknown"]);
-export type PoolCheckState = typeof PoolCheckState.Type;
-
-/** One native-parity check: a proxied session should behave exactly like a direct one. */
-export const PoolCheck = Schema.Struct({
-  id: Schema.String,
-  label: Schema.String,
-  state: PoolCheckState,
-  detail: Schema.optional(Schema.String),
-});
-export type PoolCheck = typeof PoolCheck.Type;
+export const MoveProvider = Schema.Literals(["claude", "codex"]);
+export type MoveProvider = typeof MoveProvider.Type;
 
 /**
- * A model of the other family configured on a pooled instance (e.g. a GPT slug
- * in Claude's custom models). T3 never offers one through the pool; these are
- * hand-configured, so the section flags them rather than blocking.
+ * Where a sign-in lands. `default` is the provider's default instance
+ * (`~/.claude` / `~/.codex`), which existing threads and the bare CLI use;
+ * it is the target while that home has no subscription sign-in. Every other
+ * account becomes its own instance.
  */
-export const PoolModelIssue = Schema.Struct({
-  instanceId: Schema.String,
-  displayName: Schema.String,
-  provider: PoolProvider,
-  slug: Schema.String,
-  /** `customModels`: T3's own setting (removable from the section). Otherwise where to edit it. */
-  where: Schema.Literals(["customModels", "instanceEnv", "claudeSettings"]),
-  /** The env variable, for `instanceEnv` / `claudeSettings`. */
-  setting: Schema.optional(Schema.String),
-  message: Schema.String,
-});
-export type PoolModelIssue = typeof PoolModelIssue.Type;
+export const MoveTarget = Schema.Literals(["default", "instance"]);
+export type MoveTarget = typeof MoveTarget.Type;
 
-export const PoolStatus = Schema.Struct({
-  source: PoolSource,
-  runtime: PoolRuntime,
-  external: PoolExternal,
-  accounts: Schema.Array(PoolAccount),
-  accountsError: Schema.optional(Schema.String),
-  routes: Schema.Array(PoolRoute),
-  checks: Schema.Array(PoolCheck),
-  checkedAt: Schema.optional(Schema.String),
-  modelIssues: Schema.optional(Schema.Array(PoolModelIssue)),
+/** One account the pool held that is not signed in directly yet. */
+export const MoveAccount = Schema.Struct({
+  /** Stable per provider + email. */
+  id: Schema.String,
+  provider: MoveProvider,
+  email: Schema.String,
+  /** Plan label when the pool knew it, e.g. "ChatGPT Pro". */
+  plan: Schema.optional(Schema.String),
+  target: MoveTarget,
 });
-export type PoolStatus = typeof PoolStatus.Type;
+export type MoveAccount = typeof MoveAccount.Type;
 
-export const PoolSetSourceInput = Schema.Struct({
-  source: PoolSource,
-  /** Required when switching to `external` the first time. */
-  externalUrl: Schema.optional(Schema.String),
-  /** Omit to keep the saved key. */
-  externalKey: Schema.optional(Schema.String),
+export const MoveStatus = Schema.Struct({
+  accounts: Schema.Array(MoveAccount),
+  /** The sign-in running on this server, if any (one at a time). */
+  signIn: Schema.optional(
+    Schema.Struct({
+      signInId: Schema.String,
+      accountId: Schema.String,
+    }),
+  ),
 });
-export type PoolSetSourceInput = typeof PoolSetSourceInput.Type;
+export type MoveStatus = typeof MoveStatus.Type;
 
-export const PoolLoginStart = Schema.Struct({
-  loginId: Schema.String,
-  /** Open in the user's browser; the local proxy receives the callback. */
-  url: Schema.String,
+export const MoveSignInStart = Schema.Struct({
+  signInId: Schema.String,
+  /**
+   * The provider's sign-in page, for when its CLI could not open the browser.
+   * Only Claude's works from another device (its page shows a code to paste
+   * back); Codex's sign-in finishes only in a browser on the server's machine
+   * (its callback is that machine's localhost). Absent if the CLI printed none
+   * yet.
+   */
+  url: Schema.optional(Schema.String),
+  /** The CLI accepts a pasted code (Claude's manual flow). */
+  acceptsCode: Schema.Boolean,
 });
-export type PoolLoginStart = typeof PoolLoginStart.Type;
+export type MoveSignInStart = typeof MoveSignInStart.Type;
 
-export const PoolLoginState = Schema.Struct({
-  state: Schema.Literals(["pending", "done", "error"]),
+export const MoveSignInState = Schema.Struct({
+  state: Schema.Literals(["waiting", "done", "error"]),
+  /** Set once the CLI printed its sign-in page. */
+  url: Schema.optional(Schema.String),
+  acceptsCode: Schema.Boolean,
+  /** The account that actually signed in (`done`, or an `error` for the wrong account). */
+  email: Schema.optional(Schema.String),
   message: Schema.optional(Schema.String),
 });
-export type PoolLoginState = typeof PoolLoginState.Type;
+export type MoveSignInState = typeof MoveSignInState.Type;
 
 export const PoolExtension = defineExtension(POOL_EXTENSION_ID, {
-  status: { input: Schema.Struct({}), output: PoolStatus },
-  setSource: { input: PoolSetSourceInput, output: PoolStatus },
-  setRoute: {
-    input: Schema.Struct({ instanceId: Schema.String, mode: PoolRouteMode }),
-    output: PoolStatus,
-  },
-  "login.start": { input: Schema.Struct({ provider: PoolProvider }), output: PoolLoginStart },
-  "login.status": { input: Schema.Struct({ loginId: Schema.String }), output: PoolLoginState },
-  "account.setEnabled": {
-    input: Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
-    output: PoolStatus,
-  },
-  "account.remove": { input: Schema.Struct({ id: Schema.String }), output: PoolStatus },
-  /** Re-runs the native-parity checks (spawns a probe session; no API call). */
-  check: { input: Schema.Struct({}), output: PoolStatus },
-  restart: { input: Schema.Struct({}), output: PoolStatus },
+  status: { input: Schema.Struct({}), output: MoveStatus },
   /**
-   * Clears the proxy's cooldown for one account (`id`) or every enabled one, so it
-   * is tried again now. The proxy never re-checks a cooldown against fresh quota;
-   * an account that really is out goes back to cooling after one attempt.
+   * Runs the provider's own sign-in for one account. Starting another
+   * cancels the one already running.
    */
-  reset: { input: Schema.Struct({ id: Schema.optional(Schema.String) }), output: PoolStatus },
+  "signIn.start": { input: Schema.Struct({ accountId: Schema.String }), output: MoveSignInStart },
+  "signIn.status": { input: Schema.Struct({ signInId: Schema.String }), output: MoveSignInState },
+  /** Claude's manual flow: the `code#state` text its sign-in page shows. */
+  "signIn.code": {
+    input: Schema.Struct({ signInId: Schema.String, code: Schema.String }),
+    output: MoveSignInState,
+  },
+  "signIn.cancel": { input: Schema.Struct({ signInId: Schema.String }), output: MoveStatus },
+  /** Drops an account from the list without signing it in. */
+  skip: { input: Schema.Struct({ accountId: Schema.String }), output: MoveStatus },
 });

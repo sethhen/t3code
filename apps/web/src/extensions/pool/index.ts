@@ -1,2 +1,2 @@
-/** The Pool section of Settings → Providers; registered in `../providerSettings.tsx`. */
-export { PoolSettings } from "./PoolSettings";
+/** The "Sign your accounts in again" section of Settings → Providers; registered in `../providerSettings.tsx`. */
+export { MoveAccounts } from "./MoveAccounts";

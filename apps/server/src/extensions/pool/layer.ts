@@ -1,152 +1,98 @@
 // @effect-diagnostics globalConsole:off - the controller's log callback runs outside any fiber.
-// @effect-diagnostics nodeBuiltinImport:off - the probe resolves the Claude config directory with Node's path and os.
 /**
- * The pool's server-lifetime half: builds the one `PoolController`, wires it
- * to T3's settings, instance registry and usage sources, and stops the proxy
- * when the server shuts down. Provided through `ForkServicesLive`
+ * The pool's server-lifetime half: builds the one `MoveController`, wires it
+ * to T3's settings, provider homes and provider refresh, and retires the pool
+ * in the background. Provided through `ForkServicesLive`
  * (extensions/services.ts), the fork's one server.ts seam.
  *
- * A pool failure never blocks the server: `init` errors are logged and the
- * section shows them.
+ * Never blocks or fails the server start: the boot runs detached and logs its
+ * failures (the next start retries).
  */
-import * as NodeOS from "node:os";
-import * as NodePath from "node:path";
-
-import { ProviderInstanceId, UsageLimitSourceId } from "@t3tools/contracts";
+import { CodexSettings, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import type * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
+import type * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
-import { launchArgSettings } from "../claudeSettings.ts";
-import { POOL_USAGE_SOURCE_ID, PoolController, type PoolDeps } from "./controller.ts";
-import { runProcess } from "./process.ts";
-import { setPoolController } from "./runtime.ts";
-import { poolPaths } from "./state.ts";
+import { canCreateSymlinks, MoveController } from "./move.ts";
+import { setMoveController } from "./runtime.ts";
 import {
-  buildClaudeCapabilitiesProbeQueryOptions,
-  deriveProviderInstanceConfigMap,
   expandHomePath,
-  HostProcessArchitecture,
+  HostProcessEnvironment,
   HostProcessPlatform,
-  mergeProviderInstanceEnvironment,
-  resolveClaudeSdkExecutablePath,
+  makeClaudeEnvironment,
+  materializeCodexShadowHome,
+  ProviderInstanceRegistry,
+  ProviderRegistry,
+  resolveCodexHomeLayout,
   resolveSpawnCommand,
   ServerConfig,
   ServerSettingsService,
-  UsageLimitSources,
 } from "./t3.ts";
 
-const configRecord = (config: unknown): Record<string, unknown> =>
-  typeof config === "object" && config !== null && !Array.isArray(config)
-    ? (config as Record<string, unknown>)
-    : {};
-
-const POOL_USAGE_SOURCE = UsageLimitSourceId.make(POOL_USAGE_SOURCE_ID);
-
-const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+const decodeCodexSettings = Schema.decodeUnknownSync(CodexSettings);
 
 export const PoolLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const settings = yield* ServerSettingsService;
-    // Optional so the pool degrades instead of failing a layer build if an upstream
-    // refactor moves it.
-    const usageSources = yield* Effect.serviceOption(UsageLimitSources);
+    const providers = yield* ProviderRegistry;
+    const instances = yield* ProviderInstanceRegistry;
     const platform = yield* HostProcessPlatform;
-    const arch = yield* HostProcessArchitecture;
+    const env = yield* HostProcessEnvironment;
+    // The controller is plain async code; its effects run with the layer's services.
+    const run = Effect.runPromiseWith(yield* Effect.context<FileSystem.FileSystem | Path.Path>());
 
-    const getSettings = () => Effect.runPromise(settings.getSettings);
-    const instanceMap = async () => deriveProviderInstanceConfigMap(await getSettings());
+    // What Settings' refresh does for one instance (ws.ts serverRefreshProviders with
+    // refreshModels): drop its caches, re-probe, then re-read its models.
+    const refresh = (instanceId: ProviderInstanceId) =>
+      Effect.gen(function* () {
+        const instance = yield* instances.getInstance(instanceId);
+        if (instance?.invalidateCaches) yield* instance.invalidateCaches;
+        const snapshots = yield* providers.refreshInstance(instanceId);
+        const snapshot = snapshots.find((provider) => provider.instanceId === instanceId);
+        if (instance?.refreshModels && snapshot?.enabled && snapshot.installed) {
+          yield* instance.refreshModels();
+          yield* providers.refreshInstance(instanceId);
+        }
+      });
 
-    const deps: PoolDeps = {
-      paths: poolPaths(config.stateDir),
+    const controller = new MoveController({
+      stateDir: config.stateDir,
       platform,
-      arch,
-      instanceMap,
-      // An empty patch still writes and emits, so the settings watcher (the registry's only
-      // reconciler, serial by design) re-derives the instance map with the pool's overlay.
-      // Never call the registry mutator directly: concurrent reconciles race.
-      reconcile: async () => {
-        await Effect.runPromise(settings.updateSettings({}));
+      env,
+      expandHome: expandHomePath,
+      getSettings: () => run(settings.getSettings),
+      updateSettings: async (patch) => {
+        await run(settings.updateSettings(patch));
       },
-      usageSource: async () => (await getSettings()).usageLimitSources[POOL_USAGE_SOURCE],
-      setUsageSource: async (entry) => {
-        await Effect.runPromise(
-          settings.updateSettings({ usageLimitSources: { [POOL_USAGE_SOURCE]: entry } }),
-        );
-      },
-      usageAccounts: async () => {
-        if (Option.isNone(usageSources)) return [];
-        const snapshots = await Effect.runPromise(usageSources.value.current);
-        return snapshots.find((snapshot) => snapshot.id === POOL_USAGE_SOURCE_ID)?.accounts ?? [];
-      },
-      refreshUsage: async () => {
-        if (Option.isSome(usageSources)) await Effect.runPromise(usageSources.value.refresh);
-      },
-      claudeProbe: async (instanceId) => {
-        const instance = (await instanceMap())[ProviderInstanceId.make(instanceId)];
-        const instanceConfig = configRecord(instance?.config);
-        const homePath = text(instanceConfig.homePath);
-        let env = mergeProviderInstanceEnvironment(instance?.environment);
-        const configDir = homePath
-          ? NodePath.resolve(expandHomePath(homePath))
-          : env.CLAUDE_CONFIG_DIR;
-        if (homePath) env = { ...env, CLAUDE_CONFIG_DIR: configDir };
-        const executablePath = await Effect.runPromise(
-          resolveClaudeSdkExecutablePath(text(instanceConfig.binaryPath) || "claude", env),
-        );
-        const baseOptions = buildClaudeCapabilitiesProbeQueryOptions({
-          executablePath,
-          abortController: new AbortController(),
-          environment: env,
-          cwd: NodeOS.homedir(),
-        });
-        return {
-          executablePath,
-          env: baseOptions.env ?? env,
-          flagSettings: launchArgSettings(text(instanceConfig.launchArgs)),
-          baseOptions,
-          ...(configDir ? { configDir } : {}),
-        };
-      },
-      claudeConfigDir: async (instanceId) => {
-        const instance = (await instanceMap())[ProviderInstanceId.make(instanceId)];
-        const homePath = text(configRecord(instance?.config).homePath);
-        if (homePath) return NodePath.resolve(expandHomePath(homePath));
-        return mergeProviderInstanceEnvironment(instance?.environment).CLAUDE_CONFIG_DIR;
-      },
-      codexVersion: async () => {
-        const instance = (await instanceMap())[ProviderInstanceId.make("codex")];
-        const env = mergeProviderInstanceEnvironment(instance?.environment);
-        const spawn = await Effect.runPromise(
-          resolveSpawnCommand(
-            text(configRecord(instance?.config).binaryPath) || "codex",
-            ["--version"],
-            {
-              env,
-            },
-          ),
-        );
-        const { stdout } = await runProcess(spawn.command, spawn.args, {
-          env,
-          shell: spawn.shell,
-          timeoutMs: 15_000,
-        }).catch(() => ({ stdout: "" }));
-        return /(\d+\.\d+\.\d+(?:-[\w.]+)?)/.exec(stdout)?.[1];
-      },
+      claudeEnvironment: (homePath, base) => run(makeClaudeEnvironment({ homePath }, base)),
+      // The same layout the codex driver builds for an instance with this config.
+      materializeCodexHome: (homePath, shadowHomePath) =>
+        run(
+          Effect.gen(function* () {
+            const layout = yield* resolveCodexHomeLayout(
+              decodeCodexSettings({ setupMode: "existing", homePath, shadowHomePath }),
+            );
+            yield* materializeCodexShadowHome(layout);
+            return layout.effectiveHomePath ?? layout.sharedHomePath;
+          }),
+        ),
+      resolveSpawn: (command, args, spawnEnv) =>
+        run(resolveSpawnCommand(command, args, { env: spawnEnv })),
+      refreshInstance: (instanceId) => run(refresh(ProviderInstanceId.make(instanceId))),
+      canSymlink: canCreateSymlinks,
       log: (message, cause) => console.warn(`[pool] ${message}`, cause ?? ""),
-    };
+    });
 
-    const controller = new PoolController(deps);
-    yield* Effect.tryPromise(() => controller.init()).pipe(
-      Effect.catchCause((cause) => Effect.logError("Pool failed to initialise", cause)),
-    );
-    setPoolController(controller);
+    setMoveController(controller);
+    void controller.boot();
     yield* Effect.addFinalizer(() =>
-      Effect.tryPromise(() => controller.shutdown()).pipe(
-        Effect.catchCause((cause) => Effect.logError("Pool failed to stop", cause)),
-        Effect.andThen(Effect.sync(() => setPoolController(undefined))),
-      ),
+      Effect.sync(() => {
+        controller.close();
+        setMoveController(undefined);
+      }),
     );
   }),
 );

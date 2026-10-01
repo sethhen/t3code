@@ -1,16 +1,16 @@
-/** Pool extension handlers: thin adapters from `extension.call` to the shared controller. */
+/** Pool extension handlers: thin adapters from `extension.call` to the shared move controller. */
 import { PoolExtension } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
-import type { PoolController } from "./controller.ts";
-import { getPoolController } from "./runtime.ts";
+import type { MoveController } from "./move.ts";
+import { getMoveController } from "./runtime.ts";
 import { ExtensionFailure, serverExtension } from "./t3.ts";
 
-const withController = <A>(run: (controller: PoolController) => Promise<A>) =>
+const withController = <A>(run: (controller: MoveController) => A | Promise<A>) =>
   Effect.tryPromise({
     try: async () => {
-      const controller = getPoolController();
-      if (!controller) throw new Error("Account sharing isn't available on this server.");
+      const controller = getMoveController();
+      if (!controller) throw new Error("Moving accounts isn't available on this server.");
       return run(controller);
     },
     catch: (cause) =>
@@ -23,16 +23,12 @@ const withController = <A>(run: (controller: PoolController) => Promise<A>) =>
 // Built lazily: registry.ts imports this module while it is still being evaluated.
 export const makePoolServerExtension = Effect.sync(() =>
   serverExtension(PoolExtension, {
-    status: () => withController((pool) => pool.status()),
-    setSource: (input) => withController((pool) => pool.setSource(input)),
-    setRoute: ({ instanceId, mode }) => withController((pool) => pool.setRoute(instanceId, mode)),
-    "login.start": ({ provider }) => withController((pool) => pool.startLogin(provider)),
-    "login.status": ({ loginId }) => withController((pool) => pool.loginStatus(loginId)),
-    "account.setEnabled": ({ id, enabled }) =>
-      withController((pool) => pool.setAccountEnabled(id, enabled)),
-    "account.remove": ({ id }) => withController((pool) => pool.removeAccount(id)),
-    check: () => withController((pool) => pool.check()),
-    restart: () => withController((pool) => pool.restart()),
-    reset: ({ id }) => withController((pool) => pool.reset(id)),
+    status: () => withController((move) => move.status()),
+    "signIn.start": ({ accountId }) => withController((move) => move.startSignIn(accountId)),
+    "signIn.status": ({ signInId }) => withController((move) => move.signInState(signInId)),
+    "signIn.code": ({ signInId, code }) =>
+      withController((move) => move.submitCode(signInId, code)),
+    "signIn.cancel": ({ signInId }) => withController((move) => move.cancelSignIn(signInId)),
+    skip: ({ accountId }) => withController((move) => move.skip(accountId)),
   }),
 );

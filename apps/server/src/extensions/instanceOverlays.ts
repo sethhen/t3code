@@ -10,9 +10,11 @@
  * client, so an overlay may carry secrets. Overlays are never persisted: remove
  * the overlay (or the fork) and the user's own configuration is untouched.
  *
- * An overlay must be pure and cheap: it runs on every settings emission. When
- * the state an overlay reads changes outside settings, the owner re-runs the
- * registry reconcile itself (see pool/layer.ts).
+ * Nothing registers an overlay at the moment (the retired pool was the only
+ * one); the seam stays so the next one needs no upstream edit. An overlay must
+ * be pure and cheap: it runs on every settings emission. When the state an
+ * overlay reads changes outside settings, its owner must re-run the registry
+ * reconcile itself.
  */
 import type { ProviderInstanceConfigMap } from "@t3tools/contracts";
 

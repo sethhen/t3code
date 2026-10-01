@@ -9,8 +9,8 @@
  * first, so T3's own keys still win.
  *
  * Flag settings outrank the user's `settings.json`, including its `env` block,
- * which in turn outranks the process environment. That is why the pool routes
- * Claude through here and not through environment variables alone.
+ * which in turn outranks the process environment, so an instance's
+ * `--settings` launch argument wins over both.
  */
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 

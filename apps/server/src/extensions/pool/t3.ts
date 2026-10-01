@@ -5,13 +5,16 @@
 export { ServerConfig } from "../../config.ts";
 export { ServerSettingsService } from "../../serverSettings.ts";
 export { expandHomePath } from "../../pathExpansion.ts";
-export { UsageLimitSources } from "../../usage/UsageLimitSources.ts";
 export { deriveProviderInstanceConfigMap } from "../../provider/Layers/ProviderInstanceRegistryHydration.ts";
 export { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
 export { makeClaudeEnvironment } from "../../provider/Drivers/ClaudeHome.ts";
-export { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
-export { buildClaudeCapabilitiesProbeQueryOptions } from "../../provider/Layers/ClaudeProvider.ts";
+export {
+  materializeCodexShadowHome,
+  resolveCodexHomeLayout,
+} from "../../provider/Drivers/CodexHomeLayout.ts";
 export { codexPlanLabel } from "../../provider/Layers/CodexProvider.ts";
+export { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+export { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
 export { resolveSpawnCommand } from "@t3tools/shared/shell";
-export { HostProcessArchitecture, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+export { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 export { ExtensionFailure, serverExtension } from "../registry.ts";

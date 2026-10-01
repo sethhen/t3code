@@ -26,11 +26,11 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`                                                               |
 | `apps/web/src/components/AgentsPanel.tsx`                              | shows live elapsed time for workflows and pending members via `agentElapsedClock`        |
 | `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
-| `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait (pool), + its test     |
+| `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait, + its test            |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
-| `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool proxy)         |
-| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top, may fold the rest) |
-| `apps/server/src/provider/Layers/CodexProvider.ts`                     | skips the usage read for a Codex without a ChatGPT sign-in (pooled Codex), + its test    |
+| `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool's retirement)  |
+| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top)                    |
+| `apps/server/src/provider/Layers/CodexProvider.ts`                     | skips the usage read for a Codex without a ChatGPT sign-in, + its test                   |
 
 Fork-owned paths (new extensions only touch these):
 
@@ -57,18 +57,13 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   ("t3code Safe Storage"), choose **Always Allow**.
 - **First launch on Windows:** if SmartScreen blocks the installer, click **More info → Run
   anyway** (once). PCs with Smart App Control turned on block unsigned apps outright.
-- **Claude and Codex accounts:** Settings → Providers → **Add account** next to Claude or Codex
-  (Codex signs in with ChatGPT), then sign in in the browser. Add as many as you like: usage is
-  shared between them automatically, nothing else to configure. The usual provider settings
-  (models, other providers) are under **More provider settings**. Keep Claude enabled to use
-  pooled Claude accounts and Codex enabled to use pooled ChatGPT accounts: these providers run
-  the agents, while the pool supplies their accounts. Open **Usage** from the sidebar for
-  token and cost history, or **Usage → Limits** for subscription quotas and their refresh action.
-  If an account's usage was reset but the app still won't use it, **Reset cooldowns**
-  (or Clear cooldown on the account) tries it again now. The first sign-in may show a firewall
-  prompt for `cli-proxy-api` (Windows, or a Mac with the firewall on): either answer
-  works, sign-in uses localhost. Don't also sign the same account into another proxy (CC Switch, EasyCLIProxyAPI):
-  two proxies refreshing one account sign each other out.
+- **Claude and Codex accounts:** these are T3's own provider settings (Settings → Providers):
+  one provider instance per account, picked per thread. Accounts from the old account pool are
+  listed once at the top of that page: click **Sign in** next to each (first sign your browser in
+  to that account) or **Skip**. If `~/.claude` or `~/.codex` isn't signed in yet, the first
+  account you sign in there becomes your main one, which existing threads and the `claude` /
+  `codex` commands use; every other account becomes a separate one. Open **Usage** from the sidebar for token and cost history,
+  or **Usage → Limits** for subscription quotas.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
@@ -116,59 +111,35 @@ merge and push with `fork_git` (see Traps).
   swaps it in and prints the rollback commands. Return to the release builds by installing the
   latest release DMG.
 
-## Pool
+## Pool (retired)
 
-`apps/server/src/extensions/pool/` (+ `apps/web/src/extensions/pool/`). T3 downloads a pinned
-CLIProxyAPI (`binary.ts`: version + per-platform SHA-256) into `<stateDir>/pool/`, runs it on
-`127.0.0.1:18417-18499` (never 8317; a taken port moves to the next free one), and stops it with
-the server (a pid file kills a proxy left by a hard kill on the next start). Accounts sign in
-through the proxy's management API. Routing is a runtime overlay on the default Claude and Codex
-instances (`overlay.ts`), never written to the user's Claude or Codex config.
+The fork used to run a local CLIProxyAPI that held several Claude and ChatGPT subscription
+sign-ins and routed the default Claude and Codex instances through it. Anthropic's terms forbid
+tools that collect, store or intermediate claude.ai credentials, and OpenAI's forbid rotating or
+pooling accounts to get around usage limits, so it is gone.
 
-Why each routing setting exists (measured 2026-09-26 against direct Claude Code): behind any
-custom `ANTHROPIC_BASE_URL` Claude Code drops tool search (every MCP schema in every thread),
-fine-grained tool streaming, the global system-prompt cache, the 1h cache and the advisor. The
-pool restores them with `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, `ENABLE_TOOL_SEARCH`,
-`CLAUDE_CODE_PROMPT_CACHE_TTL=1h` and `advisorModel`. They go in flag `--settings` too, because a
-`settings.json` `env` block outranks the process environment. The proxy pins each session to one
-account (prompt cache) and gives each subagent its own. Codex gets OpenAI's live model catalog
-through a pool account.
+What is left (`apps/server/src/extensions/pool/`, `apps/web/src/extensions/pool/`) moves each
+install off it. At server start it kills a leftover proxy (pid file), saves the accounts the pool
+held (provider, email, Codex plan) to `<stateDir>/pool-move.json`, deletes `<stateDir>/pool/`
+(tokens, management key, binary) and the `cliproxy-t3-pool` usage source. Settings → Providers then
+runs each provider's own `claude auth login --email` / `codex login` per account and writes a
+normal provider instance named after the email. A sign-in only counts when the account that signed
+in is the one on that row (any listed one for a default home); a wrong one is logged out again,
+never in a default home. Claude sign-ins are refused while `settings.json` or the environment
+make Claude Code use an API key helper or token instead of a subscription. Extra Claude accounts
+get `~/.claude-<email-slug>` with `settings.json`, `CLAUDE.md`, `skills`, `agents`, `commands`,
+`plugins` and `output-styles` linked from the main config dir and its MCP servers copied once;
+extra Codex accounts get a shadow home `~/.codex-<email-slug>` on the shared Codex home, or a
+separate home where symlinks aren't allowed (Windows without Developer Mode).
 
-The pool key never goes on a command line (argv shows up in `ps`, traces and resource telemetry):
-flag settings blank `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`, and `apiKeyHelper` prints the
-0600 key file for that pool's address, `<stateDir>/pool/keys/<sha256(url) prefix>`, so a session still aimed at one pool can never read another pool's key (other pools' files are removed once routing has switched). The helper command holds no path: it reads the file named by
-`T3_POOL_KEY_FILE` (`cat "$T3_POOL_KEY_FILE"`, PowerShell `-LiteralPath` on Windows), so neither
-`/bin/sh` nor `cmd.exe` can expand anything in it. Codex reads the key from an env var.
-The proxy benches an account after a 429 until the reset time it parsed then, and never re-checks
-that against fresh quota (CLIProxyAPI issues #5639, #5404, #5770), so an account whose usage was
-reset early stays unused and turns fail. `reset` clears cooldowns through `reset-quota` (no restart,
-nothing in flight dropped); status marks `staleCooldown` when a quota read taken after the 429 shows
-room again.
+Limits: Claude threads stay on the account they started on (one config dir each); Codex threads
+can switch between accounts that share a home. Codex's sign-in only finishes in a browser on the
+machine running T3 (its callback is that machine's localhost); Claude's also takes a pasted code.
 
-Models stay in their own harness: T3 never offers a cross-family model through the pool (pooled
-instances drop cross-family custom models, gateway model discovery is off, Codex uses OpenAI's
-catalog), and Settings → Providers flags any hand-configured one (a custom model, or a Claude model
-alias in the instance env or `~/.claude/settings.json`) as a failing "Model families" check.
-
-**After an upstream merge, a Claude Code update or a CLIProxyAPI bump:**
-
-1. `hostSeams.test.ts` passes (update.sh runs it).
-2. `cd apps/server && POOL_INTEGRATION=1 pnpm exec vp test run src/extensions/pool/controller.integration.test.ts`:
-   real proxy download, sign-in link, routing, and a real Claude probe that must report tool search on.
-3. In the app: Settings → Providers → ⋯ → **Run checks** is all green. A failing **Tool
-   search** means Claude Code changed how it treats proxies: search its binary for
-   `is not a first-party Anthropic host` to find the new switch.
-4. After a Claude Code update, its binary still reads `CLAUDE_CODE_RETRY_WATCHDOG` (undocumented;
-   `overlay.ts` sets it so a thread waits out an exhausted pool instead of failing, subagents too).
-   Search the binary for the name; if it's gone, find the new persistent-retry switch.
-5. Bumping CLIProxyAPI: new version + digests in `binary.ts` (command in its header), then 2, and
-   check that `reset-quota` still takes `auth_index`.
-
-Known limits: during sign-in the proxy's OAuth callback listeners (54545 Claude, 1455 Codex) bind
-all interfaces (CLIProxyAPI has no option to restrict them); on Windows a hard-killed server leaves
-the proxy running until T3 starts again;
-signing in on a remote environment needs a browser on that machine (the OAuth callback is its
-localhost); a team server (external pool) shows no accounts and Codex keeps its built-in catalog.
+Delete the extension, its contract and this section once every install has moved. Of the seams
+it used, only `instanceOverlays.ts` has nothing registered now; `claudeSettings.ts` still keeps a
+`--settings` launch argument the SDK would drop, and the CodexProvider skip still covers API-key
+Codex. Removing a seam is a `feat(fork): extension host` commit plus `update.sh`'s host list.
 
 ## Traps
 
