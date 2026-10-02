@@ -25,10 +25,13 @@ export const makePoolServerExtension = Effect.sync(() =>
   serverExtension(PoolExtension, {
     status: () => withController((move) => move.status()),
     "signIn.start": ({ accountId }) => withController((move) => move.startSignIn(accountId)),
+    "account.add": ({ provider }) => withController((move) => move.addAccount(provider)),
+    "account.signIn": ({ instanceId }) => withController((move) => move.signInAgain(instanceId)),
     "signIn.status": ({ signInId }) => withController((move) => move.signInState(signInId)),
     "signIn.code": ({ signInId, code }) =>
       withController((move) => move.submitCode(signInId, code)),
     "signIn.cancel": ({ signInId }) => withController((move) => move.cancelSignIn(signInId)),
+    "account.remove": ({ instanceId }) => withController((move) => move.removeAccount(instanceId)),
     skip: ({ accountId }) => withController((move) => move.skip(accountId)),
   }),
 );

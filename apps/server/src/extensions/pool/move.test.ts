@@ -1,6 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - drives fake CLIs in temp homes and state directories.
 /**
- * The move against temp state directories, a temp home and a fake `claude` /
+ * The move and account sign-ins against temp state directories, a temp home and a fake `claude` /
  * `codex` (a small node script that prints the real CLIs' sign-in lines and
  * keeps its "login" in a file), so nothing reaches the real home, Keychain or
  * network.
@@ -19,6 +19,7 @@ import {
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { assert, describe, it } from "@effect/vitest";
 
+import { CLAUDE_ACCOUNT_MARKER } from "../claudeHistory.ts";
 import { MoveController, type MoveDeps, POOL_USAGE_SOURCE_ID } from "./move.ts";
 import { type MoveEntry, moveAccountId } from "./state.ts";
 import { HostProcessPlatform } from "./t3.ts";
@@ -324,9 +325,10 @@ describe.skipIf(PLATFORM === "win32")("boot", () => {
     // Neither default home is signed in, so each provider's accounts start there.
     const status = await first.move.status();
     assert.deepEqual(
-      status.accounts.map((account) => [account.email, account.target, account.id]),
-      list.accounts.map((entry: MoveEntry) => [entry.email, "default", moveAccountId(entry)]),
+      status.accounts.map((account) => [account.email, account.id]),
+      list.accounts.map((entry: MoveEntry) => [entry.email, moveAccountId(entry)]),
     );
+    assert.deepEqual(status.addTarget, { claude: "default", codex: "default" });
 
     const second = makeMove(f, first.settings());
     await second.move.boot();
@@ -402,10 +404,12 @@ describe.skipIf(PLATFORM === "win32")("boot", () => {
       tokens: { id_token: jwt({ email: "bob@example.com" }) },
     });
     const dee: MoveEntry = { provider: "claude", email: "dee@example.com" };
+    const fay: MoveEntry = { provider: "claude", email: "fay@example.com" };
     const eve: MoveEntry = { provider: "codex", email: "eve@example.com" };
     writeList(f, [
       { provider: "claude", email: "ann@example.com" },
       dee,
+      fay,
       { provider: "codex", email: "bob@example.com" },
       eve,
     ]);
@@ -417,16 +421,43 @@ describe.skipIf(PLATFORM === "win32")("boot", () => {
             driver: ProviderDriverKind.make("claudeAgent"),
             config: { homePath: "~/.claude-dee-example-com" },
           },
+          // Made by hand: known by its name.
+          [ProviderInstanceId.make("claude_work")]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "Fay@example.com",
+            config: { homePath: "~/.claude-work" },
+          },
         },
       }),
     );
     await move.boot();
     assert.deepEqual(readList(f).accounts, [eve]);
     // Codex's default home is taken, so Eve gets an instance of her own.
-    assert.deepEqual(
-      (await move.status()).accounts.map((account) => account.target),
-      ["instance"],
+    assert.equal((await move.status()).addTarget.codex, "instance");
+  });
+
+  it("stops offering a listed account T3 got another way", async () => {
+    const f = fixture();
+    const { move } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: {
+          [ProviderInstanceId.make("claude_work")]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "Ann@example.com",
+            config: { homePath: "~/.claude-work" },
+          },
+        },
+      }),
     );
+    await move.boot();
+    // Listed after the start's cleanup ran.
+    writeList(f, [ANN, EVE]);
+    assert.deepEqual(
+      (await move.status()).accounts.map((account) => account.email),
+      [EVE.email],
+    );
+    assert.lengthOf(readList(f).accounts, 2);
   });
 });
 
@@ -445,13 +476,19 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     writeList(f, [{ provider: "claude", email: "Ann@Example.com" }]);
     const { move, patches, refreshed } = makeMove(f, settingsFor(f));
 
-    const [account] = (await move.status()).accounts;
-    assert.equal(account?.target, "instance");
+    const { accounts, addTarget } = await move.status();
+    assert.equal(addTarget.claude, "instance");
+    const [account] = accounts;
     const started = await move.startSignIn(account!.id);
     assert.deepEqual(
       { ...started, signInId: "" },
       { signInId: "", url: CLAUDE_URL, acceptsCode: true },
     );
+    assert.deepEqual((await move.status()).signIn, {
+      signInId: started.signInId,
+      provider: "claude",
+      accountId: account!.id,
+    });
     // Checked like the CLI checks it, and never handed over half.
     assert.throws(
       () => move.submitCode(started.signInId, "code-without-state"),
@@ -460,18 +497,19 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     assert.throws(() => move.submitCode(started.signInId, "code#"), "the part after #");
     assert.throws(() => move.submitCode("unknown", "code#state"), "no longer running");
     move.submitCode(started.signInId, "  code#state  ");
+    const id = ProviderInstanceId.make(
+      moveAccountId({ provider: "claude", email: "ann@example.com" }),
+    );
     assert.deepEqual(await move.settled(started.signInId), {
       state: "done",
       acceptsCode: true,
       url: CLAUDE_URL,
       email: "Ann@Example.com",
+      instanceId: id,
     });
     // A late paste (another tab) gets the outcome, not an error.
     assert.equal(move.submitCode(started.signInId, "code#state").state, "done");
 
-    const id = ProviderInstanceId.make(
-      moveAccountId({ provider: "claude", email: "ann@example.com" }),
-    );
     assert.deepEqual(patches, [
       {
         providerInstances: {
@@ -496,6 +534,11 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     assert.deepEqual(JSON.parse(NodeFS.readFileSync(NodePath.join(dir, ".claude.json"), "utf8")), {
       mcpServers: { github: { command: "github-mcp" } },
     });
+    const marker = NodePath.join(dir, CLAUDE_ACCOUNT_MARKER);
+    assert.equal(NodeFS.statSync(marker).mode & 0o777, 0o600);
+    // It names the main config dir the account shares.
+    assert.equal(NodeFS.readFileSync(marker, "utf8"), main);
+    assert.isFalse(NodeFS.existsSync(NodePath.join(main, CLAUDE_ACCOUNT_MARKER)));
     const [login] = callsOf(f, "auth login");
     assert.equal(login?.CLAUDE_CONFIG_DIR, dir);
     assert.isNull(login?.ANTHROPIC_API_KEY ?? null);
@@ -536,10 +579,10 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     const { move, patches, refreshed } = makeMove(f, settingsFor(f), {
       env: { FAKE_EMAIL: "other@example.com" },
     });
-    const [account] = (await move.status()).accounts;
-    assert.equal(account?.target, "default");
+    const { accounts, addTarget } = await move.status();
+    assert.equal(addTarget.claude, "default");
 
-    const started = await move.startSignIn(account!.id);
+    const started = await move.startSignIn(accounts[0]!.id);
     move.submitCode(started.signInId, "code#state");
     const state = await move.settled(started.signInId);
     assert.equal(state.message, "Signed in as other@example.com, which isn't in this list.");
@@ -548,10 +591,7 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     assert.deepEqual(patches, []);
     assert.deepEqual(refreshed, ["claudeAgent"]);
     // The default home is signed in now, so Ann would get an instance of her own.
-    assert.deepEqual(
-      (await move.status()).accounts.map((entry) => entry.target),
-      ["instance"],
-    );
+    assert.equal((await move.status()).addTarget.claude, "instance");
   });
 
   it("refuses a separate Claude login without CLAUDE_CONFIG_DIR", async () => {
@@ -660,6 +700,7 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
       state: "done",
       acceptsCode: true,
       email: "ann@example.com",
+      instanceId: moveAccountId(ANN),
     });
     assert.lengthOf(callsOf(f, "auth login"), 0);
     assert.lengthOf(patches, 1);
@@ -742,11 +783,11 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     const f = fixture();
     writeList(f, [EVE]);
     const { move } = makeMove(f, settingsFor(f), { env: { FAKE_EMAIL: "eve@example.com" } });
-    const [account] = (await move.status()).accounts;
-    assert.equal(account?.target, "default");
+    const { accounts, addTarget } = await move.status();
+    assert.equal(addTarget.codex, "default");
     // A home that doesn't exist is signed out: no CLI asked.
     assert.lengthOf(callsOf(f, "login status"), 0);
-    const started = await move.startSignIn(account!.id);
+    const started = await move.startSignIn(accounts[0]!.id);
     assert.equal((await move.settled(started.signInId)).state, "done");
     const auth = NodePath.join(f.home, ".codex", "auth.json");
     assert.include(NodeFS.readFileSync(auth, "utf8"), "id_token");
@@ -757,9 +798,9 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
     NodeFS.mkdirSync(NodePath.join(f.home, ".codex"));
     writeList(f, [EVE]);
     const signedOut = makeMove(f, settingsFor(f));
-    assert.equal((await signedOut.move.status()).accounts[0]?.target, "default");
+    assert.equal((await signedOut.move.status()).addTarget.codex, "default");
     const keyring = makeMove(f, settingsFor(f), { env: { FAKE_CODEX_KEYRING: "1" } });
-    assert.equal((await keyring.move.status()).accounts[0]?.target, "instance");
+    assert.equal((await keyring.move.status()).addTarget.codex, "instance");
     assert.deepEqual(
       callsOf(f, "login status").map((call) => call.CODEX_HOME),
       [NodePath.join(f.home, ".codex"), NodePath.join(f.home, ".codex")],
@@ -778,7 +819,7 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
       },
       { env: { FAKE_EMAIL: "eve@example.com" } },
     );
-    assert.equal((await move.status()).accounts[0]?.target, "instance");
+    assert.equal((await move.status()).addTarget.codex, "instance");
     const started = await move.startSignIn(moveAccountId(EVE));
     assert.equal((await move.settled(started.signInId)).state, "done");
     assert.equal(
@@ -805,7 +846,7 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
       },
     });
     // Signed in there, so Eve gets an instance of her own on it.
-    assert.equal((await move.status()).accounts[0]?.target, "instance");
+    assert.equal((await move.status()).addTarget.codex, "instance");
     const started = await move.startSignIn(moveAccountId(EVE));
     assert.equal((await move.settled(started.signInId)).state, "done");
     assert.deepEqual(materialized, [[shared, "~/.codex-eve-example-com"]]);
@@ -897,5 +938,698 @@ describe.skipIf(PLATFORM === "win32")("sign-in", () => {
       "sk-fake-openai",
     );
     assert.deepEqual(NodeFS.readdirSync(codexHome), ["auth.json"]);
+  });
+});
+
+/** The new account dirs (`~/.claude-account-<hex>`, `~/.codex-account-<hex>`) in the temp home. */
+const accountDirs = (f: Fixture) =>
+  NodeFS.readdirSync(f.home).filter((name) => /^\.(claude|codex)-account-/.test(name));
+
+describe.skipIf(PLATFORM === "win32")("accounts", () => {
+  it("adds a Claude account as an instance of its own, whichever one signs in", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const main = NodePath.join(f.home, ".claude");
+    NodeFS.writeFileSync(NodePath.join(main, "settings.json"), "{}");
+    const zed: MoveEntry = { provider: "claude", email: "zed@example.com" };
+    writeList(f, [zed, ANN]);
+    const { move, patches, refreshed } = makeMove(f, settingsFor(f), {
+      env: { FAKE_EMAIL: "Zed@Example.com" },
+    });
+    // Codex's default home doesn't exist yet, so a new Codex account would land there.
+    assert.deepEqual((await move.status()).addTarget, { claude: "instance", codex: "default" });
+
+    const started = await move.addAccount("claude");
+    assert.deepEqual(
+      { ...started, signInId: "" },
+      { signInId: "", url: CLAUDE_URL, acceptsCode: true },
+    );
+    assert.deepEqual((await move.status()).signIn, {
+      signInId: started.signInId,
+      provider: "claude",
+    });
+    move.submitCode(started.signInId, "code#state");
+    const id = moveAccountId(zed);
+    assert.deepEqual(await move.settled(started.signInId), {
+      state: "done",
+      acceptsCode: true,
+      url: CLAUDE_URL,
+      email: "Zed@Example.com",
+      instanceId: id,
+    });
+
+    const [login] = callsOf(f, "auth login");
+    assert.deepEqual(login?.args, ["auth", "login"]);
+    const dir = login!.CLAUDE_CONFIG_DIR!;
+    const homePath = `~/${NodePath.basename(dir)}`;
+    assert.match(homePath, /^~\/\.claude-account-[0-9a-f]{6}$/);
+    assert.equal(NodePath.dirname(dir), f.home);
+    assert.deepEqual(patches, [
+      {
+        providerInstances: {
+          [ProviderInstanceId.make(id)]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "Zed@Example.com",
+            enabled: true,
+            config: { homePath, binaryPath: NodePath.join(f.bin, "claude") },
+          },
+        },
+      },
+    ]);
+    assert.equal(NodeFS.readFileSync(NodePath.join(dir, CLAUDE_ACCOUNT_MARKER), "utf8"), main);
+    assert.equal(
+      NodeFS.readlinkSync(NodePath.join(dir, "settings.json")),
+      NodePath.join(main, "settings.json"),
+    );
+    // The list's entry for that account is done with.
+    assert.deepEqual(readList(f).accounts, [ANN]);
+    assert.deepEqual(refreshed, []);
+  });
+
+  it("refuses an account T3 has already, signing its new dir out and deleting it", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    // The browser is still signed in to the main account.
+    const { move, patches } = makeMove(f, settingsFor(f), {
+      env: { FAKE_EMAIL: "Main@example.com" },
+    });
+    const started = await move.addAccount("claude");
+    const dir = callsOf(f, "auth login")[0]!.CLAUDE_CONFIG_DIR!;
+    assert.isTrue(NodeFS.existsSync(dir));
+    move.submitCode(started.signInId, "code#state");
+    assert.deepEqual(await move.settled(started.signInId), {
+      state: "error",
+      acceptsCode: true,
+      url: CLAUDE_URL,
+      email: "Main@example.com",
+      message: "Main@example.com is already in T3.",
+    });
+    assert.deepEqual(
+      callsOf(f, "auth logout").map((call) => call.CLAUDE_CONFIG_DIR),
+      [dir],
+    );
+    assert.isFalse(NodeFS.existsSync(dir));
+    assert.deepEqual(accountDirs(f), []);
+    assert.deepEqual(patches, []);
+    // The main account stays signed in.
+    assert.isTrue(NodeFS.existsSync(NodePath.join(f.home, ".claude", "fake-login.json")));
+
+    // An instance made by hand counts too, by its display name.
+    const g = fixture();
+    signInDefaultClaude(g, "main@example.com");
+    const other = makeMove(
+      g,
+      settingsFor(g, {
+        providerInstances: {
+          [ProviderInstanceId.make("claude_work")]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "ann@example.com",
+            config: { homePath: "~/.claude-work" },
+          },
+        },
+      }),
+      { env: { FAKE_EMAIL: "ann@example.com" } },
+    );
+    const again = await other.move.addAccount("claude");
+    other.move.submitCode(again.signInId, "code#state");
+    assert.equal(
+      (await other.move.settled(again.signInId)).message,
+      "ann@example.com is already in T3.",
+    );
+    assert.deepEqual(accountDirs(g), []);
+    assert.deepEqual(other.patches, []);
+  });
+
+  it("deletes a cancelled account's dir, never what its links point to", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const main = NodePath.join(f.home, ".claude");
+    NodeFS.writeFileSync(NodePath.join(main, "settings.json"), '{"model":"opus"}');
+    writeJson(NodePath.join(main, "skills", "review", "SKILL.md"), "review");
+    const { move, patches } = makeMove(f, settingsFor(f));
+    const started = await move.addAccount("claude");
+    const dir = callsOf(f, "auth login")[0]!.CLAUDE_CONFIG_DIR!;
+    assert.isTrue(NodeFS.lstatSync(NodePath.join(dir, "skills")).isSymbolicLink());
+
+    assert.isUndefined((await move.cancelSignIn(started.signInId)).signIn);
+    assert.equal(move.signInState(started.signInId).message, "Sign-in cancelled.");
+    assert.isFalse(NodeFS.existsSync(dir));
+    assert.equal(
+      NodeFS.readFileSync(NodePath.join(main, "settings.json"), "utf8"),
+      '{"model":"opus"}',
+    );
+    assert.isTrue(NodeFS.existsSync(NodePath.join(main, "skills", "review", "SKILL.md")));
+    assert.deepEqual(
+      callsOf(f, "auth logout").map((call) => call.CLAUDE_CONFIG_DIR),
+      [dir],
+    );
+    assert.deepEqual(patches, []);
+  });
+
+  it("adds an account into a default home that has no sign-in yet", async () => {
+    const f = fixture();
+    const { move, patches, refreshed } = makeMove(f, settingsFor(f), {
+      env: { FAKE_EMAIL: "ann@example.com" },
+    });
+    assert.equal((await move.status()).addTarget.claude, "default");
+    const started = await move.addAccount("claude");
+    move.submitCode(started.signInId, "code#state");
+    const state = await move.settled(started.signInId);
+    assert.deepEqual(
+      [state.state, state.email, state.instanceId],
+      ["done", "ann@example.com", "claudeAgent"],
+    );
+    const [login] = callsOf(f, "auth login");
+    assert.deepEqual(login?.args, ["auth", "login"]);
+    assert.isNull(login?.CLAUDE_CONFIG_DIR ?? null);
+    assert.deepEqual(patches, []);
+    assert.deepEqual(refreshed, ["claudeAgent"]);
+    assert.deepEqual(accountDirs(f), []);
+    // Signed in there now: the next account gets an instance of its own.
+    assert.equal((await move.status()).addTarget.claude, "instance");
+  });
+
+  it("signs the default home out again when the account added there is one T3 has", async () => {
+    const f = fixture();
+    const { move, patches } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: {
+          [ProviderInstanceId.make("claude_work")]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "ann@example.com",
+            config: { homePath: "~/.claude-work" },
+          },
+        },
+      }),
+      { env: { FAKE_EMAIL: "ann@example.com" } },
+    );
+    assert.equal((await move.status()).addTarget.claude, "default");
+    const started = await move.addAccount("claude");
+    move.submitCode(started.signInId, "code#state");
+    const state = await move.settled(started.signInId);
+    assert.deepEqual(
+      [state.state, state.message],
+      ["error", "ann@example.com is already in T3, so the main account stays signed out."],
+    );
+    assert.deepEqual(
+      callsOf(f, "auth logout").map((call) => call.CLAUDE_CONFIG_DIR),
+      [null],
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(f.home, ".claude", "fake-login.json")));
+    assert.equal((await move.status()).addTarget.claude, "default");
+    assert.deepEqual(patches, []);
+  });
+
+  it("puts the default Codex home back when the account added there is one T3 has", async () => {
+    const providerInstances = {
+      [ProviderInstanceId.make("codex_work")]: {
+        driver: ProviderDriverKind.make("codex"),
+        displayName: "eve@example.com",
+        config: { setupMode: "existing", shadowHomePath: "~/.codex-work" },
+      },
+    };
+    const message = "eve@example.com is already in T3, so the main account stays signed out.";
+    // The API key login the sign-in moved aside comes back.
+    const f = fixture();
+    const codexHome = NodePath.join(f.home, ".codex");
+    writeJson(NodePath.join(codexHome, "auth.json"), { OPENAI_API_KEY: "sk-fake-openai" });
+    const { move } = makeMove(f, settingsFor(f, { providerInstances }), {
+      env: { FAKE_EMAIL: "eve@example.com" },
+    });
+    assert.equal((await move.status()).addTarget.codex, "default");
+    const started = await move.addAccount("codex");
+    assert.equal((await move.settled(started.signInId)).message, message);
+    assert.include(
+      NodeFS.readFileSync(NodePath.join(codexHome, "auth.json"), "utf8"),
+      "sk-fake-openai",
+    );
+    assert.deepEqual(NodeFS.readdirSync(codexHome), ["auth.json"]);
+    assert.lengthOf(callsOf(f, "logout"), 0);
+    assert.equal((await move.status()).addTarget.codex, "default");
+
+    // With none moved aside, Codex's own logout signs it out.
+    const g = fixture();
+    const other = makeMove(g, settingsFor(g, { providerInstances }), {
+      env: { FAKE_EMAIL: "eve@example.com" },
+    });
+    const again = await other.move.addAccount("codex");
+    assert.equal((await other.move.settled(again.signInId)).message, message);
+    assert.deepEqual(
+      callsOf(g, "logout").map((call) => call.CODEX_HOME),
+      [NodePath.join(g.home, ".codex")],
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(g.home, ".codex", "auth.json")));
+    assert.equal((await other.move.status()).addTarget.codex, "default");
+  });
+
+  it("adds a Codex account in a shadow home on the shared home", async () => {
+    const f = fixture();
+    signInCodex(NodePath.join(f.home, ".codex"), "main@example.com");
+    const materialized: Array<readonly [string, string]> = [];
+    const { move, patches } = makeMove(f, settingsFor(f), {
+      env: { FAKE_EMAIL: "eve@example.com" },
+      materializeCodexHome: async (homePath, shadowHomePath) => {
+        materialized.push([homePath, shadowHomePath]);
+        return NodePath.join(f.home, shadowHomePath.slice(2));
+      },
+    });
+    assert.equal((await move.status()).addTarget.codex, "instance");
+    const started = await move.addAccount("codex");
+    assert.deepEqual(
+      { ...started, signInId: "" },
+      { signInId: "", url: CODEX_URL, acceptsCode: false },
+    );
+    const state = await move.settled(started.signInId);
+    assert.equal(state.instanceId, moveAccountId(EVE));
+    assert.lengthOf(materialized, 1);
+    const [shared, shadowHomePath] = materialized[0]!;
+    assert.equal(shared, "");
+    assert.match(shadowHomePath, /^~\/\.codex-account-[0-9a-f]{6}$/);
+    assert.equal(
+      callsOf(f, "login")[0]?.CODEX_HOME,
+      NodePath.join(f.home, shadowHomePath.slice(2)),
+    );
+    assert.deepEqual(patches, [
+      {
+        providerInstances: {
+          [ProviderInstanceId.make(moveAccountId(EVE))]: {
+            driver: ProviderDriverKind.make("codex"),
+            displayName: "eve@example.com",
+            enabled: true,
+            config: {
+              setupMode: "existing",
+              shadowHomePath,
+              binaryPath: NodePath.join(f.bin, "codex"),
+            },
+          },
+        },
+      },
+    ]);
+  });
+
+  it("deletes a failed Codex account's shadow home, keeping the shared home", async () => {
+    const f = fixture();
+    const shared = NodePath.join(f.home, ".codex");
+    signInCodex(shared, "main@example.com");
+    writeJson(NodePath.join(shared, "sessions", "rollout.jsonl"), "history");
+    const { move, patches } = makeMove(f, settingsFor(f), {
+      env: { FAKE_CODEX_LOGIN: "fail" },
+      // Like the driver: the shadow home links the shared home's entries.
+      materializeCodexHome: async (_homePath, shadowHomePath) => {
+        const dir = NodePath.join(f.home, shadowHomePath.slice(2));
+        NodeFS.symlinkSync(NodePath.join(shared, "sessions"), NodePath.join(dir, "sessions"));
+        return dir;
+      },
+    });
+    assert.equal(await failure(move.addAccount("codex")), "Error: port 1455 is in use");
+    const home = callsOf(f, "login")[0]!.CODEX_HOME!;
+    assert.isFalse(NodeFS.existsSync(home));
+    assert.deepEqual(
+      callsOf(f, "logout").map((call) => call.CODEX_HOME),
+      [home],
+    );
+    assert.isTrue(NodeFS.existsSync(NodePath.join(shared, "sessions", "rollout.jsonl")));
+    assert.isTrue(NodeFS.existsSync(NodePath.join(shared, "auth.json")));
+    assert.deepEqual(patches, []);
+  });
+
+  it("removes an account instance, signed out with its own CLI, and only that one", async () => {
+    const f = fixture();
+    const claude = NodePath.join(f.bin, "claude");
+    const codex = NodePath.join(f.bin, "codex");
+    const ann = NodePath.join(f.home, ".claude-ann-example-com");
+    writeJson(NodePath.join(ann, "fake-login.json"), { email: "ann@example.com" });
+    const eve = NodePath.join(f.home, ".codex-eve-example-com");
+    signInCodex(eve, "eve@example.com");
+    const instances = {
+      claude_1a2b3c4d: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        displayName: "ann@example.com",
+        config: { homePath: "~/.claude-ann-example-com", binaryPath: claude },
+      },
+      claude_2b3c4d5e: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        config: { homePath: "~/.claude-bob-example-com", binaryPath: "/missing/claude" },
+      },
+      // Shares the main config dir: its logout would sign the main account out.
+      claude_shared: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        config: { binaryPath: claude },
+      },
+      codex_1a2b3c4d: {
+        driver: ProviderDriverKind.make("codex"),
+        config: {
+          setupMode: "existing",
+          shadowHomePath: "~/.codex-eve-example-com",
+          binaryPath: codex,
+        },
+      },
+      codex_managed: {
+        driver: ProviderDriverKind.make("codex"),
+        config: { setupMode: "managed", binaryPath: codex },
+      },
+      cursor_work: { driver: ProviderDriverKind.make("cursor") },
+    };
+    const logged: string[] = [];
+    const { move, settings } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: Object.fromEntries(
+          Object.entries(instances).map(([id, instance]) => [
+            ProviderInstanceId.make(id),
+            instance,
+          ]),
+        ),
+      }),
+      { log: (message) => logged.push(message) },
+    );
+    const saved = () => Object.keys(settings().providerInstances).sort();
+
+    await move.removeAccount("claude_1a2b3c4d");
+    const [claudeLogout] = callsOf(f, "auth logout");
+    assert.equal(claudeLogout?.CLAUDE_CONFIG_DIR, ann);
+    assert.isNull(claudeLogout?.ANTHROPIC_API_KEY ?? null);
+    assert.isFalse(NodeFS.existsSync(NodePath.join(ann, "fake-login.json")));
+    // The dir stays: its threads' transcripts point into it.
+    assert.isTrue(NodeFS.existsSync(ann));
+
+    await move.removeAccount("codex_1a2b3c4d");
+    assert.deepEqual(
+      callsOf(f, "logout").map((call) => call.CODEX_HOME),
+      [eve],
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(eve, "auth.json")));
+    assert.isTrue(NodeFS.existsSync(eve));
+
+    // T3 keeps a managed instance's sign-in: removing it is enough.
+    await move.removeAccount("codex_managed");
+    assert.lengthOf(
+      calls(f).filter((call) => call.args.includes("logout")),
+      2,
+    );
+
+    // A logout that can't run is logged, not fatal.
+    await move.removeAccount("claude_2b3c4d5e");
+    assert.include(logged, "Signing claude_2b3c4d5e out failed");
+
+    assert.deepEqual(saved(), ["claude_shared", "cursor_work"]);
+    for (const [id, message] of [
+      ["claudeAgent", "The main account can't be removed."],
+      ["codex", "The main account can't be removed."],
+      ["cursor_work", "Only Claude and Codex accounts can be removed here."],
+      ["claude_gone", "That account isn't in T3 anymore."],
+      [
+        "claude_shared",
+        "This account uses the main Claude config dir, so signing it out would sign the main account out.",
+      ],
+    ] as const) {
+      assert.equal(await failure(move.removeAccount(id)), message);
+    }
+    assert.deepEqual(saved(), ["claude_shared", "cursor_work"]);
+    assert.lengthOf(callsOf(f, "auth logout"), 1);
+  });
+
+  it("doesn't sign out a sign-in another instance still uses", async () => {
+    const f = fixture();
+    const claude = NodePath.join(f.bin, "claude");
+    const codex = NodePath.join(f.bin, "codex");
+    const ann = NodePath.join(f.home, ".claude-ann-example-com");
+    writeJson(NodePath.join(ann, "fake-login.json"), { email: "ann@example.com" });
+    const eve = NodePath.join(f.home, ".codex-eve-example-com");
+    signInCodex(eve, "eve@example.com");
+    const instances = {
+      claude_1a2b3c4d: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        config: { homePath: "~/.claude-ann-example-com", binaryPath: claude },
+      },
+      // The same dir, written another way.
+      claude_copy: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        config: { homePath: ann, binaryPath: claude },
+      },
+      codex_1a2b3c4d: {
+        driver: ProviderDriverKind.make("codex"),
+        config: {
+          setupMode: "existing",
+          shadowHomePath: "~/.codex-eve-example-com",
+          binaryPath: codex,
+        },
+      },
+      codex_copy: {
+        driver: ProviderDriverKind.make("codex"),
+        config: { setupMode: "existing", homePath: "~/.codex-eve-example-com", binaryPath: codex },
+      },
+    };
+    const logged: string[] = [];
+    const { move, settings } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: Object.fromEntries(
+          Object.entries(instances).map(([id, instance]) => [
+            ProviderInstanceId.make(id),
+            instance,
+          ]),
+        ),
+      }),
+      { log: (message) => logged.push(message) },
+    );
+
+    await move.removeAccount("claude_1a2b3c4d");
+    await move.removeAccount("codex_1a2b3c4d");
+
+    assert.deepEqual(
+      calls(f).filter((call) => call.args.includes("logout")),
+      [],
+    );
+    assert.isTrue(NodeFS.existsSync(NodePath.join(ann, "fake-login.json")));
+    assert.isTrue(NodeFS.existsSync(NodePath.join(eve, "auth.json")));
+    assert.deepEqual(Object.keys(settings().providerInstances).sort(), [
+      "claude_copy",
+      "codex_copy",
+    ]);
+    assert.include(
+      logged,
+      `Didn't sign claude_1a2b3c4d out: claude_copy uses the same sign-in (${ann})`,
+    );
+    // The last instance on it is signed out.
+    await move.removeAccount("claude_copy");
+    assert.deepEqual(
+      callsOf(f, "auth logout").map((call) => call.CLAUDE_CONFIG_DIR),
+      [ann],
+    );
+
+    // A default Codex on a shadow home of its own counts too.
+    const g = fixture();
+    const shadow = NodePath.join(g.home, ".codex-main");
+    signInCodex(shadow, "main@example.com");
+    const base = settingsFor(g);
+    const other = makeMove(g, {
+      ...base,
+      providers: {
+        ...base.providers,
+        codex: { ...base.providers.codex, shadowHomePath: "~/.codex-main" },
+      },
+      providerInstances: {
+        [ProviderInstanceId.make("codex_main")]: {
+          driver: ProviderDriverKind.make("codex"),
+          config: { setupMode: "existing", shadowHomePath: "~/.codex-main", binaryPath: codex },
+        },
+      },
+    });
+    await other.move.removeAccount("codex_main");
+    assert.lengthOf(callsOf(g, "logout"), 0);
+    assert.isTrue(NodeFS.existsSync(NodePath.join(shadow, "auth.json")));
+    assert.deepEqual(other.settings().providerInstances, {});
+  });
+});
+
+describe.skipIf(PLATFORM === "win32")("signing an account in again", () => {
+  const ANN_ID = "claude_1a2b3c4d";
+  const annInstance = (f: Fixture) => ({
+    [ProviderInstanceId.make(ANN_ID)]: {
+      driver: ProviderDriverKind.make("claudeAgent"),
+      displayName: "ann@example.com",
+      config: { homePath: "~/.claude-ann-example-com", binaryPath: NodePath.join(f.bin, "claude") },
+    },
+  });
+
+  it("signs a Claude account in again in its own config dir", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const dir = NodePath.join(f.home, ".claude-ann-example-com");
+    writeJson(NodePath.join(dir, ".claude.json"), { mcpServers: {} });
+    const { move, patches, refreshed } = makeMove(
+      f,
+      settingsFor(f, { providerInstances: annInstance(f) }),
+    );
+
+    const started = await move.signInAgain(ANN_ID);
+    assert.deepEqual(
+      { ...started, signInId: "" },
+      { signInId: "", url: CLAUDE_URL, acceptsCode: true },
+    );
+    assert.deepEqual((await move.status()).signIn, {
+      signInId: started.signInId,
+      provider: "claude",
+      instanceId: ANN_ID,
+    });
+    // Only `done` names the instance.
+    assert.isUndefined(move.signInState(started.signInId).instanceId);
+    move.submitCode(started.signInId, "code#state");
+    assert.deepEqual(await move.settled(started.signInId), {
+      state: "done",
+      acceptsCode: true,
+      url: CLAUDE_URL,
+      email: "ann@example.com",
+      instanceId: ANN_ID,
+    });
+
+    const [login] = callsOf(f, "auth login");
+    assert.deepEqual(login?.args, ["auth", "login", "--email", "ann@example.com"]);
+    assert.equal(login?.CLAUDE_CONFIG_DIR, dir);
+    assert.isNull(login?.ANTHROPIC_API_KEY ?? null);
+    assert.deepEqual(
+      JSON.parse(NodeFS.readFileSync(NodePath.join(dir, "fake-login.json"), "utf8")),
+      { email: "ann@example.com" },
+    );
+    assert.lengthOf(callsOf(f, "auth logout"), 0);
+    assert.deepEqual(patches, []);
+    assert.deepEqual(refreshed, [ANN_ID]);
+  });
+
+  it("signs another account out of the dir again, keeping the dir", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const dir = NodePath.join(f.home, ".claude-ann-example-com");
+    writeJson(NodePath.join(dir, ".claude.json"), { mcpServers: {} });
+    const { move, patches, refreshed } = makeMove(
+      f,
+      settingsFor(f, { providerInstances: annInstance(f) }),
+      { env: { FAKE_EMAIL: "Other@example.com" } },
+    );
+
+    const started = await move.signInAgain(ANN_ID);
+    move.submitCode(started.signInId, "code#state");
+    const state = await move.settled(started.signInId);
+    assert.deepEqual(
+      [state.state, state.email, state.message, state.instanceId],
+      [
+        "error",
+        "Other@example.com",
+        "Signed in as Other@example.com. Sign your browser in to ann@example.com and try again.",
+        undefined,
+      ],
+    );
+    assert.deepEqual(
+      callsOf(f, "auth logout").map((call) => call.CLAUDE_CONFIG_DIR),
+      [dir],
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(dir, "fake-login.json")));
+    assert.isTrue(NodeFS.existsSync(NodePath.join(dir, ".claude.json")));
+    // The main account is untouched.
+    assert.isTrue(NodeFS.existsSync(NodePath.join(f.home, ".claude", "fake-login.json")));
+    assert.deepEqual(patches, []);
+    assert.deepEqual(refreshed, []);
+  });
+
+  it("signs a Codex account in again in its shadow home", async () => {
+    const f = fixture();
+    signInCodex(NodePath.join(f.home, ".codex"), "main@example.com");
+    const home = NodePath.join(f.home, ".codex-eve-example-com");
+    NodeFS.mkdirSync(home);
+    const id = "codex_1a2b3c4d";
+    const { move, patches, refreshed } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: {
+          [ProviderInstanceId.make(id)]: {
+            driver: ProviderDriverKind.make("codex"),
+            displayName: "eve@example.com",
+            config: {
+              setupMode: "existing",
+              shadowHomePath: "~/.codex-eve-example-com",
+              binaryPath: NodePath.join(f.bin, "codex"),
+            },
+          },
+        },
+      }),
+      { env: { FAKE_EMAIL: "eve@example.com" } },
+    );
+
+    const started = await move.signInAgain(id);
+    assert.deepEqual(
+      { ...started, signInId: "" },
+      { signInId: "", url: CODEX_URL, acceptsCode: false },
+    );
+    const state = await move.settled(started.signInId);
+    assert.deepEqual([state.state, state.email, state.instanceId], ["done", "eve@example.com", id]);
+    assert.equal(callsOf(f, "login")[0]?.CODEX_HOME, home);
+    assert.isTrue(NodeFS.existsSync(NodePath.join(home, "auth.json")));
+    assert.deepEqual(patches, []);
+    assert.deepEqual(refreshed, [id]);
+  });
+
+  it("ends a sign-in again when its account is removed, before the logout", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const dir = NodePath.join(f.home, ".claude-ann-example-com");
+    const { move, settings } = makeMove(f, settingsFor(f, { providerInstances: annInstance(f) }));
+
+    const started = await move.signInAgain(ANN_ID);
+    await move.removeAccount(ANN_ID);
+
+    // Ended (CLI gone) by the time the removal answers.
+    const state = move.signInState(started.signInId);
+    assert.deepEqual([state.state, state.message], ["error", "The account was removed."]);
+    assert.deepEqual(
+      calls(f)
+        .filter((call) => call.args[0] === "auth" && call.args[1] !== "status")
+        .map((call) => [call.args.slice(0, 2).join(" "), call.CLAUDE_CONFIG_DIR]),
+      [
+        ["auth login", dir],
+        ["auth logout", dir],
+      ],
+    );
+    assert.isFalse(NodeFS.existsSync(NodePath.join(dir, "fake-login.json")));
+    assert.deepEqual(settings().providerInstances, {});
+  });
+
+  it("refuses main accounts, managed Codex, shared dirs and other providers", async () => {
+    const f = fixture();
+    const { move } = makeMove(
+      f,
+      settingsFor(f, {
+        providerInstances: {
+          [ProviderInstanceId.make("claude_shared")]: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            displayName: "ann@example.com",
+            config: {},
+          },
+          [ProviderInstanceId.make("codex_managed")]: {
+            driver: ProviderDriverKind.make("codex"),
+            config: { setupMode: "managed" },
+          },
+          [ProviderInstanceId.make("cursor_work")]: { driver: ProviderDriverKind.make("cursor") },
+        },
+      }),
+    );
+    for (const [id, message] of [
+      ["claudeAgent", "Sign the main account in with Add account."],
+      ["codex", "Sign the main account in with Add account."],
+      ["codex_managed", "Sign in under More provider settings."],
+      [
+        "claude_shared",
+        "This account shares the main Claude config dir, so it signs in with the main account.",
+      ],
+      ["cursor_work", "Only Claude and Codex accounts can be signed in here."],
+      ["claude_gone", "That account isn't in T3 anymore."],
+    ] as const) {
+      assert.equal(await failure(move.signInAgain(id)), message);
+    }
+    assert.deepEqual(
+      calls(f).filter((call) => call.args.includes("login") || call.args.includes("logout")),
+      [],
+    );
   });
 });

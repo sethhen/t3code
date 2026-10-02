@@ -23,14 +23,16 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/server/src/auth/RpcAuthorization.ts`                             | scope for `extension.call`                                                               |
 | `apps/web/src/rightPanelStore.ts`                                      | `extension` surface kind + `openExtension`                                               |
 | `apps/web/src/components/RightPanelTabs.tsx`                           | extension entries in the add-tab menu, label/icon                                        |
-| `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`                                                               |
+| `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`; adds fork composer banners (Continue on another account)     |
 | `apps/web/src/components/AgentsPanel.tsx`                              | shows live elapsed time for workflows and pending members via `agentElapsedClock`        |
 | `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
 | `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait, + its test            |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
 | `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool's retirement)  |
-| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (fork sections on top)                    |
+| `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (Accounts on top, the rest folds away)    |
 | `apps/server/src/provider/Layers/CodexProvider.ts`                     | skips the usage read for a Codex without a ChatGPT sign-in, + its test                   |
+| `apps/server/src/provider/Layers/ProviderService.ts`                   | a thread moved to an instance with its continuation key resumes its conversation, + test |
+| `apps/server/src/provider/Drivers/ClaudeDriver.ts`                     | Claude accounts sharing `~/.claude`'s conversations share a continuation key             |
 
 Fork-owned paths (new extensions only touch these):
 
@@ -57,13 +59,15 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   ("t3code Safe Storage"), choose **Always Allow**.
 - **First launch on Windows:** if SmartScreen blocks the installer, click **More info → Run
   anyway** (once). PCs with Smart App Control turned on block unsigned apps outright.
-- **Claude and Codex accounts:** these are T3's own provider settings (Settings → Providers):
-  one provider instance per account, picked per thread. Accounts from the old account pool are
-  listed once at the top of that page: click **Sign in** next to each (first sign your browser in
-  to that account) or **Skip**. If `~/.claude` or `~/.codex` isn't signed in yet, the first
-  account you sign in there becomes your main one, which existing threads and the `claude` /
-  `codex` commands use; every other account becomes a separate one. Open **Usage** from the sidebar for token and cost history,
-  or **Usage → Limits** for subscription quotas.
+- **Claude and Codex accounts:** Settings → Providers → **Accounts**. **Add account** next to
+  Claude or Codex signs in with Claude's or OpenAI's own sign-in in your browser (sign the browser
+  in to the account you want first) and adds it as its own account; the ⋯ menu pauses or removes
+  one, and **Sign in again** brings back one that was signed out. The first account in an unsigned `~/.claude` / `~/.codex` becomes your main one, which the
+  `claude` / `codex` commands use. Each thread uses the account you pick in the model picker. When
+  an account hits its usage limit, the thread offers **Continue on…**: pick another of your accounts
+  and the thread carries on there. Nothing switches on its own. The usual provider settings are
+  under **More provider settings**. Open **Usage** from the sidebar for token and cost history, or
+  **Usage → Limits** for subscription quotas.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
@@ -111,35 +115,51 @@ merge and push with `fork_git` (see Traps).
   swaps it in and prints the rollback commands. Return to the release builds by installing the
   latest release DMG.
 
-## Pool (retired)
+## Accounts
 
-The fork used to run a local CLIProxyAPI that held several Claude and ChatGPT subscription
-sign-ins and routed the default Claude and Codex instances through it. Anthropic's terms forbid
-tools that collect, store or intermediate claude.ai credentials, and OpenAI's forbid rotating or
-pooling accounts to get around usage limits, so it is gone.
+`apps/server/src/extensions/pool/`, `apps/web/src/extensions/pool/` (extension id `pool`, kept from
+the account pool this replaced) and `apps/web/src/extensions/continueOn/`. Every Claude and Codex
+account is an ordinary provider instance; the section is a front end for T3's own instances and
+their snapshots (email, plan, quota). The pool ran a local CLIProxyAPI that held several
+subscription sign-ins and rotated between them; Anthropic forbids tools that collect, store or
+intermediate claude.ai credentials, and OpenAI forbids rotating or pooling accounts to get around
+usage limits. So the line is: the provider's own CLI holds each sign-in, the user picks the
+account, and nothing switches accounts automatically.
 
-What is left (`apps/server/src/extensions/pool/`, `apps/web/src/extensions/pool/`) moves each
-install off it. At server start it kills a leftover proxy (pid file), saves the accounts the pool
-held (provider, email, Codex plan) to `<stateDir>/pool-move.json`, deletes `<stateDir>/pool/`
-(tokens, management key, binary) and the `cliproxy-t3-pool` usage source. Settings → Providers then
-runs each provider's own `claude auth login --email` / `codex login` per account and writes a
-normal provider instance named after the email. A sign-in only counts when the account that signed
-in is the one on that row (any listed one for a default home); a wrong one is logged out again,
-never in a default home. Claude sign-ins are refused while `settings.json` or the environment
-make Claude Code use an API key helper or token instead of a subscription. Extra Claude accounts
-get `~/.claude-<email-slug>` with `settings.json`, `CLAUDE.md`, `skills`, `agents`, `commands`,
-`plugins` and `output-styles` linked from the main config dir and its MCP servers copied once;
-extra Codex accounts get a shadow home `~/.codex-<email-slug>` on the shared Codex home, or a
-separate home where symlinks aren't allowed (Windows without Developer Mode).
+- **Sign-ins** run on the server: `claude auth login` with the account's own `CLAUDE_CONFIG_DIR`
+  (its Keychain item is named after that path, so an account dir is never renamed or moved), or
+  `codex login` with `CODEX_HOME` set to a shadow home on the shared Codex home (a separate home
+  where symlinks aren't allowed, e.g. Windows without Developer Mode). Only the expected account is
+  kept; a wrong one is signed out again (in a default home only when it is an account T3 already
+  has, so the main home stays as it was). Claude sign-ins are refused while
+  `settings.json` makes Claude Code use an API key helper or token instead of a subscription.
+- **Claude account dirs** (`~/.claude-<email-slug>`, `~/.claude-account-<hex>`) link
+  `settings.json`, `CLAUDE.md`, `skills`, `agents`, `commands`, `plugins` and `output-styles` from
+  the main config dir (`~/.claude`, or the default instance's) and get its MCP servers once. Their
+  `.t3-account` marker names that main dir. When the instance is built, `claudeHistory.ts` links
+  their `projects/` and `plans/` to the main dir's, and keys their continuation group on that
+  shared store, so threads move between Claude accounts like Codex shadow homes do. What an
+  account already had is merged in without overwriting: a differing file is kept as
+  `<name>.from-<dir>`, and anything that can't move stays in `<dir>/projects.unmerged-<time>`. Dirs
+  without a marker are only touched when the instance is a `claude_<hash>` one T3 made in
+  `~/.claude-*`.
+- **Continue on…**: a composer banner when the thread's account hits a usage limit; the user picks
+  another account with the same continuation key and the thread continues there ("Continue where
+  you left off."). Claude Code drops the other account's thinking and re-reads the thread once.
+- **Pool leftovers**: at server start the extension kills a leftover proxy, saves the accounts the
+  pool held to `<stateDir>/pool-move.json` (listed until signed in or skipped) and deletes
+  `<stateDir>/pool/` and the `cliproxy-t3-pool` usage source.
 
-Limits: Claude threads stay on the account they started on (one config dir each); Codex threads
-can switch between accounts that share a home. Codex's sign-in only finishes in a browser on the
-machine running T3 (its callback is that machine's localhost); Claude's also takes a pasted code.
+Limits: Codex's sign-in only finishes in a browser on the machine running T3 (its callback is that
+machine's localhost); Claude's also takes a pasted code. A thread whose account was removed can't
+move until the account is added again (same instance id). Mobile has none of this. After a Claude
+Code update, check that resume still reads `<config dir>/projects/` (search its binary for
+`"projects"`), or the shared key would point at a store Claude Code no longer uses.
 
-Delete the extension, its contract and this section once every install has moved. Of the seams
-it used, only `instanceOverlays.ts` has nothing registered now; `claudeSettings.ts` still keeps a
-`--settings` launch argument the SDK would drop, and the CodexProvider skip still covers API-key
-Codex. Removing a seam is a `feat(fork): extension host` commit plus `update.sh`'s host list.
+Of the older seams, only `instanceOverlays.ts` has nothing registered now; `claudeSettings.ts`
+still keeps a `--settings` launch argument the SDK would drop, and the CodexProvider skip still
+covers API-key Codex. Removing a seam is a `feat(fork): extension host` commit plus `update.sh`'s
+host list.
 
 ## Traps
 

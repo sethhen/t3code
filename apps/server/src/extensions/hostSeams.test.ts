@@ -51,6 +51,22 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "fork sections at the top of Settings → Providers",
   ],
   [
+    "apps/web/src/components/settings/ProviderSettingsPanel.tsx",
+    // The prop's other lines in this file are upstream's own; the marker makes this one unique.
+    "targetInstanceId={targetInstanceId} // t3-ext",
+    "upstream provider list unfolded for a linked instance",
+  ],
+  [
+    "apps/web/src/components/ChatView.tsx",
+    "useForkComposerBannerItems(composerBannerItems",
+    "Continue on… next to a usage-limit stop",
+  ],
+  [
+    "apps/web/src/components/ChatView.tsx",
+    "bannerItems={bannerItemsWithFork}",
+    "composer notices with Continue on… added",
+  ],
+  [
     "apps/server/src/provider/Layers/CodexProvider.ts",
     "codexHasNoSubscriptionUsage(accountResponse)",
     "no usage read for a Codex without ChatGPT (API key, custom model_provider)",
@@ -59,6 +75,16 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "apps/server/src/provider/Layers/CodexProvider.ts",
     "codexHasNoSubscriptionUsage(snapshot.account)",
     "unsupported (not failed) usage for a Codex without ChatGPT",
+  ],
+  [
+    "apps/server/src/provider/Layers/ProviderService.ts",
+    "resumesPersisted = true",
+    "persisted resume cursor for an instance with the same continuation key",
+  ],
+  [
+    "apps/server/src/provider/Drivers/ClaudeDriver.ts",
+    "claudeSharedHistoryKey(",
+    "shared continuation key for Claude accounts on one conversation store",
   ],
   [
     "apps/web/src/components/AgentsPanel.tsx",

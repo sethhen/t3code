@@ -8,19 +8,18 @@ function account(overrides: Partial<MoveAccount> = {}): MoveAccount {
     id: "claude:a@example.com",
     provider: "claude",
     email: "a@example.com",
-    target: "instance",
     ...overrides,
   };
 }
 
 describe("orderMoveAccounts", () => {
-  it("puts Claude before Codex, then sorts by email, whatever the target", () => {
+  it("puts Claude before Codex, then sorts by email", () => {
     const ordered = orderMoveAccounts([
       account({ id: "x-b", provider: "codex", email: "b@example.com" }),
       account({ id: "c-b", email: "b@example.com" }),
-      account({ id: "x-z", provider: "codex", email: "z@example.com", target: "default" }),
+      account({ id: "x-z", provider: "codex", email: "z@example.com" }),
       account({ id: "c-a", email: "a@example.com" }),
-      account({ id: "c-y", email: "y@example.com", target: "default" }),
+      account({ id: "c-y", email: "y@example.com" }),
       account({ id: "x-a", provider: "codex", email: "a@example.com" }),
     ]);
     assert.deepEqual(

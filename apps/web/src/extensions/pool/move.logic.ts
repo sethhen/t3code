@@ -1,8 +1,8 @@
 /**
- * Pure helpers for "Sign your accounts in again" in Settings → Providers: the
- * accounts the retired pool held, each signed in again with its provider's own
- * sign-in. Row order, what each sign-in lands on, the waiting copy, the pasted
- * code check, and when a server has no such list at all.
+ * Pure helpers for the sign-ins of the Accounts section in Settings →
+ * Providers: a new account, or one the retired pool held, signed in with its
+ * provider's own sign-in. Pending row order, the waiting copy, the pasted code
+ * check, and when a server can't run sign-ins at all.
  */
 import { type MoveAccount, type MoveProvider, ProviderDriverKind } from "@t3tools/contracts";
 
@@ -33,22 +33,19 @@ export const MOVE_WAITING_TEXT: Readonly<Record<MoveProvider, string>> = {
 /** What the code box says when a pasted code fails `isWholeSignInCode`. */
 export const PARTIAL_CODE_MESSAGE = "Paste the whole code, including the part after #.";
 
-const COMMAND: Readonly<Record<MoveProvider, string>> = { claude: "claude", codex: "codex" };
+/** The line under an account the retired pool held. */
+export const PENDING_HINT: Readonly<Record<MoveProvider, string>> = {
+  claude: "Sign in again with Claude's own sign-in",
+  codex: "Sign in again with Codex's own sign-in",
+};
 
-/** Claude before Codex, then by email: targets change as accounts sign in, so rows ignore them. */
+/** Claude before Codex, then by email. */
 export function orderMoveAccounts(accounts: readonly MoveAccount[]): MoveAccount[] {
   return accounts.toSorted(
     (a, b) =>
       PROVIDERS.indexOf(a.provider) - PROVIDERS.indexOf(b.provider) ||
       a.email.localeCompare(b.email),
   );
-}
-
-/** The line under an account: where its sign-in lands. */
-export function moveTargetHint(account: MoveAccount): string {
-  return account.target === "default"
-    ? `The first ${MOVE_PROVIDER_LABEL[account.provider]} account you sign in becomes your main one: existing threads and the ${COMMAND[account.provider]} command use it`
-    : "Separate account";
 }
 
 /**
@@ -61,10 +58,11 @@ export function isWholeSignInCode(text: string): boolean {
 }
 
 /**
- * True when the server cannot list the accounts at all: a fork build without
- * the pool extension ("Unknown extension method"), an official T3 server with
- * no extension RPC ("Unknown request tag"), or an older fork build whose pool
- * answers with its old shape ("Unexpected response"). The section steps aside.
+ * True when the server cannot run sign-ins at all: a fork build without the
+ * pool extension ("Unknown extension method"), an official T3 server with no
+ * extension RPC ("Unknown request tag"), or an older fork build whose pool
+ * answers with its old shape ("Unexpected response"). The section then lists
+ * the accounts from the provider snapshots only, and folds nothing away.
  */
 export function isMoveUnsupported(message: string): boolean {
   return /^Unexpected response|Unknown extension method pool\.|Unknown request tag/i.test(message);

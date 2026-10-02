@@ -1,16 +1,22 @@
 // @effect-diagnostics globalTimers:off globalDate:off - the move is plain async Node by design; Effect wraps it at the layer and handler boundary.
 // @effect-diagnostics nodeBuiltinImport:off - the move runs the provider CLIs and lays out their config dirs with plain Node.
 /**
- * Moves the retired pool's accounts to direct sign-ins, one at a time, with
- * each provider's own CLI login. One instance per server, created by
- * `layer.ts`; plain async code, the Effect boundary is the layer and the
- * handlers.
+ * Signs Claude and Codex accounts in, one at a time, with each provider's own
+ * CLI login: the retired pool's accounts (the move list) and new ones the user
+ * adds, or an account instance signed in again in its own dir. Removing an
+ * account instance signs it out with the same CLI. One instance per server,
+ * created by `layer.ts`; plain async code, the Effect boundary is the layer
+ * and the handlers.
  *
  * A sign-in lands in the provider's default home (`~/.claude`, `~/.codex`)
  * while that home has no subscription sign-in, else in a new instance of its
  * own: `~/.claude-<slug>`, or a Codex shadow home on the shared Codex home (a
- * standalone `~/.codex-<slug>` where symlinks can't be made). In the default
- * home any account on the list counts; in a new instance only the one clicked.
+ * standalone `~/.codex-<slug>` where symlinks can't be made). An added
+ * account's email is only known after its login, so its dir is
+ * `~/.claude-account-<hex>` / `~/.codex-account-<hex>`, made for it and deleted
+ * again if the sign-in doesn't finish. In the default home any account on the
+ * list counts; in a new instance only the one clicked, or for an added account
+ * any one T3 doesn't have yet.
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
@@ -32,6 +38,7 @@ import {
   UsageLimitSourceId,
 } from "@t3tools/contracts";
 
+import { CLAUDE_ACCOUNT_MARKER } from "../claudeHistory.ts";
 import { migratePool } from "./boot.ts";
 import { CLAUDE_URL_MARKER, CODEX_URL_MARKER, lastLine, signInEnv, signInUrl } from "./cli.ts";
 import { runProcess } from "./process.ts";
@@ -55,10 +62,17 @@ import { deriveProviderInstanceConfigMap, mergeProviderInstanceEnvironment } fro
 /** The retired pool's entry in `settings.usageLimitSources`. */
 export const POOL_USAGE_SOURCE_ID = UsageLimitSourceId.make("cliproxy-t3-pool");
 
+const PROVIDERS = ["claude", "codex"] as const;
 /** Each provider's default instance id, which is also its driver kind. */
 const DEFAULT_INSTANCE: Record<MoveProvider, string> = { claude: "claudeAgent", codex: "codex" };
 const CLI: Record<MoveProvider, string> = { claude: "claude", codex: "codex" };
 const PROVIDER_NAME: Record<MoveProvider, string> = { claude: "Claude Code", codex: "Codex" };
+/** Where each provider keeps the default instance's sign-in. */
+const MAIN_HOME: Record<MoveProvider, string> = {
+  claude: "Claude config dir",
+  codex: "Codex home",
+};
+const EMAIL = /^[^\s@]+@[^\s@]+$/;
 
 /**
  * What every Claude account shares from the main config dir. Never
@@ -86,6 +100,8 @@ const CLAUDE_OVERRIDES = new Map([
 ]);
 
 const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
+/** How long `status` reuses a read of the default logins. */
+const DEFAULTS_TTL_MS = 30_000;
 /** How long `signIn.start` waits for the CLI to print its sign-in page. */
 const URL_WAIT_MS = 5_000;
 /** How long an exited CLI's output may stay open (a grandchild holding the pipes). */
@@ -143,21 +159,42 @@ interface SignInPlan {
   readonly marker: string;
   /** The account the CLI is signed in to now. */
   readonly signedInEmail: () => Promise<string | undefined>;
-  /** Puts back what preparing the sign-in moved aside, when it doesn't finish. */
+  /**
+   * Undoes the sign-in when it doesn't finish: puts back a login it moved
+   * aside (default home), or signs the new dir out again and deletes it if
+   * this sign-in made it (new instance; never a default home or an existing
+   * instance's dir).
+   */
   readonly restore?: () => Promise<void>;
-  /** Instance target only, so a default home is never signed out. */
-  readonly instance?: {
-    /** The instance an account signed in here becomes. */
-    readonly config: (email: string) => ProviderInstanceConfig;
-    /** Signs a wrong (or unreadable) account out of the new dir again. */
-    readonly logout: () => Promise<void>;
+  /**
+   * Signs out the account that just signed in, when `accept` refuses it
+   * there: one T3 has in a default home (putting back a login it replaced),
+   * another account in an instance signed in again.
+   */
+  readonly signOut?: () => Promise<void>;
+  /** Instance target only: the instance an account signed in here becomes. */
+  readonly instance?: (email: string) => ProviderInstanceConfig;
+}
+
+/** What a sign-in is for: a listed account, a new account of `provider`, or an existing instance. */
+interface SignInRequest {
+  readonly provider: MoveProvider;
+  readonly entry?: MoveEntry;
+  /** `account.signIn`: the instance signed in again, and its account when its name is an email. */
+  readonly existing?: {
+    readonly id: string;
+    readonly instance: ProviderInstanceConfig;
+    readonly email?: string;
   };
 }
 
-interface SignInRun {
+type SignInPick =
+  | { readonly accountId: string }
+  | { readonly provider: MoveProvider }
+  | { readonly instanceId: string };
+
+interface SignInRun extends SignInRequest {
   readonly signInId: string;
-  readonly accountId: string;
-  readonly entry: MoveEntry;
   readonly target: MoveTarget;
   readonly acceptsCode: boolean;
   /** Absent when the account was signed in there already. */
@@ -167,6 +204,8 @@ interface SignInRun {
   state: MoveSignInState["state"];
   url?: string;
   email?: string;
+  /** `done`: the instance the account now is. */
+  instanceId?: string;
   message?: string;
   /** Resolves when the CLI printed its sign-in page. */
   urlFound: Promise<void>;
@@ -207,16 +246,43 @@ const claudeConfigEmail = async (dir: string) => {
   return text(account.emailAddress) || undefined;
 };
 
+const isCode = (error: unknown, code: string) => isRecord(error) && error.code === code;
+
+/**
+ * Marks `dir` as an account dir T3 made (`CLAUDE_ACCOUNT_MARKER`, which the
+ * Claude history sharing looks for), naming the main config dir it shares
+ * with; keeps a marker already there.
+ */
+const markClaudeAccountDir = (dir: string, mainDir: string) =>
+  NodeFSP.writeFile(NodePath.join(dir, CLAUDE_ACCOUNT_MARKER), mainDir, {
+    mode: 0o600,
+    flag: "wx",
+  }).catch((error: unknown) => {
+    if (!isCode(error, "EEXIST")) throw error;
+  });
+
+/**
+ * Deletes an account dir a sign-in made. Its links (into the main Claude
+ * config dir or the shared Codex home) are unlinked first, so nothing behind
+ * one is ever touched; the rest is the account's own (its `.claude.json`,
+ * caches, the marker, a shadow home's own files).
+ */
+const removeAccountDir = async (dir: string) => {
+  for (const entry of await NodeFSP.readdir(dir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) await NodeFSP.unlink(NodePath.join(dir, entry.name));
+  }
+  await NodeFSP.rm(dir, { recursive: true, force: true });
+};
+
 /** A sign-in that is waiting; without a CLI (`child`) it is already being checked. */
 const newRun = (
-  entry: MoveEntry,
+  request: SignInRequest,
   target: MoveTarget,
   acceptsCode: boolean,
   child?: NodeChildProcess.ChildProcess,
 ): SignInRun => ({
   signInId: NodeCrypto.randomUUID(),
-  accountId: moveAccountId(entry),
-  entry,
+  ...request,
   target,
   acceptsCode,
   ...(child ? { child } : {}),
@@ -281,6 +347,7 @@ export class MoveController {
   private readonly deps: MoveDeps;
   private readonly listPath: string;
   private booted: Promise<void> | undefined;
+  private defaultsRead: { readonly at: number; readonly done: Promise<void> } | undefined;
   /** Each default home's sign-in; absent while unknown (then it is never the target). */
   private defaults: Partial<Record<MoveProvider, DefaultLogin | undefined>> = {};
   /** The current (or last) sign-in. One at a time: Codex's callback port is fixed. */
@@ -288,6 +355,7 @@ export class MoveController {
   /** Sign-ins a newer one replaced, for pollers still asking about them. */
   private readonly replaced = new Set<string>();
   private starting: Promise<unknown> = Promise.resolve();
+  private instanceWrites: Promise<unknown> = Promise.resolve();
   private symlinks: Promise<boolean> | undefined;
   /** Set by `close`: a start still in flight launches nothing (or ends what it launched). */
   private closed = false;
@@ -298,8 +366,9 @@ export class MoveController {
   }
 
   /**
-   * Server start: retire the pool, drop its usage source, read the default
-   * logins and drop the accounts already signed in. Runs once; never rejects.
+   * Server start: retire the pool, drop its usage source, then read the
+   * default logins and drop the accounts T3 has already. Runs once; never
+   * rejects.
    */
   boot(): Promise<void> {
     this.booted ??= (async () => {
@@ -311,13 +380,7 @@ export class MoveController {
       // Nothing left to move (every start once it is done): no need to run the CLIs.
       const pending = await readMoveList(this.listPath).catch(() => []);
       if (pending.length === 0) return;
-      await Promise.all(
-        (["claude", "codex"] as const).map((provider) =>
-          this.refreshDefault(provider).catch(
-            log(`Reading the default ${provider} sign-in failed`),
-          ),
-        ),
-      );
+      await this.readDefaults();
       await this.prune().catch(log("Updating the account move list failed"));
     })();
     return this.booted;
@@ -325,27 +388,85 @@ export class MoveController {
 
   async status(): Promise<MoveStatus> {
     await this.boot();
-    const entries = await readMoveList(this.listPath);
+    await this.readDefaults();
+    const [entries, settings] = await Promise.all([
+      readMoveList(this.listPath),
+      this.deps.getSettings(),
+    ]);
     const run = this.run;
     return {
-      accounts: entries.map((entry) => ({
-        id: moveAccountId(entry),
-        provider: entry.provider,
-        email: entry.email,
-        ...(entry.plan ? { plan: entry.plan } : {}),
-        target: this.targetOf(entry.provider),
-      })),
+      // One T3 got since (another way) isn't offered; the list drops it at the next start.
+      accounts: entries
+        .filter((entry) => !this.isKnown(entry, settings))
+        .map((entry) => ({
+          id: moveAccountId(entry),
+          provider: entry.provider,
+          email: entry.email,
+          ...(entry.plan ? { plan: entry.plan } : {}),
+        })),
+      addTarget: { claude: this.targetOf("claude"), codex: this.targetOf("codex") },
       ...(run?.state === "waiting"
-        ? { signIn: { signInId: run.signInId, accountId: run.accountId } }
+        ? {
+            signIn: {
+              signInId: run.signInId,
+              provider: run.provider,
+              ...(run.entry ? { accountId: moveAccountId(run.entry) } : {}),
+              ...(run.existing ? { instanceId: run.existing.id } : {}),
+            },
+          }
         : {}),
     };
   }
 
-  /** Starts `accountId`'s sign-in, cancelling the one running. Starts never overlap. */
+  /** Starts `accountId`'s sign-in, cancelling the one running. */
   startSignIn(accountId: string): Promise<MoveSignInStart> {
-    const next = this.starting.then(() => this.start(accountId));
-    this.starting = next.catch(() => undefined);
-    return next;
+    return this.queueStart({ accountId });
+  }
+
+  /** Starts a sign-in for a new `provider` account, cancelling the one running. */
+  addAccount(provider: MoveProvider): Promise<MoveSignInStart> {
+    return this.queueStart({ provider });
+  }
+
+  /** Signs an account instance in again in its own dir, cancelling the sign-in running. */
+  signInAgain(instanceId: string): Promise<MoveSignInStart> {
+    return this.queueStart({ instanceId });
+  }
+
+  /**
+   * Signs an account instance out with its CLI's own logout (a failed logout
+   * is only logged, and none runs while another instance uses the same
+   * sign-in) and removes it from T3. Its dir stays: its threads' transcripts
+   * point into it, and Claude's history in it is shared.
+   */
+  async removeAccount(instanceId: string): Promise<MoveStatus> {
+    await this.boot();
+    if (Object.values(DEFAULT_INSTANCE).includes(instanceId)) {
+      throw new Error("The main account can't be removed.");
+    }
+    const { settings, instance, provider } = await this.savedAccount(instanceId, "removed");
+    const logout = await this.logoutOf(provider, instance, settings);
+    // Its sign-in again would otherwise finish after the logout, signing the account back in.
+    const run = this.run;
+    if (run?.existing?.id === instanceId) await this.stop(run, "The account was removed.");
+    if (logout) {
+      const name = instance.displayName ?? instanceId;
+      // The default instances count too (a default Codex can have a shadow home of its own).
+      let sharer: string | undefined;
+      for (const [id, other] of Object.entries(deriveProviderInstanceConfigMap(settings))) {
+        if (id === instanceId || other.driver !== instance.driver) continue;
+        if ((await this.signInHome(provider, other, settings))?.dir === logout.dir) sharer = id;
+      }
+      if (sharer) {
+        this.deps.log(`Didn't sign ${name} out: ${sharer} uses the same sign-in (${logout.dir})`);
+      } else {
+        await this.logOut(name, logout.binary, logout.logout, logout.env);
+      }
+    }
+    await this.changeInstances((current) =>
+      Object.fromEntries(Object.entries(current).filter(([id]) => id !== instanceId)),
+    );
+    return this.status();
   }
 
   signInState(signInId: string): MoveSignInState {
@@ -364,6 +485,7 @@ export class MoveController {
       acceptsCode: run.acceptsCode,
       ...(run.url ? { url: run.url } : {}),
       ...(run.email ? { email: run.email } : {}),
+      ...(run.instanceId ? { instanceId: run.instanceId } : {}),
       ...(run.message ? { message: run.message } : {}),
     };
   }
@@ -402,7 +524,8 @@ export class MoveController {
   /** Drops an account from the list without signing it in. */
   async skip(accountId: string): Promise<MoveStatus> {
     await this.boot();
-    if (this.run?.accountId === accountId) await this.stop(this.run, "Skipped.");
+    const run = this.run;
+    if (run?.entry && moveAccountId(run.entry) === accountId) await this.stop(run, "Skipped.");
     await updateMoveList(this.listPath, (entries) =>
       entries.filter((entry) => moveAccountId(entry) !== accountId),
     );
@@ -416,33 +539,59 @@ export class MoveController {
     if (run?.running) this.end(run, "The server stopped.");
   }
 
-  private async start(accountId: string): Promise<MoveSignInStart> {
+  /** Starts never overlap: Codex's callback port is fixed. */
+  private queueStart(pick: SignInPick): Promise<MoveSignInStart> {
+    const next = this.starting.then(() => this.start(pick));
+    this.starting = next.catch(() => undefined);
+    return next;
+  }
+
+  private async start(pick: SignInPick): Promise<MoveSignInStart> {
     await this.boot();
     if (this.run) await this.stop(this.run, "Another sign-in started.");
-    const entry = (await readMoveList(this.listPath)).find(
-      (candidate) => moveAccountId(candidate) === accountId,
-    );
-    if (!entry) throw new Error("That account isn't on the list anymore.");
+    let request: SignInRequest;
+    if ("accountId" in pick) {
+      const entry = (await readMoveList(this.listPath)).find(
+        (candidate) => moveAccountId(candidate) === pick.accountId,
+      );
+      if (!entry) throw new Error("That account isn't on the list anymore.");
+      request = { provider: entry.provider, entry };
+    } else if ("instanceId" in pick) {
+      if (Object.values(DEFAULT_INSTANCE).includes(pick.instanceId)) {
+        throw new Error("Sign the main account in with Add account.");
+      }
+      const { instance, provider } = await this.savedAccount(pick.instanceId, "signed in");
+      const name = instance.displayName?.trim() ?? "";
+      request = {
+        provider,
+        existing: { id: pick.instanceId, instance, ...(EMAIL.test(name) ? { email: name } : {}) },
+      };
+    } else {
+      request = { provider: pick.provider };
+    }
+    const { provider, entry } = request;
     // Read again: signing in over a default login that appeared since would replace it.
-    await this.refreshDefault(entry.provider);
-    const override = entry.provider === "claude" ? this.defaults.claude?.override : undefined;
+    await this.refreshDefault(provider);
+    const override = provider === "claude" ? this.defaults.claude?.override : undefined;
     if (override) {
       throw new Error(
         `Claude Code is set to use ${override} (in its settings.json), which overrides any sign-in. Remove it, then sign in.`,
       );
     }
-    const target = this.targetOf(entry.provider);
+    // An instance signed in again is never the default home, whatever that holds.
+    const target = request.existing ? "instance" : this.targetOf(provider);
     const settings = await this.deps.getSettings();
     if (this.closed) throw new Error("The server stopped.");
-    const plan =
-      entry.provider === "claude"
+    const plan = request.existing
+      ? await this.existingPlan(request.existing, provider, settings)
+      : provider === "claude"
         ? await this.claudePlan(entry, target, settings)
         : await this.codexPlan(entry, target, settings);
-    if (plan.instance) {
+    if (entry && plan.instance) {
       const email = await plan.signedInEmail();
       if (email?.toLowerCase() === entry.email.toLowerCase()) {
         // Signed in there already (an earlier sign-in that wasn't saved): keep it, no CLI.
-        const run = this.track(newRun(entry, target, plan.acceptsCode));
+        const run = this.track(newRun(request, target, plan.acceptsCode));
         run.finished = this.settle(run, plan, email).catch((error: unknown) =>
           this.fail(run, messageOf(error)),
         );
@@ -453,7 +602,7 @@ export class MoveController {
     }
     let run: SignInRun;
     try {
-      run = this.track(await this.launch(entry, target, plan));
+      run = this.track(await this.launch(request, target, plan));
     } catch (error) {
       await this.restore(plan);
       throw error;
@@ -482,6 +631,39 @@ export class MoveController {
   /** A default home is the target only while it is known to have no subscription sign-in. */
   private targetOf(provider: MoveProvider): MoveTarget {
     return this.defaults[provider]?.signedIn === false ? "default" : "instance";
+  }
+
+  /**
+   * Reads both default logins (boot with a list, status), reusing a read from
+   * the last `DEFAULTS_TTL_MS`; sign-ins re-read theirs.
+   */
+  private readDefaults() {
+    const now = Date.now();
+    if (!this.defaultsRead || now - this.defaultsRead.at >= DEFAULTS_TTL_MS) {
+      const done = Promise.all(
+        PROVIDERS.map((provider) =>
+          this.refreshDefault(provider).catch((error: unknown) =>
+            this.deps.log(`Reading the default ${provider} sign-in failed`, error),
+          ),
+        ),
+      ).then(() => undefined);
+      this.defaultsRead = { at: now, done };
+    }
+    return this.defaultsRead.done;
+  }
+
+  /** Whether T3 has `account` already: as a default home's sign-in, or as an instance. */
+  private isKnown(account: MoveEntry, settings: ServerSettings) {
+    const email = account.email.toLowerCase();
+    return (
+      this.defaults[account.provider]?.email?.toLowerCase() === email ||
+      moveAccountId(account) in settings.providerInstances ||
+      Object.values(settings.providerInstances).some(
+        (instance) =>
+          instance.driver === DEFAULT_INSTANCE[account.provider] &&
+          instance.displayName?.toLowerCase() === email,
+      )
+    );
   }
 
   private defaultInstance(settings: ServerSettings, provider: MoveProvider) {
@@ -626,13 +808,23 @@ export class MoveController {
     await this.deps.updateSettings({ usageLimitSources: { [POOL_USAGE_SOURCE_ID]: null } });
   }
 
-  /** Drops accounts already signed in directly: in a default home, or as an instance made here. */
+  /** Drops the accounts T3 has already (`isKnown`). */
   private async prune() {
     const settings = await this.deps.getSettings();
-    const signedIn = (entry: MoveEntry) =>
-      this.defaults[entry.provider]?.email?.toLowerCase() === entry.email.toLowerCase() ||
-      moveAccountId(entry) in settings.providerInstances;
-    await updateMoveList(this.listPath, (entries) => entries.filter((entry) => !signedIn(entry)));
+    await updateMoveList(this.listPath, (entries) =>
+      entries.filter((entry) => !this.isKnown(entry, settings)),
+    );
+  }
+
+  /** Whether an instance (other than `exceptId`) keeps its home or shadow home in `dir`. */
+  private homeInUse(dir: string, settings: ServerSettings, exceptId?: string) {
+    return Object.entries(settings.providerInstances).some(([id, instance]) => {
+      if (id === exceptId) return false;
+      const config = configOf(instance);
+      return [text(config.homePath), text(config.shadowHomePath)].some(
+        (path) => path && this.resolveHome(path) === dir,
+      );
+    });
   }
 
   /** `~/.claude-<slug>` / `~/.codex-<slug>`, plus the account's hash when another account has it. */
@@ -640,23 +832,179 @@ export class MoveController {
     const hash = accountHash(entry.provider, entry.email);
     const plain = `~/.${CLI[entry.provider]}-${emailSlug(entry.email) || hash}`;
     const dir = this.resolveHome(plain);
-    const usedByOther = Object.entries(settings.providerInstances).some(([id, instance]) => {
-      if (id === moveAccountId(entry)) return false;
-      const config = configOf(instance);
-      return [text(config.homePath), text(config.shadowHomePath)].some(
-        (path) => path && this.resolveHome(path) === dir,
-      );
-    });
     const signedInAs =
       entry.provider === "claude" ? await claudeConfigEmail(dir) : await codexEmail(dir);
     const taken =
-      usedByOther ||
+      this.homeInUse(dir, settings, moveAccountId(entry)) ||
       (signedInAs !== undefined && signedInAs.toLowerCase() !== entry.email.toLowerCase());
     return taken ? `${plain}-${hash}` : plain;
   }
 
+  /**
+   * A new account's dir, `~/.claude-account-<hex>` / `~/.codex-account-<hex>`,
+   * made here, so it is this sign-in's to delete again. It is fixed before the
+   * login: Claude's Keychain item is named after the dir.
+   */
+  private async claimAccountHome(provider: MoveProvider, settings: ServerSettings) {
+    for (;;) {
+      const homePath = `~/.${CLI[provider]}-account-${NodeCrypto.randomBytes(3).toString("hex")}`;
+      const dir = this.resolveHome(homePath);
+      if (this.homeInUse(dir, settings)) continue;
+      try {
+        // Not recursive: fails if the dir exists, so it is only ever one this sign-in made.
+        await NodeFSP.mkdir(dir, { mode: 0o700 });
+        return homePath;
+      } catch (error) {
+        if (!isCode(error, "EEXIST")) throw error;
+      }
+    }
+  }
+
+  /** Signs a new dir out again (logged, not thrown), then deletes it if this sign-in made it. */
+  private async undoInstance(logout: () => Promise<unknown>, made: string | undefined) {
+    await logout().catch((error: unknown) => this.deps.log("Signing a new dir out failed", error));
+    if (made) await removeAccountDir(made);
+  }
+
+  /** Deletes a dir a sign-in made when preparing that sign-in failed, then rethrows. */
+  private async abandon(made: string | undefined, error: unknown): Promise<never> {
+    if (made) {
+      await removeAccountDir(made).catch((cause: unknown) =>
+        this.deps.log(`Deleting ${made} failed`, cause),
+      );
+    }
+    throw error;
+  }
+
+  /** Where the default instance's Claude Code keeps its config (ClaudeHome.ts resolveClaudeHomePath). */
+  private claudeMainDir(defaultEnv: NodeJS.ProcessEnv) {
+    const inherited = text(defaultEnv.CLAUDE_CONFIG_DIR);
+    return inherited
+      ? NodePath.resolve(inherited)
+      : NodePath.join(this.deps.expandHome("~"), ".claude");
+  }
+
+  /** A saved Claude or Codex instance (`action`: what other drivers can't be). */
+  private async savedAccount(instanceId: string, action: string) {
+    const settings = await this.deps.getSettings();
+    const instance = Object.entries(settings.providerInstances).find(
+      ([id]) => id === instanceId,
+    )?.[1];
+    if (!instance) throw new Error("That account isn't in T3 anymore.");
+    const provider = PROVIDERS.find((candidate) => DEFAULT_INSTANCE[candidate] === instance.driver);
+    if (!provider) throw new Error(`Only Claude and Codex accounts can be ${action} here.`);
+    return { settings, instance, provider };
+  }
+
+  /**
+   * Where `instance` keeps its sign-in (Claude's config dir, Codex's shadow or
+   * own home), the default instance's next to it, and how its CLI runs there:
+   * its binary and environment as the driver builds them (Claude's Keychain
+   * item is named after the literal CLAUDE_CONFIG_DIR). None for a managed
+   * Codex instance, whose sign-in T3 keeps.
+   */
+  private async signInHome(
+    provider: MoveProvider,
+    instance: ProviderInstanceConfig,
+    settings: ServerSettings,
+  ) {
+    const config = configOf(instance);
+    const binary = this.deps.expandHome(text(config.binaryPath) || CLI[provider]);
+    const base = signInEnv(mergeProviderInstanceEnvironment(instance.environment, this.deps.env));
+    if (provider === "claude") {
+      const env = await this.deps.claudeEnvironment(text(config.homePath), base);
+      const main = this.claudeMainDir(await this.claudeDefaultEnv(settings));
+      const dir = text(env.CLAUDE_CONFIG_DIR);
+      const logout = ["auth", "logout"];
+      return { binary, env, dir: dir ? NodePath.resolve(dir) : main, main, logout };
+    }
+    if (config.setupMode === "managed") return undefined;
+    const main = this.codexDefault(settings).home;
+    const homePath = text(config.shadowHomePath) || text(config.homePath);
+    const dir = homePath ? this.resolveHome(homePath) : main;
+    return { binary, env: { ...base, CODEX_HOME: dir }, dir, main, logout: ["logout"] };
+  }
+
+  /**
+   * How to sign `instance` out. Refuses an instance without a home of its
+   * own: its logout would sign the default instance out too. None for a
+   * managed Codex instance.
+   */
+  private async logoutOf(
+    provider: MoveProvider,
+    instance: ProviderInstanceConfig,
+    settings: ServerSettings,
+  ) {
+    const home = await this.signInHome(provider, instance, settings);
+    if (home && home.dir === home.main) {
+      throw new Error(
+        `This account uses the main ${MAIN_HOME[provider]}, so signing it out would sign the main account out.`,
+      );
+    }
+    return home;
+  }
+
+  /** Runs a logout; one that fails is only logged. */
+  private async logOut(
+    name: string,
+    binary: string,
+    args: ReadonlyArray<string>,
+    env: NodeJS.ProcessEnv,
+  ) {
+    await this.exec(binary, args, env).then(
+      (result) => {
+        if (result.code !== 0) {
+          this.deps.log(
+            `Signing ${name} out exited with code ${result.code}`,
+            lastLine(result.stderr),
+          );
+        }
+      },
+      (error: unknown) => this.deps.log(`Signing ${name} out failed`, error),
+    );
+  }
+
+  /**
+   * `account.signIn`: the provider's own login in an account instance's own
+   * config dir or home, run the way the instance runs. Only the account it
+   * is counts (any, when its name isn't an email); another one is signed out
+   * again. The dir always stays.
+   */
+  private async existingPlan(
+    existing: NonNullable<SignInRequest["existing"]>,
+    provider: MoveProvider,
+    settings: ServerSettings,
+  ): Promise<SignInPlan> {
+    const home = await this.signInHome(provider, existing.instance, settings);
+    if (!home) throw new Error("Sign in under More provider settings.");
+    if (home.dir === home.main) {
+      throw new Error(
+        `This account shares the main ${MAIN_HOME[provider]}, so it signs in with the main account.`,
+      );
+    }
+    const claude = provider === "claude";
+    const signedInEmail = claude
+      ? async () => {
+          const login = await this.claudeLogin(home.binary, home.env);
+          return login?.signedIn ? login.email : undefined;
+        }
+      : () => codexEmail(home.dir);
+    return {
+      binary: home.binary,
+      args: claude
+        ? ["auth", "login", ...(existing.email ? ["--email", existing.email] : [])]
+        : ["login"],
+      env: home.env,
+      acceptsCode: claude,
+      marker: claude ? CLAUDE_URL_MARKER : CODEX_URL_MARKER,
+      signedInEmail,
+      // No `restore`: a cancelled or failed login leaves the dir as it was.
+      signOut: () => this.logOut(home.dir, home.binary, home.logout, home.env),
+    };
+  }
+
   private async claudePlan(
-    entry: MoveEntry,
+    entry: MoveEntry | undefined,
     target: MoveTarget,
     settings: ServerSettings,
   ): Promise<SignInPlan> {
@@ -664,7 +1012,8 @@ export class MoveController {
     const defaultEnv = await this.claudeDefaultEnv(settings);
     const plan = {
       binary: defaults.binary,
-      args: ["auth", "login", "--email", entry.email],
+      // A new account is whichever one the browser signs in.
+      args: entry ? ["auth", "login", "--email", entry.email] : ["auth", "login"],
       acceptsCode: true,
       marker: CLAUDE_URL_MARKER,
     };
@@ -673,50 +1022,59 @@ export class MoveController {
       return login?.signedIn ? login.email : undefined;
     };
     if (target === "default") {
-      return { ...plan, env: defaultEnv, signedInEmail: signedInEmail(defaultEnv) };
+      return {
+        ...plan,
+        env: defaultEnv,
+        signedInEmail: signedInEmail(defaultEnv),
+        signOut: () =>
+          this.logOut("the main account", defaults.binary, ["auth", "logout"], defaultEnv),
+      };
     }
-    const homePath = await this.homePathFor(entry, settings);
-    // From the exact homePath the instance saves: the Keychain item's name hashes the
-    // CLAUDE_CONFIG_DIR string, so the instance must see the same one the login wrote.
-    const env = await this.deps.claudeEnvironment(homePath, signInEnv(this.deps.env));
-    // Without it the login would replace the main (default) Keychain sign-in.
-    if (!env.CLAUDE_CONFIG_DIR) {
-      throw new Error("Can't sign in a separate Claude account: CLAUDE_CONFIG_DIR isn't set.");
-    }
-    await this.seedClaudeHome(env.CLAUDE_CONFIG_DIR, defaultEnv);
-    return {
-      ...plan,
-      env,
-      signedInEmail: signedInEmail(env),
-      instance: {
-        config: (email) => ({
+    const homePath = entry
+      ? await this.homePathFor(entry, settings)
+      : await this.claimAccountHome("claude", settings);
+    const made = entry ? undefined : this.resolveHome(homePath);
+    try {
+      // From the exact homePath the instance saves: the Keychain item's name hashes the
+      // CLAUDE_CONFIG_DIR string, so the instance must see the same one the login wrote.
+      const env = await this.deps.claudeEnvironment(homePath, signInEnv(this.deps.env));
+      // Without it the login would replace the main (default) Keychain sign-in.
+      if (!env.CLAUDE_CONFIG_DIR) {
+        throw new Error("Can't sign in a separate Claude account: CLAUDE_CONFIG_DIR isn't set.");
+      }
+      await this.seedClaudeHome(env.CLAUDE_CONFIG_DIR, defaultEnv);
+      return {
+        ...plan,
+        env,
+        signedInEmail: signedInEmail(env),
+        restore: () =>
+          this.undoInstance(() => this.exec(defaults.binary, ["auth", "logout"], env), made),
+        instance: (email) => ({
           driver: ProviderDriverKind.make("claudeAgent"),
           displayName: email,
           enabled: true,
           config: { homePath, ...defaults.binaryConfig },
         }),
-        logout: async () => {
-          await this.exec(defaults.binary, ["auth", "logout"], env);
-        },
-      },
-    };
+      };
+    } catch (error) {
+      return this.abandon(made, error);
+    }
   }
 
   /**
    * Shares the main config dir's settings, memory, skills, agents, commands,
-   * plugins and output styles with a new account's `dir`, and copies its MCP
-   * servers once. Only fills in what `dir` doesn't have yet.
+   * plugins and output styles with a new account's `dir`, marks it as T3's
+   * (`CLAUDE_ACCOUNT_MARKER`) and copies the main MCP servers once. Only fills
+   * in what `dir` doesn't have yet.
    */
   private async seedClaudeHome(dir: string, defaultEnv: NodeJS.ProcessEnv) {
-    const home = this.deps.expandHome("~");
-    // Where the default instance's Claude Code reads its config (ClaudeHome.ts resolveClaudeHomePath).
-    const inherited = text(defaultEnv.CLAUDE_CONFIG_DIR);
-    const mainDir = inherited ? NodePath.resolve(inherited) : NodePath.join(home, ".claude");
-    const mainConfig = inherited
+    const mainDir = this.claudeMainDir(defaultEnv);
+    const mainConfig = text(defaultEnv.CLAUDE_CONFIG_DIR)
       ? NodePath.join(mainDir, ".claude.json")
-      : NodePath.join(home, ".claude.json");
+      : NodePath.join(this.deps.expandHome("~"), ".claude.json");
     if (NodePath.resolve(dir) === mainDir) return;
     await NodeFSP.mkdir(dir, { recursive: true, mode: 0o700 });
+    await markClaudeAccountDir(dir, mainDir);
     for (const name of CLAUDE_SHARED_ENTRIES) {
       const source = NodePath.join(mainDir, name);
       const target = NodePath.join(dir, name);
@@ -752,7 +1110,7 @@ export class MoveController {
   }
 
   private async codexPlan(
-    entry: MoveEntry,
+    entry: MoveEntry | undefined,
     target: MoveTarget,
     settings: ServerSettings,
   ): Promise<SignInPlan> {
@@ -775,10 +1133,15 @@ export class MoveController {
         await NodeFSP.rename(auth, backup);
       }
       const saved = backup;
+      const env = { ...signInEnv(codex.environment), CODEX_HOME: codex.home };
       return {
         ...plan,
-        env: { ...signInEnv(codex.environment), CODEX_HOME: codex.home },
+        env,
         signedInEmail: () => codexEmail(codex.home),
+        signOut: () =>
+          saved
+            ? NodeFSP.rename(saved, auth)
+            : this.logOut("the main account", codex.binary, ["logout"], env),
         ...(saved
           ? {
               restore: async () => {
@@ -788,48 +1151,51 @@ export class MoveController {
           : {}),
       };
     }
-    const homePath = await this.homePathFor(entry, settings);
+    const homePath = entry
+      ? await this.homePathFor(entry, settings)
+      : await this.claimAccountHome("codex", settings);
+    const made = entry ? undefined : this.resolveHome(homePath);
     let home: string;
     let config: Record<string, string>;
-    if (await (this.symlinks ??= this.deps.canSymlink())) {
-      // A shadow home: its own auth.json, everything else linked to the shared home.
-      home = await this.deps.materializeCodexHome(codex.homePath, homePath);
-      config = {
-        setupMode: "existing",
-        shadowHomePath: homePath,
-        ...(codex.homePath ? { homePath: codex.homePath } : {}),
-      };
-    } else {
-      // No symlinks (Windows without Developer Mode): a home of its own, with the shared config.
-      home = this.resolveHome(homePath);
-      await NodeFSP.mkdir(home, { recursive: true });
-      await NodeFSP.copyFile(
-        NodePath.join(codex.home, "config.toml"),
-        NodePath.join(home, "config.toml"),
-        NodeFSP.constants.COPYFILE_EXCL,
-      ).catch((error: unknown) => {
-        // None to copy, or copied before.
-        if (isMissing(error) || (isRecord(error) && error.code === "EEXIST")) return;
-        this.deps.log(`Couldn't copy Codex's config.toml into ${home}`, error);
-      });
-      config = { setupMode: "existing", homePath };
+    try {
+      if (await (this.symlinks ??= this.deps.canSymlink())) {
+        // A shadow home: its own auth.json, everything else linked to the shared home.
+        home = await this.deps.materializeCodexHome(codex.homePath, homePath);
+        config = {
+          setupMode: "existing",
+          shadowHomePath: homePath,
+          ...(codex.homePath ? { homePath: codex.homePath } : {}),
+        };
+      } else {
+        // No symlinks (Windows without Developer Mode): a home of its own, with the shared config.
+        home = this.resolveHome(homePath);
+        await NodeFSP.mkdir(home, { recursive: true });
+        await NodeFSP.copyFile(
+          NodePath.join(codex.home, "config.toml"),
+          NodePath.join(home, "config.toml"),
+          NodeFSP.constants.COPYFILE_EXCL,
+        ).catch((error: unknown) => {
+          // None to copy, or copied before.
+          if (isMissing(error) || isCode(error, "EEXIST")) return;
+          this.deps.log(`Couldn't copy Codex's config.toml into ${home}`, error);
+        });
+        config = { setupMode: "existing", homePath };
+      }
+    } catch (error) {
+      return this.abandon(made, error);
     }
     const env = { ...signInEnv(this.deps.env), CODEX_HOME: home };
     return {
       ...plan,
       env,
       signedInEmail: () => codexEmail(home),
-      instance: {
-        config: (email) => ({
-          driver: ProviderDriverKind.make("codex"),
-          displayName: email,
-          enabled: true,
-          config: { ...config, ...codex.binaryConfig },
-        }),
-        logout: async () => {
-          await this.exec(codex.binary, ["logout"], env);
-        },
-      },
+      restore: () => this.undoInstance(() => this.exec(codex.binary, ["logout"], env), made),
+      instance: (email) => ({
+        driver: ProviderDriverKind.make("codex"),
+        displayName: email,
+        enabled: true,
+        config: { ...config, ...codex.binaryConfig },
+      }),
     };
   }
 
@@ -839,7 +1205,7 @@ export class MoveController {
     return runProcess(spawn.command, spawn.args, { env, shell: spawn.shell, timeoutMs: 15_000 });
   }
 
-  private async launch(entry: MoveEntry, target: MoveTarget, plan: SignInPlan) {
+  private async launch(request: SignInRequest, target: MoveTarget, plan: SignInPlan) {
     const spawn = await this.deps.resolveSpawn(plan.binary, plan.args, plan.env);
     const child = NodeChildProcess.spawn(spawn.command, spawn.args, {
       env: plan.env,
@@ -873,7 +1239,7 @@ export class MoveController {
     child.stdin.on("error", () => undefined);
     let foundUrl = () => {};
     const run: SignInRun = {
-      ...newRun(entry, target, plan.acceptsCode, child),
+      ...newRun(request, target, plan.acceptsCode, child),
       urlFound: new Promise((resolve) => (foundUrl = resolve)),
     };
     // Whole buffers, re-parsed per chunk: an escape sequence or URL can span two chunks.
@@ -900,7 +1266,7 @@ export class MoveController {
     );
     timer.unref();
 
-    const name = `${PROVIDER_NAME[entry.provider]} (${plan.binary})`;
+    const name = `${PROVIDER_NAME[request.provider]} (${plan.binary})`;
     run.finished = exited
       .then(async ({ code, error }) => {
         clearTimeout(timer);
@@ -925,24 +1291,17 @@ export class MoveController {
   private async restore(plan: SignInPlan) {
     await plan
       .restore?.()
-      .catch((error: unknown) => this.deps.log("Putting the replaced sign-in back failed", error));
+      .catch((error: unknown) => this.deps.log("Undoing an unfinished sign-in failed", error));
   }
 
   /**
    * The CLI finished (or `email` was signed in already): keep the sign-in if
-   * it is an account that counts.
+   * it is an account that counts. One that doesn't is signed out again by
+   * `plan.restore` (a new instance's dir) or `plan.signOut`.
    */
   private async settle(run: SignInRun, plan: SignInPlan, known?: string) {
-    const provider = run.entry.provider;
+    const provider = run.provider;
     const email = known ?? (await plan.signedInEmail());
-    if (!email && plan.instance) {
-      // Nothing readable signed in (e.g. a login kept elsewhere): don't leave it in the new dir.
-      await plan.instance
-        .logout()
-        .catch((error: unknown) =>
-          this.deps.log(`Signing ${run.entry.email}'s new directory out failed`, error),
-        );
-    }
     const problem = email
       ? await this.accept(run, plan, email)
       : `${PROVIDER_NAME[provider]} finished without a signed-in account.`;
@@ -950,11 +1309,12 @@ export class MoveController {
     await this.refreshDefault(provider).catch((error) =>
       this.deps.log(`Reading the default ${provider} sign-in failed`, error),
     );
-    if (run.target === "default") {
+    const refresh = (instanceId: string) =>
       void this.deps
-        .refreshInstance(DEFAULT_INSTANCE[provider])
-        .catch((error) => this.deps.log(`Refreshing ${DEFAULT_INSTANCE[provider]} failed`, error));
-    }
+        .refreshInstance(instanceId)
+        .catch((error) => this.deps.log(`Refreshing ${instanceId} failed`, error));
+    if (run.target === "default") refresh(DEFAULT_INSTANCE[provider]);
+    if (run.existing && !problem) refresh(run.existing.id);
     if (email) run.email = email;
     if (problem) this.fail(run, problem);
     else run.state = "done";
@@ -962,43 +1322,78 @@ export class MoveController {
 
   /** Records `email`'s sign-in; returns why it doesn't count, if it doesn't. */
   private async accept(run: SignInRun, plan: SignInPlan, email: string) {
-    const isEmail = (entry: MoveEntry) =>
-      entry.provider === run.entry.provider && entry.email.toLowerCase() === email.toLowerCase();
-    if (plan.instance) {
-      // A new instance is for the account that was clicked, and only that one.
-      if (!isEmail(run.entry)) {
-        await plan.instance
-          .logout()
-          .catch((error: unknown) => this.deps.log(`Signing ${email} out again failed`, error));
-        return `Signed in as ${email}. Sign your browser in to ${run.entry.email} and try again.`;
+    const signOut = () =>
+      plan
+        .signOut?.()
+        .catch((error: unknown) => this.deps.log(`Signing ${email} out again failed`, error));
+    if (run.existing) {
+      // The instance is there already; only its own account counts.
+      const expected = run.existing.email;
+      if (expected && expected.toLowerCase() !== email.toLowerCase()) {
+        await signOut();
+        return `Signed in as ${email}. Sign your browser in to ${expected} and try again.`;
       }
-      await this.addInstance(moveAccountId(run.entry), plan.instance.config(run.entry.email));
-      await updateMoveList(this.listPath, (entries) =>
-        entries.filter((entry) => !sameAccount(entry, run.entry)),
-      );
+      run.instanceId = run.existing.id;
       return undefined;
     }
-    // The default home keeps whatever signed in (it may be the user's own main account);
-    // it counts for any account on the list.
+    const account: MoveEntry = { provider: run.provider, email };
     const settings = await this.deps.getSettings();
-    const match = (await readMoveList(this.listPath)).find(
-      (entry) => isEmail(entry) && !(moveAccountId(entry) in settings.providerInstances),
-    );
-    if (!match) return `Signed in as ${email}, which isn't in this list.`;
-    await updateMoveList(this.listPath, (entries) =>
-      entries.filter((entry) => !sameAccount(entry, match)),
-    );
+    // Once the sign-in is saved it counts; a list entry left behind goes at the next boot.
+    const dropListed = () =>
+      updateMoveList(this.listPath, (entries) =>
+        entries.filter((entry) => !sameAccount(entry, account)),
+      ).catch((error: unknown) => this.deps.log("Updating the account move list failed", error));
+    if (plan.instance) {
+      // A listed account's new instance is for that account only; a new account for one
+      // T3 doesn't have yet. Either way its id is the account's, so threads bound to an
+      // account that was removed and added again find it.
+      if (run.entry && !sameAccount(run.entry, account)) {
+        return `Signed in as ${email}. Sign your browser in to ${run.entry.email} and try again.`;
+      }
+      if (!run.entry && this.isKnown(account, settings)) return `${email} is already in T3.`;
+      const id = moveAccountId(account);
+      const instance = plan.instance(run.entry?.email ?? email);
+      await this.changeInstances((current) => ({
+        ...current,
+        [ProviderInstanceId.make(id)]: instance,
+      }));
+      await dropListed();
+      run.instanceId = id;
+      return undefined;
+    }
+    // The default home keeps whatever signed in (it may be the user's own main account).
+    if (run.entry) {
+      // It counts for any account on the list.
+      const listed = (await readMoveList(this.listPath)).some(
+        (entry) =>
+          sameAccount(entry, account) && !(moveAccountId(entry) in settings.providerInstances),
+      );
+      if (!listed) return `Signed in as ${email}, which isn't in this list.`;
+    } else if (this.isKnown(account, settings)) {
+      // The default home was signed out when this started: it stays so, not a second copy.
+      await signOut();
+      return `${email} is already in T3, so the main account stays signed out.`;
+    }
+    await dropListed();
+    run.instanceId = DEFAULT_INSTANCE[run.provider];
     return undefined;
   }
 
-  /** Sign-ins never overlap, so this is the move's only writer of the map. */
-  private async addInstance(id: string, instance: ProviderInstanceConfig) {
-    // The patch replaces the whole map: start from what is saved right now (never the
-    // derived map, which would persist the default instances).
-    const current = (await this.deps.getSettings()).providerInstances;
-    await this.deps.updateSettings({
-      providerInstances: { ...current, [ProviderInstanceId.make(id)]: instance },
+  /**
+   * Saves a change to the instance map, one at a time. The patch replaces the
+   * whole map, so each starts from what is saved right now (never the derived
+   * map, which would persist the default instances). A client's own settings
+   * write doesn't queue here and can still land between the read and the write.
+   */
+  private changeInstances(
+    change: (current: ServerSettings["providerInstances"]) => ServerSettings["providerInstances"],
+  ) {
+    const next = this.instanceWrites.then(async () => {
+      const current = (await this.deps.getSettings()).providerInstances;
+      await this.deps.updateSettings({ providerInstances: change(current) });
     });
+    this.instanceWrites = next.catch(() => undefined);
+    return next;
   }
 
   private fail(run: SignInRun, message: string) {

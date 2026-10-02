@@ -1,2 +1,2 @@
-/** The "Sign your accounts in again" section of Settings → Providers; registered in `../providerSettings.tsx`. */
-export { MoveAccounts } from "./MoveAccounts";
+/** The Accounts section of Settings → Providers; registered in `../providerSettings.tsx`. */
+export { AccountsSettings } from "./AccountsSettings";
