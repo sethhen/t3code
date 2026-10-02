@@ -67,6 +67,7 @@ import {
   resolveClaudeHomePath,
 } from "./ClaudeHome.ts";
 import { discoverClaudeSkills } from "./ClaudeSkills.ts";
+import { claudeSharedHistoryKey } from "../../extensions/claudeHistory.ts"; // t3-ext
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -143,11 +144,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
           Effect.provideService(Path.Path, path),
         ),
       );
-      const continuationGroupKey = yield* makeClaudeContinuationGroupKey(
-        effectiveConfig,
-        processEnv,
-      );
       const configDir = yield* resolveClaudeHomePath(effectiveConfig, processEnv);
+      // t3-ext: Claude accounts that share ~/.claude's conversations share a key.
+      const continuationGroupKey = yield* claudeSharedHistoryKey(
+        configDir,
+        yield* makeClaudeContinuationGroupKey(effectiveConfig, processEnv),
+        instanceId,
+      );
       const accountConfigPath = yield* ClaudeResetCredits.claudeAccountConfigPath(
         effectiveConfig.homePath.trim() || processEnv.CLAUDE_CONFIG_DIR?.trim()
           ? configDir

@@ -219,6 +219,7 @@ import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavaila
 import { RightPanelTabs } from "./RightPanelTabs";
 import { AgentsPanel } from "./AgentsPanel";
 import { ExtensionSurface } from "~/extensions/ExtensionSurface"; // t3-ext
+import { useForkComposerBannerItems } from "~/extensions/continueOn"; // t3-ext
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
@@ -6602,6 +6603,11 @@ export default function ChatView(props: ChatViewProps) {
     usageLimitsBanner,
     wokeThreadBannerItem,
   ]);
+  // t3-ext
+  const bannerItemsWithFork = useForkComposerBannerItems(composerBannerItems, {
+    environmentId,
+    threadId,
+  });
   useEffect(() => {
     setPendingServerThreadEnvMode(null);
     setPendingServerThreadBranch(undefined);
@@ -10041,7 +10047,7 @@ export default function ChatView(props: ChatViewProps) {
                                       : projectCloneSendBlockReason
                             }
                             isPreparingWorktree={isPreparingWorktree}
-                            bannerItems={composerBannerItems}
+                            bannerItems={bannerItemsWithFork} // t3-ext
                             // With attachments or contexts aboard the pick just inserts the
                             // text, so it sends as a prompt like the typed path would.
                             onUsageLimitsCommand={

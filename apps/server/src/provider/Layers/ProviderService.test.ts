@@ -1253,6 +1253,102 @@ antigravityInstanceRouting.layer("ProviderServiceLive instance-owned conversatio
   );
 });
 
+// t3-ext: Claude accounts that share one conversation store share a continuation key.
+const sharedStoreClaude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+const sharedStoreAccount = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
+const sharedStoreAccountId = ProviderInstanceId.make("claude_work");
+const sharedStoreKey = "claude:home:/Users/example/.claude";
+let sharedStoreAccountKey = sharedStoreKey;
+const sharedStoreRegistry = makeAdapterRegistryMock({
+  [CLAUDE_AGENT_DRIVER]: sharedStoreClaude.adapter,
+});
+const sharedStoreRouting = makeProviderServiceLayer({
+  registry: {
+    ...sharedStoreRegistry,
+    getByInstance: (instanceId) =>
+      instanceId === sharedStoreAccountId
+        ? Effect.succeed(sharedStoreAccount.adapter)
+        : sharedStoreRegistry.getByInstance(instanceId),
+    getInstanceInfo: (instanceId) =>
+      instanceId === sharedStoreAccountId || instanceId === claudeAgentInstanceId
+        ? Effect.succeed({
+            instanceId,
+            driverKind: CLAUDE_AGENT_DRIVER,
+            displayName: undefined,
+            enabled: true,
+            continuationIdentity: {
+              driverKind: CLAUDE_AGENT_DRIVER,
+              continuationKey:
+                instanceId === sharedStoreAccountId ? sharedStoreAccountKey : sharedStoreKey,
+            },
+          })
+        : sharedStoreRegistry.getInstanceInfo(instanceId),
+  },
+});
+sharedStoreRouting.layer("ProviderServiceLive shared conversation stores", (it) => {
+  const bindToDefaultInstance = (threadId: ThreadId, cwd: string) =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      yield* directory.upsert({
+        threadId,
+        provider: CLAUDE_AGENT_DRIVER,
+        providerInstanceId: claudeAgentInstanceId,
+        status: "stopped",
+        runtimeMode: "full-access",
+        resumeCursor: { resume: `session-of-${threadId}` },
+        runtimePayload: { cwd },
+      });
+    });
+
+  it.effect("resumes the persisted conversation on another instance with its key", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-shared-store");
+      const cwd = fixtureCwd("project-shared-store");
+      yield* bindToDefaultInstance(threadId, cwd);
+      sharedStoreAccountKey = sharedStoreKey;
+      sharedStoreAccount.startSession.mockClear();
+
+      const session = yield* provider.startSession(threadId, {
+        providerInstanceId: sharedStoreAccountId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const startInput = sharedStoreAccount.startSession.mock.calls[0]?.[0];
+      assert.deepEqual(startInput?.resumeCursor, { resume: `session-of-${threadId}` });
+      assert.equal(startInput?.cwd, cwd);
+      assert.equal(session.providerInstanceId, sharedStoreAccountId);
+      assert.equal(sharedStoreClaude.startSession.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("still refuses an instance with another key", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const threadId = asThreadId("thread-separate-store");
+      yield* bindToDefaultInstance(threadId, fixtureCwd("project-separate-store"));
+      const binding = yield* directory.getBinding(threadId);
+      sharedStoreAccountKey = "claude:home:/Users/example/.claude-work";
+      sharedStoreAccount.startSession.mockClear();
+
+      const error = yield* Effect.flip(
+        provider.startSession(threadId, {
+          providerInstanceId: sharedStoreAccountId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+
+      assert.instanceOf(error, ProviderValidationError);
+      assert.include(error.issue, "resume state is incompatible");
+      assert.equal(sharedStoreAccount.startSession.mock.calls.length, 0);
+      assert.deepEqual(yield* directory.getBinding(threadId), binding);
+    }),
+  );
+});
+
 const unsupportedRollback = makeProviderServiceLayer({ supportsConversationRollback: false });
 unsupportedRollback.layer("ProviderServiceLive unsupported rewind", (it) => {
   it.effect("rejects rewind without starting or changing the provider conversation", () =>
