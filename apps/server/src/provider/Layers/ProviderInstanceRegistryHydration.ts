@@ -57,6 +57,7 @@ import { ProviderInstanceRegistry } from "../Services/ProviderInstanceRegistry.t
 import { ProviderInstanceRegistryMutator } from "../Services/ProviderInstanceRegistryMutator.ts";
 import { ProviderInstanceRegistryMutableLayer } from "./ProviderInstanceRegistryLive.ts";
 import { applyForkInstanceOverlays } from "../../extensions/instanceOverlays.ts"; // t3-ext
+import { withOverlayReconciles } from "../../extensions/instanceOverlays.ts"; // t3-ext
 
 /**
  * Synthesize a `ProviderInstanceConfigMap` from a `ServerSettings` snapshot.
@@ -121,6 +122,7 @@ const SettingsWatcherLive = Layer.effectDiscard(
     const serverSettings = yield* ServerSettingsService;
     const settingsChanges = yield* serverSettings.subscribeChanges;
     yield* settingsChanges.pipe(
+      withOverlayReconciles(serverSettings.getSettings), // t3-ext
       Stream.runForEach((next) =>
         mutator
           .reconcile(deriveProviderInstanceConfigMap(next))

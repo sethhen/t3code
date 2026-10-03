@@ -63,6 +63,7 @@ import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
 import * as ResetCreditCoordinator from "./resetCreditCoordinator.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
+import { CLAUDE_RESET_IN_ACCOUNTS } from "../../extensions/claudeProbe.ts"; // t3-ext
 
 const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
@@ -465,12 +466,13 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  const redeemClaudeReset = (claim: { result: string; usageFailsAfterClaim: boolean }) =>
+  // t3-ext: T3 never reads or sends Claude's OAuth token, so no banked resets
+  // through it; the Accounts section runs Claude Code's own /limit-reset.
+  it.live("never sends Claude's OAuth token to read or redeem resets", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const fixtures = yield* makeTildeProviderFixtures();
-      const marker = path.join(fixtures.claudeHomePath, "redeemed");
       yield* fs.writeFileString(
         path.join(fixtures.claudeHomePath, ".credentials.json"),
         '{"claudeAiOauth":{"accessToken":"fake-token"}}',
@@ -479,27 +481,15 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
         path.join(fixtures.claudeHomePath, ".claude.json"),
         '{"oauthAccount":{"organizationUuid":"fake-org"}}',
       );
-      const client = HttpClient.make((request) =>
-        Effect.gen(function* () {
-          if (request.url.endsWith("/api/oauth/usage")) {
-            return HttpClientResponse.fromWeb(
-              request,
-              Response.json({
-                cedar_ember: {
-                  eligible: true,
-                  next_grant_id: "grant_a",
-                  grants: [{ id: "grant_a", resets_left: 1, usable_now: true }],
-                },
-              }),
-            );
-          }
-          if (request.url.endsWith("/reset_rate_limits")) {
-            yield* fs.writeFileString(marker, "redeemed").pipe(Effect.orDie);
-            return HttpClientResponse.fromWeb(request, Response.json({ result: claim.result }));
-          }
-          return HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }));
-        }),
-      );
+      const anthropicRequests: Array<string> = []; // t3-ext
+      const client = HttpClient.make((request) => {
+        if (new URL(request.url).hostname.endsWith("anthropic.com")) {
+          anthropicRequests.push(request.url);
+        }
+        return Effect.succeed(
+          HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" })),
+        );
+      });
       const instanceId = ProviderInstanceId.make("claude_reset");
       const { registry } = yield* makeProviderInstanceRegistry({
         drivers: [ClaudeDriver],
@@ -507,12 +497,7 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
           [instanceId]: {
             driver: ProviderDriverKind.make("claudeAgent"),
             enabled: true,
-            environment: [
-              { name: "T3_CLAUDE_RESET_MARKER", value: marker, sensitive: false },
-              ...(claim.usageFailsAfterClaim
-                ? [{ name: "T3_CLAUDE_USAGE_FAILS_AFTER_CLAIM", value: "1", sensitive: false }]
-                : []),
-            ],
+            // t3-ext: no reset-marker variables
             config: makeClaudeConfig({
               enabled: true,
               binaryPath: fixtures.claudeBinaryPath,
@@ -523,36 +508,20 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
       }).pipe(Effect.provideService(HttpClient.HttpClient, client));
       const instance = yield* registry.getInstance(instanceId);
       expect(instance).toBeDefined();
-      const before = yield* instance!.snapshot.refresh;
-      expect(before.usageLimits?.windows[0]?.usedPercent).toBe(100);
-      expect(before.usageLimits?.resetCredits?.nextCreditId).toBe("grant_a");
+      const snapshot = yield* instance!.snapshot.refresh;
+      expect(snapshot.usageLimits?.windows[0]?.usedPercent).toBe(100);
+      expect(snapshot.usageLimits?.resetCredits).toBeUndefined();
       const outcome = yield* instance!.consumeResetCredit!().pipe(Effect.result);
-      return { outcome, after: yield* instance!.snapshot.getSnapshot };
+      expect(outcome).toMatchObject({
+        _tag: "Failure",
+        failure: { detail: CLAUDE_RESET_IN_ACCOUNTS },
+      });
+      expect(anthropicRequests).toEqual([]);
     }).pipe(
-      // macOS logins live in the Keychain, where resets are never read.
+      // t3-ext: upstream reads the token from the config dir everywhere but macOS (Keychain).
       Effect.provideService(HostProcessPlatform, "linux"),
       Effect.provide(testLayer),
-    );
-
-  it.live("refreshes Claude usage after redeeming a reset", () =>
-    Effect.gen(function* () {
-      const { outcome, after } = yield* redeemClaudeReset({
-        result: "reset",
-        usageFailsAfterClaim: false,
-      });
-      expect(outcome).toMatchObject({ _tag: "Success", success: "reset" });
-      expect(after.usageLimits?.windows[0]?.usedPercent).toBe(0);
-    }),
-  );
-
-  it.live("reports Claude's answer when a claim changed nothing and the re-probe fails", () =>
-    Effect.gen(function* () {
-      const { outcome } = yield* redeemClaudeReset({
-        result: "already_used",
-        usageFailsAfterClaim: true,
-      });
-      expect(outcome).toMatchObject({ _tag: "Success", success: "alreadyRedeemed" });
-    }),
+    ),
   );
 
   it.live(

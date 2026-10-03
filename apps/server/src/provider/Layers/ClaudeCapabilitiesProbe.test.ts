@@ -18,6 +18,7 @@ import {
   CLAUDE_CAPABILITIES_PROBE_SETTING_SOURCES,
   probeClaudeCapabilities,
 } from "./ClaudeProvider.ts";
+import { CLAUDE_USAGE_TIMEOUT_MS } from "../../extensions/claudeProbe.ts"; // t3-ext
 
 vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
 
@@ -211,7 +212,7 @@ it.effect("preserves initialized capabilities when optional usage times out", ()
       decodeClaudeSettings({ binaryPath: "claude" }),
     ).pipe(Effect.forkChild);
     yield* Deferred.await(usageStarted);
-    yield* TestClock.adjust("4 seconds");
+    yield* TestClock.adjust(CLAUDE_USAGE_TIMEOUT_MS); // t3-ext
     const capabilities = yield* Fiber.join(probe);
     assert.equal(capabilities?.email, "dev@example.com");
     assert.equal(capabilities?.subscriptionType, "pro");
