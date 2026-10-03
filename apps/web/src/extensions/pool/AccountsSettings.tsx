@@ -6,9 +6,11 @@
  * here; the upstream sections fold away under "More provider settings".
  *
  * Rows come from settings and the provider snapshots, exactly like the
- * provider list. The pool extension only runs sign-ins and removals, and lists
- * the accounts the retired pool left. On a server without it the rows still
- * show (Pause and Resume are plain settings writes) and nothing is folded away.
+ * provider list. The pool extension only runs sign-ins and removals, lists
+ * the accounts the retired pool left, and runs Claude Code's own model
+ * training setting and session limit reset for a Claude account. On a server without
+ * it the rows still show (Pause and Resume are plain settings writes) and
+ * nothing is folded away. Codex's banked resets are upstream's own redeem.
  */
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
@@ -18,20 +20,24 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import {
   DEFAULT_UNIFIED_SETTINGS,
+  type EnvironmentId,
   type MoveAccount,
   type MoveProvider,
   PoolExtension,
+  type PrivacyTask,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { limitsNotice } from "@t3tools/shared/usageLimits";
-import { ChevronRightIcon, EllipsisIcon, PlusIcon } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRightIcon, EllipsisIcon, ExternalLinkIcon, PlusIcon } from "lucide-react";
+import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { Badge } from "~/components/ui/badge";
 import { Button, InlineButton } from "~/components/ui/button";
+import { Checkbox } from "~/components/ui/checkbox";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "~/components/ui/menu";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { Spinner } from "~/components/ui/spinner";
+import { Switch } from "~/components/ui/switch";
 import { toastManager } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
@@ -43,20 +49,35 @@ import {
   ACCOUNT_PROVIDERS,
   type AccountRow,
   accountSignIn,
+  announcesPrivacyTask,
   accountTone,
+  accountWho,
   buildAccountRows,
+  type ClaudePrivacyView,
+  claudePrivacyView,
+  codexMarkedOffAt,
   foldFor,
   foldReasons,
   type FoldState,
+  followPrivacyTask,
   isManagedCodex,
+  KEEP_TRAINING_OFF_HINT,
+  keepOffQuestion,
   limitsClock,
   MAIN_ACCOUNT_HINT,
+  PRIVACY_LINKS,
+  privacyOutcome,
   removeQuestion,
+  resetLine,
+  resetQuestion,
+  type SeenPrivacyTask,
   visiblePendingAccounts,
 } from "./accounts.logic";
 import { MOVE_DRIVER, MOVE_PROVIDER_LABEL, PENDING_HINT } from "./move.logic";
 import {
   confirmAction,
+  openInBrowser,
+  PRIVACY_POLL_MS,
   type SignIn,
   SignInDetails,
   useMoveStatus,
@@ -66,12 +87,15 @@ import {
 import {
   buildProviderInstanceUpdatePatch,
   EMPTY_SERVER_PROVIDERS,
+  formatElapsedDurationLabel,
   getProviderSummary,
   isProviderSettingsUpdateCandidate,
   LimitWindows,
   PROVIDER_STATUS_STYLES,
   ProviderInstanceIcon,
   RedactedSensitiveText,
+  ResetCredits,
+  resetCreditsSummary,
   resolveAppModelSelectionState,
   searchableSetting,
   serverEnvironment,
@@ -94,6 +118,24 @@ const UPSTREAM_SEARCH_IDS: ReadonlySet<string> = new Set(
   ).map((id) => searchableSetting(id).id),
 );
 
+const PRIVACY_START_FAILED: Readonly<Record<PrivacyTask, string>> = {
+  check: "Could not check model training",
+  turnOff: "Could not turn off model training",
+  reset: "Could not use the session limit reset",
+};
+
+/** `5m ago`, `just now`; told against the last status read, so it never ticks on its own. */
+function ago(iso: string, now: number): string {
+  const elapsed = formatElapsedDurationLabel(iso, now);
+  return elapsed === "just now" || elapsed === "" ? "just now" : `${elapsed} ago`;
+}
+
+/** A provider's own settings page, in the system browser on desktop. */
+async function openLink(url: string) {
+  if (await openInBrowser(url)) return;
+  toastManager.add({ type: "error", title: "Could not open your browser", description: url });
+}
+
 export function AccountsSettings({
   environmentId,
   environmentLabel,
@@ -109,7 +151,7 @@ export function AccountsSettings({
   const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
-  const { status, unsupported, refresh, apply } = useMoveStatus(client, readOnly);
+  const { status, receivedAt, unsupported, refresh, apply } = useMoveStatus(client, readOnly);
   const navigate = useNavigate();
   const { signIn, start, add, signInAgain, cancel, submitCode, adopt, dismiss } = useSignIn(
     client,
@@ -128,10 +170,18 @@ export function AccountsSettings({
   const [removing, setRemoving] = useState<ProviderInstanceId | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshingRef = useRef(false);
+  // The account whose model training check, change or reset waits for the server's answer.
+  const [privacyStarting, setPrivacyStarting] = useState<ProviderInstanceId | null>(null);
+  const [markingCodex, setMarkingCodex] = useState<ProviderInstanceId | null>(null);
+  // The value "Keep model training off" was switched to, until the server answers.
+  const [keepOffTarget, setKeepOffTarget] = useState<boolean | null>(null);
 
   const rows = useMemo(() => buildAccountRows(settings, providers), [settings, providers]);
   const [openedAt] = useState(() => Date.now());
-  const now = limitsClock(rows, openedAt);
+  const now = Math.max(limitsClock(rows, openedAt), receivedAt);
+  // Absent before the first status, and on servers without the accounts extension: then none of it shows.
+  const privacy = status?.privacy;
+  const privacyBusy = privacy?.busy !== undefined;
   // Sign-ins and removals; `status` answering means the server has them.
   const manageable = !readOnly && status !== null;
   const pending = useMemo(
@@ -143,8 +193,32 @@ export function AccountsSettings({
   useStatusPolling(
     refresh,
     !unsupported &&
-      (status === null || pending.length > 0 || serverSignIn !== undefined || signInRunning),
+      (status === null ||
+        pending.length > 0 ||
+        serverSignIn !== undefined ||
+        signInRunning ||
+        privacyBusy),
+    privacyBusy ? PRIVACY_POLL_MS : undefined,
   );
+  // Says how each Claude Code task ended once a read shows it gone: always for
+  // one this page started, else only when it changed something or failed.
+  const seenTask = useRef<SeenPrivacyTask | null>(null);
+  const startedHere = useRef(new Set<string>());
+  // Every row's name as last seen, for a task whose account was removed before it ended.
+  const knownLabels = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const row of rows) knownLabels.current.set(row.instanceId, row.label);
+    if (privacy === undefined) return;
+    const { seen, ended } = followPrivacyTask(seenTask.current, privacy);
+    seenTask.current = seen;
+    if (ended === null) return;
+    const { instanceId } = ended.busy;
+    const label = knownLabels.current.get(instanceId) ?? ACCOUNT_KIND.claude;
+    const outcome = privacyOutcome(ended, label);
+    if (announcesPrivacyTask(ended, outcome, startedHere.current.delete(instanceId))) {
+      toastManager.add(outcome);
+    }
+  }, [privacy, rows]);
   useEffect(() => {
     if (serverSignIn === undefined) return;
     const { accountId, instanceId, provider } = serverSignIn;
@@ -246,6 +320,60 @@ export function AccountsSettings({
     }
   };
 
+  const startPrivacyTask = async (row: AccountRow, task: PrivacyTask) => {
+    if (task === "reset" && !(await confirmAction(resetQuestion(row)))) return;
+    setPrivacyStarting(row.instanceId);
+    // Before the call: its answer may already show the task running.
+    startedHere.current.add(row.instanceId);
+    const input = { instanceId: row.instanceId };
+    const outcome = await apply(() =>
+      task === "check"
+        ? client.call("privacy.check", input)
+        : task === "turnOff"
+          ? client.call("privacy.turnOff", input)
+          : client.call("reset.useClaude", input),
+    );
+    setPrivacyStarting(null);
+    if (!outcome.ok) {
+      startedHere.current.delete(row.instanceId);
+      toastManager.add({
+        type: "error",
+        title: PRIVACY_START_FAILED[task],
+        description: outcome.message,
+      });
+    }
+  };
+
+  const setKeepOff = async (enabled: boolean) => {
+    // The switch stays where it is until the user agrees: it restarts running sessions.
+    if (!(await confirmAction(keepOffQuestion(enabled)))) return;
+    setKeepOffTarget(enabled);
+    const outcome = await apply(() => client.call("privacy.setKeepOff", { enabled }));
+    setKeepOffTarget(null);
+    if (!outcome.ok) {
+      toastManager.add({
+        type: "error",
+        title: "Could not change Keep model training off",
+        description: outcome.message,
+      });
+    }
+  };
+
+  const markCodexOff = async (row: AccountRow, off: boolean) => {
+    setMarkingCodex(row.instanceId);
+    const outcome = await apply(() =>
+      client.call("privacy.markCodexOff", { instanceId: row.instanceId, off }),
+    );
+    setMarkingCodex(null);
+    if (!outcome.ok) {
+      toastManager.add({
+        type: "error",
+        title: "Could not save that",
+        description: outcome.message,
+      });
+    }
+  };
+
   const skip = async (account: MoveAccount) => {
     const question = `Skip ${account.email}? It leaves this list for good. You can still add it later with Add account.`;
     if (!(await confirmAction(question))) return;
@@ -287,6 +415,13 @@ export function AccountsSettings({
           This session can view {environmentLabel}'s accounts but can't change them.
         </p>
       ) : null}
+      {privacy ? (
+        <KeepTrainingOff
+          checked={keepOffTarget ?? privacy.keepTrainingOff}
+          disabled={readOnly || keepOffTarget !== null}
+          onChange={(enabled) => void setKeepOff(enabled)}
+        />
+      ) : null}
       {ACCOUNT_PROVIDERS.map((provider) => {
         const providerRows = rows.filter((row) => row.provider === provider);
         const providerPending = pending.filter((account) => account.provider === provider);
@@ -322,10 +457,22 @@ export function AccountsSettings({
                 {providerRows.map((row) => {
                   const own = accountSignIn(row);
                   const rowSignIn = signInInstanceId === row.instanceId ? signIn : null;
+                  // Model training and resets act on the signed-in account of an account in use.
+                  const signedIn = row.enabled && row.snapshot?.auth.status !== "unauthenticated";
+                  const email = row.snapshot?.auth.email;
+                  const claudeView =
+                    privacy && signedIn && provider === "claude"
+                      ? claudePrivacyView(privacy, row.instanceId, privacyStarting)
+                      : null;
+                  // Removing waits for this account's Claude Code task, paused or signed out too.
+                  const privacyRunning =
+                    privacy?.busy?.instanceId === row.instanceId ||
+                    privacyStarting === row.instanceId;
                   return (
                     <AccountLine
                       key={row.instanceId}
                       row={row}
+                      environmentId={environmentId}
                       now={now}
                       readOnly={readOnly}
                       canRemove={manageable && own !== null}
@@ -333,7 +480,7 @@ export function AccountsSettings({
                       signIn={rowSignIn}
                       signInBlocked={signInRunning && rowSignIn === null}
                       removing={removing === row.instanceId}
-                      removeBlocked={removing !== null}
+                      removeBlocked={removing !== null || privacyRunning}
                       onSetEnabled={(enabled) => setEnabled(row, enabled)}
                       onRemove={() => {
                         if (own !== null) void remove(row, own);
@@ -343,6 +490,34 @@ export function AccountsSettings({
                       }
                       onCancel={(signInId) => void cancel(signInId)}
                       onOpenSetup={() => openSetup(row)}
+                      onUseReset={claudeView ? () => void startPrivacyTask(row, "reset") : null}
+                      resetBlocked={claudeView?.blocked ?? true}
+                      training={
+                        claudeView ? (
+                          <ClaudeTraining
+                            row={row}
+                            email={email}
+                            view={claudeView}
+                            now={now}
+                            readOnly={readOnly}
+                            onCheck={() => void startPrivacyTask(row, "check")}
+                            onTurnOff={() => void startPrivacyTask(row, "turnOff")}
+                          />
+                        ) : privacy &&
+                          signedIn &&
+                          provider === "codex" &&
+                          // ChatGPT's setting; an API key or Bedrock sign-in has none.
+                          row.snapshot?.auth.type === "chatgpt" ? (
+                          <CodexTraining
+                            row={row}
+                            email={email}
+                            markedAt={codexMarkedOffAt(privacy, email)}
+                            readOnly={readOnly}
+                            marking={markingCodex === row.instanceId}
+                            onMark={(off) => void markCodexOff(row, off)}
+                          />
+                        ) : null
+                      }
                       details={
                         rowSignIn ? (
                           <SignInDetails
@@ -485,12 +660,13 @@ function AccountName({ label }: { readonly label: string }) {
 }
 
 /**
- * One instance: name, plan, main or paused, what needs attention, its quota,
- * Sign in again (Cancel while it waits) when it signed out of its own sign-in,
- * and its menu.
+ * One instance: name, plan, main or paused, what needs attention, its quota
+ * and Codex's banked resets, its model training line, Sign in again (Cancel
+ * while it waits) when it signed out of its own sign-in, and its menu.
  */
 function AccountLine({
   row,
+  environmentId,
   now,
   readOnly,
   canRemove,
@@ -504,9 +680,13 @@ function AccountLine({
   onSignInAgain,
   onCancel,
   onOpenSetup,
+  onUseReset,
+  resetBlocked,
+  training,
   details,
 }: {
   readonly row: AccountRow;
+  readonly environmentId: EnvironmentId;
   readonly now: number;
   readonly readOnly: boolean;
   readonly canRemove: boolean;
@@ -517,7 +697,7 @@ function AccountLine({
   /** Another sign-in is running. */
   readonly signInBlocked: boolean;
   readonly removing: boolean;
-  /** Some account's removal is running. */
+  /** Some account's removal, or this account's Claude Code task, is running. */
   readonly removeBlocked: boolean;
   readonly onSetEnabled: (enabled: boolean) => void;
   readonly onRemove: () => void;
@@ -525,6 +705,12 @@ function AccountLine({
   readonly onCancel: (signInId: string) => void;
   /** Opens this instance in the provider list, where a managed Codex signs in. */
   readonly onOpenSetup: () => void;
+  /** Claude Code's session limit reset, for a signed-in Claude account. */
+  readonly onUseReset: (() => void) | null;
+  /** A Claude Code task runs or is starting. */
+  readonly resetBlocked: boolean;
+  /** The model training line. */
+  readonly training: ReactNode;
   readonly details: ReactNode;
 }) {
   const tone = accountTone(row);
@@ -534,8 +720,10 @@ function AccountLine({
   const summary = getProviderSummary(snapshot);
   const limits = row.enabled && !signedOut ? snapshot?.usageLimits : undefined;
   const notice = limits ? limitsNotice(limits) : null;
+  // Codex's banked resets, redeemed through the Codex app-server as Usage → Limits does.
+  const credits = row.provider === "codex" ? limits?.resetCredits : undefined;
   const plan = snapshot?.auth.label;
-  const who = `${MOVE_PROVIDER_LABEL[row.provider]} account ${row.label}`;
+  const who = accountWho(row);
   const starting = signIn?.phase === "starting";
 
   return (
@@ -594,6 +782,24 @@ function AccountLine({
               </div>
             )
           ) : null}
+          {credits === undefined ? null : readOnly ? (
+            credits.availableCount > 0 ? (
+              <p className="mt-1 text-xs text-muted-foreground tabular-nums">
+                {resetCreditsSummary(credits, now)}
+              </p>
+            ) : null
+          ) : (
+            // Outside the menu: its confirm is a dialog. Empty (hidden) when no credit is banked.
+            <div className="mt-1 empty:hidden">
+              <ResetCredits
+                environmentId={environmentId}
+                input={{ instanceId: row.instanceId }}
+                credits={credits}
+                now={now}
+              />
+            </div>
+          )}
+          {training}
         </div>
         {signIn?.phase === "waiting" ? (
           <Button
@@ -636,6 +842,11 @@ function AccountLine({
               <MenuItem onClick={() => onSetEnabled(!row.enabled)}>
                 {row.enabled ? "Pause" : "Resume"}
               </MenuItem>
+              {onUseReset ? (
+                <MenuItem disabled={resetBlocked} onClick={onUseReset}>
+                  Use session reset…
+                </MenuItem>
+              ) : null}
               {canRemove ? (
                 <>
                   <MenuSeparator />
@@ -649,6 +860,196 @@ function AccountLine({
         )}
       </div>
       {details ? <div className="ms-8">{details}</div> : null}
+    </div>
+  );
+}
+
+/**
+ * "Keep model training off": the server checks every Claude account daily in
+ * Claude Code and turns training off, and turns off Codex /feedback and
+ * Claude's /bug and feedback survey; ChatGPT's setting only gets links (it has no API).
+ */
+function KeepTrainingOff({
+  checked,
+  disabled,
+  onChange,
+}: {
+  readonly checked: boolean;
+  readonly disabled: boolean;
+  readonly onChange: (enabled: boolean) => void;
+}) {
+  const hintId = useId();
+  return (
+    <div className="flex items-start gap-3 px-3 py-3 sm:px-4">
+      <div className="min-w-0 flex-1">
+        <p className="text-sm text-foreground">Keep model training off</p>
+        <p id={hintId} className="text-xs text-muted-foreground">
+          {KEEP_TRAINING_OFF_HINT}
+        </p>
+      </div>
+      <span className="flex h-5 shrink-0 items-center">
+        <Switch
+          checked={checked}
+          disabled={disabled}
+          onCheckedChange={(next) => onChange(Boolean(next))}
+          aria-label="Keep model training off"
+          aria-describedby={hintId}
+        />
+      </span>
+    </div>
+  );
+}
+
+/** Blurred like the row's name; Claude's and OpenAI's pages show whoever the browser is signed in as. */
+function SignInAs({ email }: { readonly email: string | undefined }) {
+  if (!email) return null;
+  return (
+    <>
+      <span>· sign in there as</span>
+      <AccountName label={email} />
+    </>
+  );
+}
+
+/**
+ * A signed-in Claude account's model training, as Claude Code's own
+ * `/privacy-settings` last showed it, with Turn off and Check, the claude.ai
+ * page to change it by hand, and the last session limit reset's result.
+ */
+function ClaudeTraining({
+  row,
+  email,
+  view,
+  now,
+  readOnly,
+  onCheck,
+  onTurnOff,
+}: {
+  readonly row: AccountRow;
+  readonly email: string | undefined;
+  readonly view: ClaudePrivacyView;
+  readonly now: number;
+  readonly readOnly: boolean;
+  readonly onCheck: () => void;
+  readonly onTurnOff: () => void;
+}) {
+  const { entry, running } = view;
+  const who = accountWho(row);
+  const idle = running === null;
+  const lastReset = running === "reset" ? undefined : entry?.reset;
+  return (
+    <div className="mt-1 grid gap-0.5 text-xs text-muted-foreground">
+      <p className="flex flex-wrap items-center gap-x-1.5">
+        <span>Model training:</span>
+        <span
+          role="status"
+          className={cn(
+            "text-foreground",
+            idle && entry?.training === "on" && "text-warning-foreground",
+          )}
+        >
+          {view.training}
+        </span>
+        {idle && entry?.checkedAt ? <span>· checked {ago(entry.checkedAt, now)}</span> : null}
+        {readOnly ? null : (
+          <>
+            {view.showTurnOff ? (
+              <InlineButton
+                disabled={view.blocked}
+                aria-label={`Turn off model training for ${who}`}
+                onClick={onTurnOff}
+              >
+                Turn off
+              </InlineButton>
+            ) : null}
+            {idle ? (
+              <InlineButton
+                tone="muted"
+                disabled={view.blocked}
+                aria-label={`Check model training for ${who}`}
+                onClick={onCheck}
+              >
+                Check
+              </InlineButton>
+            ) : null}
+          </>
+        )}
+      </p>
+      {idle && entry?.message ? <p className="[overflow-wrap:anywhere]">{entry.message}</p> : null}
+      <p className="flex flex-wrap items-center gap-x-1.5">
+        <InlineButton tone="muted" onClick={() => void openLink(PRIVACY_LINKS.claude)}>
+          claude.ai privacy
+          <ExternalLinkIcon aria-hidden className="size-3" />
+        </InlineButton>
+        <SignInAs email={email} />
+      </p>
+      {/* The time stays outside the live region: it moves with every status read. */}
+      {running === "reset" || lastReset ? (
+        <p className="[overflow-wrap:anywhere]">
+          {lastReset ? <span>Session reset {ago(lastReset.at, now)}: </span> : null}
+          <span role="status">{lastReset ? resetLine(lastReset) : "Using the session reset…"}</span>
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A signed-in Codex account's model training: ChatGPT has no way for apps to
+ * read or change it, so only its pages, and what the user says they did there
+ * (never claimed as checked).
+ */
+function CodexTraining({
+  row,
+  email,
+  markedAt,
+  readOnly,
+  marking,
+  onMark,
+}: {
+  readonly row: AccountRow;
+  readonly email: string | undefined;
+  readonly markedAt: string | undefined;
+  readonly readOnly: boolean;
+  readonly marking: boolean;
+  readonly onMark: (off: boolean) => void;
+}) {
+  const markedId = useId();
+  const marked = markedAt
+    ? `You marked this off on ${new Date(markedAt).toLocaleDateString(undefined, { dateStyle: "medium" })}`
+    : null;
+  return (
+    <div className="mt-1 grid gap-1 text-xs text-muted-foreground">
+      <p className="flex flex-wrap items-center gap-x-1.5">
+        <span>Model training: set in ChatGPT ·</span>
+        <InlineButton tone="muted" onClick={() => void openLink(PRIVACY_LINKS.chatgptDataControls)}>
+          Data controls
+          <ExternalLinkIcon aria-hidden className="size-3" />
+        </InlineButton>
+        <span aria-hidden>·</span>
+        <InlineButton tone="muted" onClick={() => void openLink(PRIVACY_LINKS.openaiPrivacyPortal)}>
+          Privacy Portal
+          <ExternalLinkIcon aria-hidden className="size-3" />
+        </InlineButton>
+        <SignInAs email={email} />
+      </p>
+      {/* The server keeps the user's word by email, so it needs the signed-in one. */}
+      {!email ? null : readOnly ? (
+        marked ? (
+          <p>{marked}</p>
+        ) : null
+      ) : (
+        <label className="flex w-fit cursor-pointer items-center gap-2">
+          <Checkbox
+            checked={markedAt !== undefined}
+            disabled={marking}
+            onCheckedChange={(checked) => onMark(checked === true)}
+            aria-label={`I turned off model training in ChatGPT for ${accountWho(row)}`}
+            aria-describedby={marked ? markedId : undefined}
+          />
+          <span id={markedId}>{marked ?? "I turned it off"}</span>
+        </label>
+      )}
     </div>
   );
 }

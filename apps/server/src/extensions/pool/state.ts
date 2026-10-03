@@ -95,18 +95,21 @@ export const readMoveList = async (path: string): Promise<MoveEntry[]> => {
   });
 };
 
+/** Writes `value` as JSON atomically: a temp file (mode `mode`, 0600 by default) renamed over `path`. */
+export const writeJsonFile = async (path: string, value: unknown, mode = 0o600) => {
+  // Unique per write: concurrent saves must never share (and delete) one temp file.
+  const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
+  await NodeFSP.writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode });
+  await NodeFSP.rename(temp, path);
+};
+
 /** Writes the list atomically (temp file + rename, 0600); an empty list deletes the file. */
 const writeMoveList = async (path: string, entries: ReadonlyArray<MoveEntry>) => {
   if (entries.length === 0) {
     await NodeFSP.rm(path, { force: true });
     return;
   }
-  // Unique per write: concurrent saves must never share (and delete) one temp file.
-  const temp = `${path}.${process.pid}.${NodeCrypto.randomUUID()}.tmp`;
-  await NodeFSP.writeFile(temp, `${JSON.stringify({ version: 1, accounts: entries }, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  await NodeFSP.rename(temp, path);
+  await writeJsonFile(path, { version: 1, accounts: entries });
 };
 
 let writes: Promise<unknown> = Promise.resolve();

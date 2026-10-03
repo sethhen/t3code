@@ -9,10 +9,11 @@ export { RedactedSensitiveText } from "~/components/settings/RedactedSensitiveTe
 export { buildProviderInstanceUpdatePatch } from "~/components/settings/SettingsPanels.logic";
 export { SettingsSection, useSettingsSearchTargetId } from "~/components/settings/settingsLayout";
 export { searchableSetting } from "~/components/settings/settingsSearch";
-export { LimitWindows } from "~/components/usage/UsageLimits";
+export { LimitWindows, ResetCredits, resetCreditsSummary } from "~/components/usage/UsageLimits";
 export { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 export { useEnvironmentSettings, useUpdateEnvironmentSettings } from "~/hooks/useSettings";
 export { readLocalApi } from "~/localApi";
 export { resolveAppModelSelectionState } from "~/modelSelection";
 export { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "~/state/server";
 export { useAtomCommand } from "~/state/use-atom-command";
+export { formatElapsedDurationLabel } from "~/timestampFormat";

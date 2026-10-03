@@ -33,5 +33,30 @@ export const makePoolServerExtension = Effect.sync(() =>
     "signIn.cancel": ({ signInId }) => withController((move) => move.cancelSignIn(signInId)),
     "account.remove": ({ instanceId }) => withController((move) => move.removeAccount(instanceId)),
     skip: ({ accountId }) => withController((move) => move.skip(accountId)),
+    "privacy.setKeepOff": ({ enabled }) =>
+      withController(async (move) => {
+        await move.privacy.setKeepOff(enabled);
+        return move.status();
+      }),
+    "privacy.check": ({ instanceId }) =>
+      withController(async (move) => {
+        await move.privacy.enqueue(instanceId, "check");
+        return move.status();
+      }),
+    "privacy.turnOff": ({ instanceId }) =>
+      withController(async (move) => {
+        await move.privacy.enqueue(instanceId, "turnOff");
+        return move.status();
+      }),
+    "privacy.markCodexOff": ({ instanceId, off }) =>
+      withController(async (move) => {
+        await move.privacy.markCodexOff(instanceId, off);
+        return move.status();
+      }),
+    "reset.useClaude": ({ instanceId }) =>
+      withController(async (move) => {
+        await move.privacy.enqueue(instanceId, "reset");
+        return move.status();
+      }),
   }),
 );

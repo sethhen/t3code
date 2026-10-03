@@ -26,6 +26,11 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "runtime overlays on provider instances",
   ],
   [
+    "apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts",
+    "withOverlayReconciles(serverSettings.getSettings)",
+    "overlay reconcile requests in the settings watcher (no settings.json write)",
+  ],
+  [
     "apps/server/src/provider/Layers/ClaudeAdapter.ts",
     "...launchArgSettings(claudeSettings.launchArgs)",
     "flag --settings for Claude sessions (launch args)",
@@ -87,6 +92,16 @@ const SEAMS: ReadonlyArray<readonly [file: string, needle: string, why: string]>
     "shared continuation key for Claude accounts on one conversation store",
   ],
   [
+    "apps/server/src/provider/Drivers/ClaudeDriver.ts",
+    "consumeResetCredit: () =>",
+    "no Claude reset claim with its OAuth token",
+  ],
+  [
+    "apps/server/src/provider/Layers/ClaudeProvider.ts",
+    "Effect.timeout(CLAUDE_USAGE_TIMEOUT_MS)",
+    "longer deadline for Claude Code's usage read",
+  ],
+  [
     "apps/web/src/components/AgentsPanel.tsx",
     "agentElapsedClock(agent)",
     "elapsed for live agents, pending workflow members included",
@@ -113,6 +128,23 @@ describe("fork host seams", () => {
       );
     });
   }
+
+  // Upstream reads and claims Claude's resets with its OAuth token (claudeResetCredits.ts); a
+  // merge that brings any of that back into the server outside that file fails here.
+  it("apps/server/src keeps Claude's OAuth token in claudeResetCredits.ts alone", () => {
+    const token =
+      /claudeResetCredits|readClaudeResetCredits|consumeClaudeResetCredit|claudeAiOauth|\.credentials\.json/;
+    const reaching = NodeFS.readdirSync(NodePath.join(repo, "apps/server/src"), { recursive: true })
+      .map((file) => `apps/server/src/${String(file).split(NodePath.sep).join("/")}`)
+      .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
+      .filter((file) => file !== "apps/server/src/provider/Layers/claudeResetCredits.ts")
+      .filter((file) => token.test(source(file)));
+    assert.deepEqual(
+      reaching,
+      [],
+      "these reach for Claude's OAuth token again; re-apply the host edits (FORK.md)",
+    );
+  });
 
   it("deriveProviderInstanceConfigMap applies registered overlays", () => {
     const remove = registerInstanceOverlay("seam-test", (map) => {

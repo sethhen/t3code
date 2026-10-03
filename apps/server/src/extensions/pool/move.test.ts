@@ -21,6 +21,7 @@ import { assert, describe, it } from "@effect/vitest";
 
 import { CLAUDE_ACCOUNT_MARKER } from "../claudeHistory.ts";
 import { MoveController, type MoveDeps, POOL_USAGE_SOURCE_ID } from "./move.ts";
+import type { ClaudeTerminalTarget } from "./claudeTerminal.ts";
 import { type MoveEntry, moveAccountId } from "./state.ts";
 import { HostProcessPlatform } from "./t3.ts";
 
@@ -165,6 +166,12 @@ const makeMove = (
   let settings = initial;
   const patches: ServerSettingsPatch[] = [];
   const refreshed: string[] = [];
+  /** Claude Code terminal runs (privacy.ts); each reads training "off". */
+  const terminals: Array<{ readonly task: string; readonly target: ClaudeTerminalTarget }> = [];
+  const terminal = (task: string) => async (_pty: unknown, target: ClaudeTerminalTarget) => {
+    terminals.push({ task, target });
+    return { training: "off" as const, outcome: "notUsed" as const, message: "" };
+  };
   const expandHome = (path: string) =>
     path === "~" ? f.home : path.startsWith("~/") ? NodePath.join(f.home, path.slice(2)) : path;
   const deps: MoveDeps = {
@@ -188,6 +195,18 @@ const makeMove = (
       refreshed.push(instanceId);
     },
     canSymlink: async () => true,
+    claudeExecutable: async (binary) => binary,
+    claudeTerminal: {
+      claudeTerminalEnv: (base) => base,
+      readClaudeTraining: terminal("check"),
+      turnClaudeTrainingOff: terminal("turnOff"),
+      useClaudeSessionReset: terminal("reset"),
+    },
+    pty: async () => {
+      throw new Error("These tests run no terminal.");
+    },
+    providerEmail: async () => undefined,
+    reconcile: async () => undefined,
     log: () => undefined,
     ...over,
     // Never the real environment: the fakes get a temp HOME, and the key must be stripped.
@@ -199,7 +218,13 @@ const makeMove = (
       ...over.env,
     },
   };
-  return { move: new MoveController(deps), patches, refreshed, settings: () => settings };
+  return {
+    move: new MoveController(deps),
+    patches,
+    refreshed,
+    terminals,
+    settings: () => settings,
+  };
 };
 
 type Call = {
@@ -1004,6 +1029,36 @@ describe.skipIf(PLATFORM === "win32")("accounts", () => {
     // The list's entry for that account is done with.
     assert.deepEqual(readList(f).accounts, [ANN]);
     assert.deepEqual(refreshed, []);
+  });
+
+  it("checks a new Claude account's training as soon as it signs in, while kept off", async () => {
+    const f = fixture();
+    signInDefaultClaude(f, "main@example.com");
+    const { move, terminals } = makeMove(f, settingsFor(f), {
+      env: { FAKE_EMAIL: "zed@example.com" },
+    });
+    const runs = () =>
+      terminals.map(({ task, target }) => [task, target.env.CLAUDE_CONFIG_DIR ?? "main"]);
+    await move.privacy.setKeepOff(true);
+    await move.privacy.idle();
+    assert.deepEqual(runs(), [["check", "main"]]);
+
+    const started = await move.addAccount("claude");
+    move.submitCode(started.signInId, "code#state");
+    const { instanceId } = await move.settled(started.signInId);
+    await move.privacy.idle();
+    const dir = callsOf(f, "auth login")[0]?.CLAUDE_CONFIG_DIR;
+    assert.deepEqual(runs(), [
+      ["check", "main"],
+      ["check", dir],
+    ]);
+    assert.deepEqual(
+      (await move.status()).privacy?.claude.map((entry) => [entry.instanceId, entry.training]),
+      [
+        [instanceId, "off"],
+        ["claudeAgent", "off"],
+      ],
+    );
   });
 
   it("refuses an account T3 has already, signing its new dir out and deleting it", async () => {

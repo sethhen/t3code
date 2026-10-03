@@ -25,14 +25,15 @@ is marked with a `t3-ext` comment so merge conflicts are easy to recognise
 | `apps/web/src/components/RightPanelTabs.tsx`                           | extension entries in the add-tab menu, label/icon                                        |
 | `apps/web/src/components/ChatView.tsx`                                 | renders `ExtensionSurface`; adds fork composer banners (Continue on another account)     |
 | `apps/web/src/components/AgentsPanel.tsx`                              | shows live elapsed time for workflows and pending members via `agentElapsedClock`        |
-| `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | `applyForkInstanceOverlays` on the derived instance map (runtime-only instance overlays) |
+| `apps/server/src/provider/Layers/ProviderInstanceRegistryHydration.ts` | runtime-only instance overlays (`applyForkInstanceOverlays`) + `withOverlayReconciles`   |
 | `apps/server/src/provider/Layers/ClaudeAdapter.ts`                     | merges `--settings` launch args; one row per long rate-limit wait, + its test            |
 | `apps/server/src/textGeneration/ClaudeTextGeneration.ts`               | the same merge for Claude text generation                                                |
 | `apps/server/src/server.ts`                                            | provides `ForkServicesLive` (server-lifetime fork services, e.g. the pool's retirement)  |
 | `apps/web/src/components/settings/ProviderSettingsPanel.tsx`           | wraps the page in `ProviderSettingsExtensions` (Accounts on top, the rest folds away)    |
 | `apps/server/src/provider/Layers/CodexProvider.ts`                     | skips the usage read for a Codex without a ChatGPT sign-in, + its test                   |
 | `apps/server/src/provider/Layers/ProviderService.ts`                   | a thread moved to an instance with its continuation key resumes its conversation, + test |
-| `apps/server/src/provider/Drivers/ClaudeDriver.ts`                     | Claude accounts sharing `~/.claude`'s conversations share a continuation key             |
+| `apps/server/src/provider/Drivers/ClaudeDriver.ts`                     | shared-history continuation key; no Claude resets via the OAuth token, + its test        |
+| `apps/server/src/provider/Layers/ClaudeProvider.ts`                    | a longer deadline for Claude Code's usage read (~3s per account), + its test             |
 
 Fork-owned paths (new extensions only touch these):
 
@@ -67,7 +68,11 @@ with `feat(fork): extension host` (the rule accepts the files of every such comm
   an account hits its usage limit, the thread offers **Continue on…**: pick another of your accounts
   and the thread carries on there. Nothing switches on its own. The usual provider settings are
   under **More provider settings**. Open **Usage** from the sidebar for token and cost history, or
-  **Usage → Limits** for subscription quotas.
+  **Usage → Limits** for subscription quotas. **Keep model training off** (top of Accounts) checks
+  each Claude account daily and turns "Help improve Claude" off; each Codex account links to
+  ChatGPT's Data controls (OpenAI doesn't let apps change it). Codex accounts show their banked
+  resets, and **Use session reset…** in a Claude account's ⋯ menu runs Claude Code's own
+  `/limit-reset`. Flipping the switch restarts running Claude and Codex agents.
 - **Signing in** on desktop: use email, Google, GitHub, Apple or Microsoft. Passkeys are not
   available in fork builds.
 - **Updates:** an update button appears in the sidebar. Click it to download, click it again to
@@ -149,6 +154,23 @@ account, and nothing switches accounts automatically.
 - **Pool leftovers**: at server start the extension kills a leftover proxy, saves the accounts the
   pool held to `<stateDir>/pool-move.json` (listed until signed in or skipped) and deletes
   `<stateDir>/pool/` and the `cliproxy-t3-pool` usage source.
+
+- **Model training and resets**: Claude's "Help improve our AI models" and its session limit
+  reset have no API a tool may call with the account's token, so `claudeTerminal.ts` runs the
+  unmodified interactive `claude` in a PTY (cwd `<stateDir>/claude-privacy`, refused inside a git
+  repository since Claude Code would trust the whole repo) and drives its own `/privacy-settings`
+  and `/limit-reset` screens. It answers only the trust prompt for that folder and the Chrome
+  offer's default, stops at anything else (first-run setup, a login step or updated terms are the
+  user's to answer), verifies a change in a fresh process, and reports a reset as used, not used or
+  unknown. Account dirs T3 made get `hasCompletedOnboarding` so first-run setup never shows. With
+  **Keep model training off** on, every Claude account is checked daily (and when added), Codex
+  instances get `-c feedback.enabled=false` and Claude ones `DISABLE_BUG_COMMAND=1` and
+  `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` through an instance overlay, applied by a reconcile
+  trigger in the settings watcher (never by rewriting `settings.json`). ChatGPT's training setting
+  has no API at all, so Codex rows only link to it and remember what the user says. Upstream's
+  Claude reset path (`claudeResetCredits.ts`, which reads the OAuth token) is disabled in
+  `ClaudeDriver.ts`, and `hostSeams.test.ts` fails if any other server file reaches for that token.
+  After a Claude Code update, check the screens still match: the tests' fake TUI mirrors them.
 
 Limits: Codex's sign-in only finishes in a browser on the machine running T3 (its callback is that
 machine's localhost); Claude's also takes a pasted code. A thread whose account was removed can't

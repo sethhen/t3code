@@ -7,7 +7,12 @@
  * can't: run those logins on the server and save the instance they produce,
  * sign an account in again or out when it is removed, and list the accounts
  * the retired pool held that are not signed in directly yet (the list shrinks
- * as they are signed in or skipped).
+ * as they are signed in or skipped). It also keeps each account's model
+ * training setting off when the user asks, and uses Claude's session limit
+ * reset: both through Claude Code's own `/privacy-settings` and
+ * `/limit-reset`, run in the unmodified `claude` (T3 never reads a token).
+ * OpenAI offers no way to read or change ChatGPT's training setting, so for
+ * Codex T3 can only link to it and remember what the user said.
  */
 import * as Schema from "effect/Schema";
 
@@ -41,10 +46,52 @@ export const MoveAccount = Schema.Struct({
 });
 export type MoveAccount = typeof MoveAccount.Type;
 
+/** "Help improve our AI models", as Claude Code's `/privacy-settings` shows it; `unknown` until read. */
+export const TrainingState = Schema.Literals(["on", "off", "unknown"]);
+export type TrainingState = typeof TrainingState.Type;
+
+export const ClaudeAccountPrivacy = Schema.Struct({
+  instanceId: Schema.String,
+  training: TrainingState,
+  /** When `training` was last read from Claude Code. */
+  checkedAt: Schema.optional(Schema.String),
+  /** Why the last check or change didn't finish, in plain words. */
+  message: Schema.optional(Schema.String),
+  /**
+   * The last session reset the user asked for and what Claude Code said:
+   * `unknown` when T3 couldn't tell whether Claude Code used it (it stopped
+   * waiting, or Claude Code answered with words T3 doesn't know).
+   */
+  reset: Schema.optional(
+    Schema.Struct({
+      at: Schema.String,
+      outcome: Schema.Literals(["used", "notUsed", "unknown"]),
+      message: Schema.String,
+    }),
+  ),
+});
+export type ClaudeAccountPrivacy = typeof ClaudeAccountPrivacy.Type;
+
+export const PrivacyTask = Schema.Literals(["check", "turnOff", "reset"]);
+export type PrivacyTask = typeof PrivacyTask.Type;
+
+export const PrivacyStatus = Schema.Struct({
+  /** Check every Claude account daily (and each new one) and turn training off; turn Codex `/feedback` off. */
+  keepTrainingOff: Schema.Boolean,
+  claude: Schema.Array(ClaudeAccountPrivacy),
+  /** Codex accounts the user says they opted out of training in ChatGPT: lowercased email → when. */
+  codexMarkedOff: Schema.Record(Schema.String, Schema.String),
+  /** The Claude Code task running now; one at a time per server. */
+  busy: Schema.optional(Schema.Struct({ instanceId: Schema.String, task: PrivacyTask })),
+});
+export type PrivacyStatus = typeof PrivacyStatus.Type;
+
 export const MoveStatus = Schema.Struct({
   accounts: Schema.Array(MoveAccount),
   /** Where a new account of each provider would land now. */
   addTarget: Schema.Struct({ claude: MoveTarget, codex: MoveTarget }),
+  /** Absent from servers older than the privacy controls. */
+  privacy: Schema.optional(PrivacyStatus),
   /** The sign-in running on this server, if any (one at a time). */
   signIn: Schema.optional(
     Schema.Struct({
@@ -125,4 +172,16 @@ export const PoolExtension = defineExtension(POOL_EXTENSION_ID, {
   "account.remove": { input: Schema.Struct({ instanceId: Schema.String }), output: MoveStatus },
   /** Drops a listed account without signing it in. */
   skip: { input: Schema.Struct({ accountId: Schema.String }), output: MoveStatus },
+  "privacy.setKeepOff": { input: Schema.Struct({ enabled: Schema.Boolean }), output: MoveStatus },
+  /** Starts reading a Claude account's training setting; the result lands in `status.privacy`. */
+  "privacy.check": { input: Schema.Struct({ instanceId: Schema.String }), output: MoveStatus },
+  /** Starts turning a Claude account's training setting off (then reads it again to confirm). */
+  "privacy.turnOff": { input: Schema.Struct({ instanceId: Schema.String }), output: MoveStatus },
+  /** Records (or clears) the user's word that a Codex account is opted out in ChatGPT. */
+  "privacy.markCodexOff": {
+    input: Schema.Struct({ instanceId: Schema.String, off: Schema.Boolean }),
+    output: MoveStatus,
+  },
+  /** Starts Claude Code's `/limit-reset` for a Claude account; the outcome lands in `status.privacy`. */
+  "reset.useClaude": { input: Schema.Struct({ instanceId: Schema.String }), output: MoveStatus },
 });

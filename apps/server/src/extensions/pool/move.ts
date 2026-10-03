@@ -41,6 +41,7 @@ import {
 import { CLAUDE_ACCOUNT_MARKER } from "../claudeHistory.ts";
 import { migratePool } from "./boot.ts";
 import { CLAUDE_URL_MARKER, CODEX_URL_MARKER, lastLine, signInEnv, signInUrl } from "./cli.ts";
+import { ClaudePrivacy, type PrivacyDeps } from "./privacy.ts";
 import { runProcess } from "./process.ts";
 import {
   accountHash,
@@ -107,21 +108,9 @@ const URL_WAIT_MS = 5_000;
 /** How long an exited CLI's output may stay open (a grandchild holding the pipes). */
 const EXIT_GRACE_MS = 500;
 
-export interface MoveDeps {
-  readonly stateDir: string;
-  /** The host's `HostProcessPlatform`. */
-  readonly platform: string;
-  /** The environment the CLIs start from, before an instance's own variables. */
-  readonly env: NodeJS.ProcessEnv;
-  /** `~` expansion as the provider drivers do it (`expandHomePath`). */
-  readonly expandHome: (path: string) => string;
-  readonly getSettings: () => Promise<ServerSettings>;
+/** `PrivacyDeps` (settings, homes, the Claude terminal, refresh), plus what sign-ins need. */
+export interface MoveDeps extends PrivacyDeps {
   readonly updateSettings: (patch: ServerSettingsPatch) => Promise<void>;
-  /** The environment Claude Code runs with for `homePath` (upstream's `makeClaudeEnvironment`). */
-  readonly claudeEnvironment: (
-    homePath: string,
-    base: NodeJS.ProcessEnv,
-  ) => Promise<NodeJS.ProcessEnv>;
   /** Lays out a Codex shadow home the way the codex driver does; resolves to its path. */
   readonly materializeCodexHome: (homePath: string, shadowHomePath: string) => Promise<string>;
   /** `command args` as T3 spawns it (`resolveSpawnCommand`: `.cmd` shims on Windows). */
@@ -134,11 +123,8 @@ export interface MoveDeps {
     readonly args: ReadonlyArray<string>;
     readonly shell: boolean;
   }>;
-  /** Re-probes an instance with its caches invalidated, like Settings' refresh. */
-  readonly refreshInstance: (instanceId: string) => Promise<void>;
   /** Whether this host lets T3 create symlinks (`canCreateSymlinks`); asked once. */
   readonly canSymlink: () => Promise<boolean>;
-  readonly log: (message: string, cause?: unknown) => void;
 }
 
 /** What a default home is signed in to. */
@@ -359,10 +345,13 @@ export class MoveController {
   private symlinks: Promise<boolean> | undefined;
   /** Set by `close`: a start still in flight launches nothing (or ends what it launched). */
   private closed = false;
+  /** Training settings and session resets (`privacy.*`, `reset.useClaude`). */
+  readonly privacy: ClaudePrivacy;
 
   constructor(deps: MoveDeps) {
     this.deps = deps;
     this.listPath = moveListPath(deps.stateDir);
+    this.privacy = new ClaudePrivacy(deps);
   }
 
   /**
@@ -392,6 +381,7 @@ export class MoveController {
     const [entries, settings] = await Promise.all([
       readMoveList(this.listPath),
       this.deps.getSettings(),
+      this.privacy.load(),
     ]);
     const run = this.run;
     return {
@@ -405,6 +395,7 @@ export class MoveController {
           ...(entry.plan ? { plan: entry.plan } : {}),
         })),
       addTarget: { claude: this.targetOf("claude"), codex: this.targetOf("codex") },
+      privacy: this.privacy.status(settings),
       ...(run?.state === "waiting"
         ? {
             signIn: {
@@ -449,6 +440,8 @@ export class MoveController {
     // Its sign-in again would otherwise finish after the logout, signing the account back in.
     const run = this.run;
     if (run?.existing?.id === instanceId) await this.stop(run, "The account was removed.");
+    // Nor may a Claude Code terminal keep running on it.
+    await this.privacy.stop(instanceId);
     if (logout) {
       const name = instance.displayName ?? instanceId;
       // The default instances count too (a default Codex can have a shadow home of its own).
@@ -466,6 +459,7 @@ export class MoveController {
     await this.changeInstances((current) =>
       Object.fromEntries(Object.entries(current).filter(([id]) => id !== instanceId)),
     );
+    await this.privacy.forget(instanceId);
     return this.status();
   }
 
@@ -532,9 +526,13 @@ export class MoveController {
     return this.status();
   }
 
-  /** Server shutdown: ends a running sign-in CLI, and any a start still in flight launches. */
+  /**
+   * Server shutdown: ends a running sign-in CLI (and any a start still in
+   * flight launches) and the running Claude Code terminal task.
+   */
   close() {
     this.closed = true;
+    this.privacy.close();
     const run = this.run;
     if (run?.running) this.end(run, "The server stopped.");
   }
@@ -1318,6 +1316,9 @@ export class MoveController {
     if (email) run.email = email;
     if (problem) this.fail(run, problem);
     else run.state = "done";
+    if (run.state === "done" && provider === "claude" && run.instanceId) {
+      this.privacy.afterSignIn(run.instanceId);
+    }
   }
 
   /** Records `email`'s sign-in; returns why it doesn't count, if it doesn't. */

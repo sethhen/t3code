@@ -10,13 +10,19 @@
  * client, so an overlay may carry secrets. Overlays are never persisted: remove
  * the overlay (or the fork) and the user's own configuration is untouched.
  *
- * Nothing registers an overlay at the moment (the retired pool was the only
- * one); the seam stays so the next one needs no upstream edit. An overlay must
- * be pure and cheap: it runs on every settings emission. When the state an
- * overlay reads changes outside settings, its owner must re-run the registry
- * reconcile itself.
+ * The accounts extension registers one (keep training off, pool/privacy.ts);
+ * a new overlay needs no upstream edit. An overlay must be pure and cheap: it
+ * runs on every settings emission. When the state an overlay reads changes
+ * outside settings, its owner calls `requestOverlayReconcile()`: the registry's
+ * settings watcher (second host edit, `withOverlayReconciles`) re-derives the
+ * map from the current settings, serially with settings changes, and never
+ * writes settings.json (a file that failed to decode stays on disk for repair).
  */
-import type { ProviderInstanceConfigMap } from "@t3tools/contracts";
+import type { ProviderInstanceConfigMap, ServerSettings } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as PubSub from "effect/PubSub";
+import * as Result from "effect/Result";
+import * as Stream from "effect/Stream";
 
 export type InstanceOverlay = (map: ProviderInstanceConfigMap) => ProviderInstanceConfigMap;
 
@@ -44,3 +50,40 @@ export const applyForkInstanceOverlays = (
   }
   return next;
 };
+
+/**
+ * Pending reconcile requests: a burst collapses into one, and the last is
+ * replayed to a watcher that subscribes after it.
+ */
+const reconcileRequests = Effect.runSync(PubSub.sliding<void>({ capacity: 1, replay: 1 }));
+
+/** Rebuilds the provider instances whose overlaid config changed, from the current settings. */
+export const requestOverlayReconcile = () => {
+  PubSub.publishUnsafe(reconcileRequests, undefined);
+};
+
+/**
+ * The settings watcher's stream with reconcile requests merged in. A request
+ * reads the settings when its turn comes, after every change that arrived
+ * before it, so the last reconcile always sees the newest settings. Ends with
+ * the settings stream; a failed read is logged and skipped.
+ */
+export const withOverlayReconciles =
+  <E, R>(getSettings: Effect.Effect<ServerSettings, E, R>) =>
+  (changes: Stream.Stream<ServerSettings>): Stream.Stream<ServerSettings, never, R> =>
+    Stream.merge(changes, Stream.fromPubSub(reconcileRequests).pipe(Stream.map(() => undefined)), {
+      haltStrategy: "left",
+    }).pipe(
+      Stream.filterMapEffect((change) =>
+        change !== undefined
+          ? Effect.succeed(Result.succeed(change))
+          : getSettings.pipe(
+              Effect.map(Result.succeed),
+              Effect.catchCause((cause) =>
+                Effect.logError("Reading settings for an overlay reconcile failed", cause).pipe(
+                  Effect.as(Result.fail(undefined)),
+                ),
+              ),
+            ),
+      ),
+    );

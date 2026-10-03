@@ -65,7 +65,8 @@ export const shareClaudeHistory = async (configDir: string, options: ShareClaude
   for (const name of SHARED) await shareEntry(dir, main, name, options);
 };
 
-const isPreviousReleaseDir = (dir: string, home: string, instanceId: string | undefined) =>
+/** An unmarked `<home>/.claude-*` dir the previous release made for a `claude_<hash>` instance. */
+export const isPreviousReleaseDir = (dir: string, home: string, instanceId: string | undefined) =>
   instanceId !== undefined &&
   PREVIOUS_RELEASE_ID.test(instanceId) &&
   NodePath.dirname(dir) === home &&
@@ -220,7 +221,7 @@ const sameFile = async (a: string, b: string) => {
 };
 
 /** Claude Code keeps `<config dir>/sessions/<pid>.json` while it runs. */
-const claudeIsRunning = async (dir: string) => {
+export const claudeIsRunning = async (dir: string) => {
   const sessions = NodePath.join(dir, "sessions");
   const names = await NodeFSP.readdir(sessions).catch(() => []);
   for (const name of names) {

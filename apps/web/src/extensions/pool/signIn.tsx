@@ -7,7 +7,9 @@
  * A sign-in starts only from a click (never from an effect, so a StrictMode
  * remount cannot start two), then `signIn.status` is polled until it ends. One
  * already running on the server (started before a remount, or from another
- * device) is picked up from `status`.
+ * device) is picked up from `status`. The model training checks and session
+ * limit resets the server runs in Claude Code show in `status` too, polled
+ * faster while one runs.
  */
 import {
   type MoveAccount,
@@ -36,6 +38,8 @@ import {
 import { readLocalApi, writeTextToClipboard } from "./t3";
 
 const STATUS_POLL_MS = 10_000;
+/** While Claude Code checks, changes or resets an account (a few seconds each). */
+export const PRIVACY_POLL_MS = 2_000;
 const SIGN_IN_POLL_MS = 1_500;
 
 export type MoveClient = ExtensionClient<(typeof PoolExtension)["methods"]>;
@@ -70,7 +74,7 @@ export type SignIn =
   | (SignInSubject & { readonly phase: "error"; readonly message: string });
 
 /** Desktop opens the system browser through the shell bridge; the web build opens a tab. */
-async function openInBrowser(url: string): Promise<boolean> {
+export async function openInBrowser(url: string): Promise<boolean> {
   try {
     const api = readLocalApi();
     if (api) await api.shell.openExternal(url);
@@ -94,6 +98,8 @@ export async function confirmAction(question: string): Promise<boolean> {
  */
 export function useMoveStatus(client: MoveClient, readOnly: boolean) {
   const [status, setStatus] = useState<MoveStatus | null>(null);
+  // When the last status arrived: the clock "checked 5m ago" is told against, so it moves with reads, not a timer.
+  const [receivedAt, setReceivedAt] = useState(() => Date.now());
   // No sign-ins here (an official T3 server, or no permission to ask): stop asking.
   const [unsupported, setUnsupported] = useState(false);
   const sequence = useRef(0);
@@ -103,6 +109,7 @@ export function useMoveStatus(client: MoveClient, readOnly: boolean) {
     if (id < applied.current) return;
     applied.current = id;
     setStatus(next);
+    setReceivedAt(Date.now());
   }, []);
 
   const refresh = useCallback(async () => {
@@ -128,25 +135,29 @@ export function useMoveStatus(client: MoveClient, readOnly: boolean) {
     [accept],
   );
 
-  return { status, unsupported, refresh, apply };
+  return { status, receivedAt, unsupported, refresh, apply };
 }
 
-/** Calls `refresh` now and every 10s while `active`, skipping ticks while the page is hidden. */
-export function useStatusPolling(refresh: () => Promise<void>, active: boolean) {
+/** Calls `refresh` now and every `intervalMs` (10s) while `active`, skipping ticks while the page is hidden. */
+export function useStatusPolling(
+  refresh: () => Promise<void>,
+  active: boolean,
+  intervalMs = STATUS_POLL_MS,
+) {
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
     let timer: number | undefined;
     const tick = async () => {
       if (!document.hidden) await refresh();
-      if (!cancelled) timer = window.setTimeout(tick, STATUS_POLL_MS);
+      if (!cancelled) timer = window.setTimeout(tick, intervalMs);
     };
     void tick();
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [active, refresh]);
+  }, [active, intervalMs, refresh]);
 }
 
 /**
